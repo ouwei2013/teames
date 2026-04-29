@@ -22,6 +22,7 @@ import logging
 import re
 from typing import Dict, Any, List, Optional, Union
 
+from agent.access_context import AccessContext
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
@@ -263,10 +264,23 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _access_kwargs(access_context: AccessContext | Dict[str, Any] | None) -> Dict[str, Any]:
+    return {"access_context": access_context} if access_context is not None else {}
+
+
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    access_context: AccessContext | Dict[str, Any] | None = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
-        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
+        sessions = db.list_sessions_rich(
+            limit=limit + 5,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            **_access_kwargs(access_context),
+        )  # fetch extra to skip current
 
         # Resolve current session lineage to exclude it
         current_root = None
@@ -276,7 +290,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
                 visited = set()
                 while sid and sid not in visited:
                     visited.add(sid)
-                    s = db.get_session(sid)
+                    s = db.get_session(sid, **_access_kwargs(access_context))
                     parent = s.get("parent_session_id") if s else None
                     sid = parent if parent else None
                 current_root = max(visited, key=len) if visited else current_session_id
@@ -321,6 +335,7 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
+    access_context: AccessContext | Dict[str, Any] | None = None,
 ) -> str:
     """
     Search past sessions and return focused summaries of matching conversations.
@@ -344,7 +359,12 @@ def session_search(
     # Recent sessions mode: when query is empty, return metadata for recent sessions.
     # No LLM calls — just DB queries for titles, previews, timestamps.
     if not query or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            access_context=access_context,
+        )
 
     query = query.strip()
 
@@ -361,6 +381,7 @@ def session_search(
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=50,  # Get more matches to find unique sessions
             offset=0,
+            **_access_kwargs(access_context),
         )
 
         if not raw_results:
@@ -381,7 +402,7 @@ def session_search(
             while sid and sid not in visited:
                 visited.add(sid)
                 try:
-                    session = db.get_session(sid)
+                    session = db.get_session(sid, **_access_kwargs(access_context))
                     if not session:
                         break
                     parent = session.get("parent_session_id")
@@ -427,10 +448,16 @@ def session_search(
         tasks = []
         for session_id, match_info in seen_sessions.items():
             try:
-                messages = db.get_messages_as_conversation(session_id)
+                messages = db.get_messages_as_conversation(
+                    session_id,
+                    **_access_kwargs(access_context),
+                )
                 if not messages:
                     continue
-                session_meta = db.get_session(session_id) or {}
+                session_meta = db.get_session(
+                    session_id,
+                    **_access_kwargs(access_context),
+                ) or {}
                 conversation_text = _format_conversation(messages)
                 conversation_text = _truncate_around_matches(conversation_text, query)
                 tasks.append((session_id, match_info, conversation_text, session_meta))

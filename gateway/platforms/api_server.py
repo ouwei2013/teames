@@ -520,6 +520,7 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
+    identity_seed: str = "",
 ) -> str:
     """Derive a stable session ID from the conversation's first user message.
 
@@ -530,9 +531,20 @@ def _derive_chat_session_id(
     the same Hermes session (and therefore the same Docker container sandbox
     directory) across turns.
     """
-    seed = f"{system_prompt or ''}\n{first_user_message}"
+    seed = f"{identity_seed}\n{system_prompt or ''}\n{first_user_message}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
     return f"api-{digest}"
+
+
+def _enterprise_enabled_toolsets(toolsets) -> list[str]:
+    """Toolsets safe for enterprise-authenticated API sessions.
+
+    Skills are currently HERMES_HOME-scoped and writable through skill_manage,
+    so enterprise sessions must not expose them until skills are tenant/user
+    scoped.
+    """
+    blocked = {"skills"}
+    return sorted(str(toolset) for toolset in toolsets if str(toolset) not in blocked)
 
 
 _CRON_AVAILABLE = False
@@ -591,6 +603,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._enterprise_store: Optional[Any] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -669,19 +682,97 @@ class APIServerAdapter(BasePlatformAdapter):
         If no API key is configured, all requests are allowed (only when API
         server is local).
         """
-        if not self._api_key:
-            return None  # No key configured — allow all (local-only use)
+        auth_err, _access_context = self._authenticate_request(request)
+        return auth_err
 
+    def _ensure_enterprise_store(self):
+        """Lazily initialise enterprise invite/user-token storage if present."""
+        if self._enterprise_store is None:
+            try:
+                from enterprise import EnterpriseStore
+                store = EnterpriseStore()
+                if store.is_initialized():
+                    self._enterprise_store = store
+                else:
+                    store.close()
+                    return None
+            except Exception as e:
+                logger.debug("EnterpriseStore unavailable for API server: %s", e)
+                return None
+        return self._enterprise_store
+
+    def _authenticate_request(self, request: "web.Request") -> tuple[Optional["web.Response"], Optional[Any]]:
+        """Validate request auth and return an optional enterprise AccessContext."""
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            if hmac.compare_digest(token, self._api_key):
-                return None  # Auth OK
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
 
-        return web.json_response(
-            {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
-            status=401,
+        if token:
+            store = self._ensure_enterprise_store()
+            if store is not None:
+                try:
+                    auth = store.authenticate_api_key(token)
+                    if auth:
+                        return None, auth.get("access_context")
+                except Exception as e:
+                    logger.debug("Enterprise API key auth failed: %s", e)
+
+        if not self._api_key:
+            return None, None  # No key configured — allow all (local-only use)
+
+        if token and hmac.compare_digest(token, self._api_key):
+            return None, None  # Admin/global API key auth, no user context
+
+        return (
+            web.json_response(
+                {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+                status=401,
+            ),
+            None,
         )
+
+    async def _handle_redeem_invite(self, request: "web.Request") -> "web.Response":
+        """POST /v1/enterprise/invites/redeem — exchange an invite code for a user API key."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        try:
+            from enterprise import EnterpriseStore
+            store = EnterpriseStore()
+            result = store.redeem_invite(
+                str(body.get("code") or body.get("invite_code") or ""),
+                email=body.get("email"),
+                name=body.get("name"),
+            )
+            store.close()
+            return web.json_response({
+                "object": "enterprise.invite_redeemed",
+                "user": result["user"],
+                "api_key": result["api_key"],
+                "api_base": "/v1",
+                "agents": result.get("agents", []),
+            })
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            logger.exception("Enterprise invite redemption failed")
+            return web.json_response(_openai_error(f"Invite redemption failed: {exc}", err_type="server_error"), status=500)
+
+    @staticmethod
+    def _access_context_identity_seed(access_context: Optional[Any]) -> str:
+        if not access_context:
+            return ""
+        try:
+            data = access_context.as_dict()
+        except Exception:
+            return ""
+        parts = [
+            str(data.get("tenant_id") or ""),
+            str(data.get("workspace_id") or ""),
+            str(data.get("user_id") or ""),
+            str(data.get("agent_id") or ""),
+        ]
+        return ":".join(parts)
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -713,6 +804,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        access_context: Optional[Any] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -731,6 +823,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if access_context is not None:
+            enabled_toolsets = _enterprise_enabled_toolsets(enabled_toolsets)
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -755,6 +849,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            access_context=access_context,
         )
         return agent
 
@@ -789,7 +884,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
-        auth_err = self._check_auth(request)
+        auth_err, _access_context = self._authenticate_request(request)
         if auth_err:
             return auth_err
 
@@ -810,7 +905,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
-        auth_err = self._check_auth(request)
+        auth_err, access_context = self._authenticate_request(request)
         if auth_err:
             return auth_err
 
@@ -868,21 +963,21 @@ class APIServerAdapter(BasePlatformAdapter):
         # When provided, history is loaded from state.db instead of from the request body.
         #
         # Security: session continuation exposes conversation history, so it is
-        # only allowed when the API key is configured and the request is
-        # authenticated.  Without this gate, any unauthenticated client could
-        # read arbitrary session history by guessing/enumerating session IDs.
+        # only allowed when the request is authenticated by either the global
+        # API key or an enterprise user token. Without this gate, any
+        # unauthenticated client could read arbitrary session history by
+        # guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
-            if not self._api_key:
+            if not self._api_key and access_context is None:
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
-                    "no API key configured.  Set API_SERVER_KEY to enable "
-                    "session continuity."
+                    "no API key or enterprise user token configured."
                 )
                 return web.json_response(
                     _openai_error(
-                        "Session continuation requires API key authentication. "
-                        "Configure API_SERVER_KEY to enable this feature."
+                        "Session continuation requires API key authentication "
+                        "or an enterprise user token."
                     ),
                     status=403,
                 )
@@ -896,7 +991,10 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    history = db.get_messages_as_conversation(
+                        session_id,
+                        access_context=access_context,
+                    )
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -910,7 +1008,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 if cm.get("role") == "user":
                     first_user = cm.get("content", "")
                     break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            session_id = _derive_chat_session_id(
+                system_prompt,
+                first_user,
+                identity_seed=self._access_context_identity_seed(access_context),
+            )
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -974,6 +1076,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
+                access_context=access_context,
             ))
 
             return await self._write_sse_chat_completion(
@@ -988,6 +1091,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                access_context=access_context,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1673,7 +1777,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
-        auth_err = self._check_auth(request)
+        auth_err, access_context = self._authenticate_request(request)
         if auth_err:
             return auth_err
 
@@ -1828,6 +1932,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
+                access_context=access_context,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -1856,6 +1961,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                access_context=access_context,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2252,6 +2358,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        access_context: Optional[Any] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2274,6 +2381,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                access_context=access_context,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2341,7 +2449,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
-        auth_err = self._check_auth(request)
+        auth_err, access_context = self._authenticate_request(request)
         if auth_err:
             return auth_err
 
@@ -2444,6 +2552,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    access_context=access_context,
                 )
                 self._active_run_agents[run_id] = agent
                 def _run_sync():
@@ -2621,6 +2730,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_post("/v1/enterprise/invites/redeem", self._handle_redeem_invite)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

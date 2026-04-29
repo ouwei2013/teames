@@ -11,6 +11,29 @@ declare global {
 }
 let _sessionToken: string | null = null;
 const SESSION_HEADER = "X-Hermes-Session-Token";
+const TOKEN_RELOAD_FLAG = "hermes.dashboard.tokenReloaded";
+
+function isPublicApiPath(url: string): boolean {
+  const path = url.split("?", 1)[0];
+  return (
+    path === "/api/status" ||
+    path === "/api/config/defaults" ||
+    path === "/api/config/schema" ||
+    path === "/api/model/info" ||
+    path === "/api/dashboard/themes" ||
+    path === "/api/dashboard/plugins" ||
+    path === "/api/dashboard/plugins/rescan" ||
+    path === "/api/enterprise/invites/redeem" ||
+    path === "/api/enterprise/me" ||
+    path === "/api/enterprise/chat" ||
+    path.startsWith("/api/enterprise/portal/") ||
+    path.startsWith("/api/plugins/")
+  );
+}
+
+function shouldReloadForStaleDashboardToken(url: string, status: number): boolean {
+  return status === 401 && url.startsWith("/api/") && !isPublicApiPath(url);
+}
 
 function setSessionHeader(headers: Headers, token: string): void {
   if (!headers.has(SESSION_HEADER)) {
@@ -26,6 +49,17 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
     setSessionHeader(headers, token);
   }
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
+  if (res.ok) {
+    window.sessionStorage.removeItem(TOKEN_RELOAD_FLAG);
+  }
+  if (shouldReloadForStaleDashboardToken(url, res.status)) {
+    const alreadyReloaded = window.sessionStorage.getItem(TOKEN_RELOAD_FLAG) === "1";
+    if (!alreadyReloaded) {
+      window.sessionStorage.setItem(TOKEN_RELOAD_FLAG, "1");
+      window.location.reload();
+      throw new Error("Dashboard session expired; reloading");
+    }
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${text}`);
@@ -217,7 +251,259 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     }),
+
+  getEnterpriseStatus: () =>
+    fetchJSON<EnterpriseStatusResponse>("/api/enterprise/status"),
+  initEnterprise: (payload: {
+    name: string;
+    tenant_id?: string;
+    admin_email?: string;
+    admin_name?: string;
+  }) =>
+    fetchJSON<EnterpriseInitResponse>("/api/enterprise/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  getEnterpriseUsers: () =>
+    fetchJSON<{ users: EnterpriseUser[] }>("/api/enterprise/users"),
+  getEnterpriseAgents: () =>
+    fetchJSON<{ agents: EnterpriseAgent[] }>("/api/enterprise/agents"),
+  createEnterpriseAgent: (payload: EnterpriseAgentPayload) =>
+    fetchJSON<{ agent: EnterpriseAgent }>("/api/enterprise/agents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  updateEnterpriseAgent: (id: string, payload: EnterpriseAgentPayload) =>
+    fetchJSON<{ agent: EnterpriseAgent }>(
+      `/api/enterprise/agents/${encodeURIComponent(id)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    ),
+  getEnterpriseInvites: () =>
+    fetchJSON<{ invites: EnterpriseInvite[] }>("/api/enterprise/invites"),
+  createEnterpriseInvite: (payload: {
+    email?: string;
+    role?: "member" | "admin";
+    max_uses?: number;
+    expires_days?: number | null;
+    agent_ids?: string[];
+  }) =>
+    fetchJSON<EnterpriseInviteCreated>("/api/enterprise/invites", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+
+  redeemEnterpriseInvite: (payload: { code: string; email?: string; name?: string }) =>
+    fetchJSON<EnterpriseRedeemResponse>("/api/enterprise/invites/redeem", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  getEnterpriseMe: (token: string) =>
+    fetchJSON<EnterpriseMeResponse>("/api/enterprise/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+  enterpriseChat: (payload: {
+    token: string;
+    message: string;
+    session_id?: string;
+    agent_id?: string;
+  }) =>
+    fetchJSON<EnterpriseChatResponse>("/api/enterprise/chat", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${payload.token}`,
+      },
+      body: JSON.stringify({
+        message: payload.message,
+        session_id: payload.session_id,
+        agent_id: payload.agent_id,
+      }),
+      }),
+  getEnterprisePortalSkills: (token: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+    return fetchJSON<{ agent: EnterpriseAgent; skills: SkillInfo[]; selected: string[] }>(
+      `/api/enterprise/portal/skills${qs}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  },
+  toggleEnterprisePortalSkill: (payload: {
+    token: string;
+    agent_id: string;
+    name: string;
+    enabled: boolean;
+  }) =>
+    fetchJSON<{ ok: boolean; name: string; enabled: boolean; selected: string[] }>(
+      "/api/enterprise/portal/skills/toggle",
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${payload.token}`,
+        },
+        body: JSON.stringify({
+          agent_id: payload.agent_id,
+          name: payload.name,
+          enabled: payload.enabled,
+        }),
+      },
+    ),
+  getEnterprisePortalToolsets: (token: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+    return fetchJSON<{ agent: EnterpriseAgent; toolsets: ToolsetInfo[] }>(
+      `/api/enterprise/portal/tools/toolsets${qs}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  },
+  getEnterprisePortalCronJobs: (token: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+    return fetchJSON<{ agent: EnterpriseAgent; jobs: CronJob[] }>(
+      `/api/enterprise/portal/cron/jobs${qs}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  },
+  createEnterprisePortalCronJob: (payload: {
+    token: string;
+    agent_id: string;
+    prompt: string;
+    schedule: string;
+    name?: string;
+  }) =>
+    fetchJSON<CronJob>("/api/enterprise/portal/cron/jobs", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${payload.token}`,
+      },
+      body: JSON.stringify({
+        agent_id: payload.agent_id,
+        prompt: payload.prompt,
+        schedule: payload.schedule,
+        name: payload.name,
+      }),
+    }),
+  pauseEnterprisePortalCronJob: (token: string, id: string) =>
+    fetchJSON<CronJob>(`/api/enterprise/portal/cron/jobs/${encodeURIComponent(id)}/pause`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+  resumeEnterprisePortalCronJob: (token: string, id: string) =>
+    fetchJSON<CronJob>(`/api/enterprise/portal/cron/jobs/${encodeURIComponent(id)}/resume`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+  deleteEnterprisePortalCronJob: (token: string, id: string) =>
+    fetchJSON<{ ok: boolean }>(`/api/enterprise/portal/cron/jobs/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    }),
 };
+
+export interface EnterpriseUser {
+  id: string;
+  tenant_id: string;
+  email?: string | null;
+  name?: string | null;
+  role: string;
+  created_at?: number;
+  disabled_at?: number | null;
+}
+
+export interface EnterpriseTenant {
+  id: string;
+  name: string;
+  created_at: number;
+}
+
+export interface EnterpriseStatusResponse {
+  initialized: boolean;
+  tenant: EnterpriseTenant | null;
+  users: EnterpriseUser[];
+  agents?: EnterpriseAgent[];
+}
+
+export interface EnterpriseInitResponse {
+  tenant: EnterpriseTenant;
+  admin_user?: EnterpriseUser;
+  admin_api_key?: string;
+  agent?: EnterpriseAgent;
+  created: boolean;
+}
+
+export interface EnterpriseAgent {
+  id: string;
+  tenant_id: string;
+  name: string;
+  description?: string | null;
+  status: "active" | "disabled" | string;
+  role_prompt?: string | null;
+  task_prompt?: string | null;
+  tone_prompt?: string | null;
+  instructions?: string | null;
+  escalation_prompt?: string | null;
+  knowledge?: string | null;
+  access_role?: string | null;
+  created_by_user_id?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface EnterpriseAgentPayload {
+  name: string;
+  description?: string;
+  role_prompt?: string;
+  task_prompt?: string;
+  tone_prompt?: string;
+  instructions?: string;
+  escalation_prompt?: string;
+  knowledge?: string;
+  status?: string;
+}
+
+export interface EnterpriseInvite {
+  tenant_id: string;
+  email?: string | null;
+  role: string;
+  max_uses: number;
+  uses: number;
+  expires_at?: number | null;
+  created_by_user_id?: string | null;
+  created_at: number;
+  revoked_at?: number | null;
+  agent_ids?: string[];
+  agent_names?: string[];
+}
+
+export interface EnterpriseInviteCreated extends EnterpriseInvite {
+  code: string;
+}
+
+export interface EnterpriseRedeemResponse {
+  user: EnterpriseUser;
+  api_key: string;
+  api_base: string;
+  agents: EnterpriseAgent[];
+}
+
+export interface EnterpriseMeResponse {
+  user: EnterpriseUser;
+  agents: EnterpriseAgent[];
+}
+
+export interface EnterpriseChatResponse {
+  session_id: string;
+  final_response: string;
+  user: EnterpriseUser;
+  agent?: EnterpriseAgent;
+  agents?: EnterpriseAgent[];
+}
 
 export interface ActionResponse {
   name: string;

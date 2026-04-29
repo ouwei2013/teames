@@ -4,6 +4,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch
 
+from agent.access_context import AccessContext
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager
 
@@ -82,6 +83,26 @@ class MetadataMemoryProvider(FakeMemoryProvider):
 
     def on_memory_write(self, action, target, content, metadata=None):
         self.memory_writes.append((action, target, content, metadata or {}))
+
+
+class ContextAwareMemoryProvider(FakeMemoryProvider):
+    """Provider that opts into AccessContext on runtime memory calls."""
+
+    def __init__(self, name="context-aware"):
+        super().__init__(name=name)
+        self.prefetch_contexts = []
+        self.queue_contexts = []
+        self.sync_contexts = []
+
+    def prefetch(self, query, *, session_id="", access_context=None):
+        self.prefetch_contexts.append(access_context)
+        return self._prefetch_result
+
+    def queue_prefetch(self, query, *, session_id="", access_context=None):
+        self.queue_contexts.append(access_context)
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", access_context=None):
+        self.sync_contexts.append(access_context)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +256,38 @@ class TestMemoryManager:
         mgr.sync_all("user msg", "assistant msg")
         assert p1.synced_turns == [("user msg", "assistant msg")]
         assert p2.synced_turns == [("user msg", "assistant msg")]
+
+    def test_access_context_forwarded_to_context_aware_provider(self):
+        ctx = AccessContext(
+            tenant_id="tenant-a",
+            workspace_id="workspace-1",
+            user_id="user-1",
+            agent_id="agent-sales",
+        )
+        mgr = MemoryManager(access_context=ctx)
+        provider = ContextAwareMemoryProvider()
+        mgr.add_provider(provider)
+
+        mgr.prefetch_all("query", session_id="session-1")
+        mgr.queue_prefetch_all("query", session_id="session-1")
+        mgr.sync_all("user msg", "assistant msg", session_id="session-1")
+
+        assert provider.prefetch_contexts == [ctx]
+        assert provider.queue_contexts == [ctx]
+        assert provider.sync_contexts == [ctx]
+
+    def test_access_context_not_forced_on_legacy_provider(self):
+        mgr = MemoryManager(access_context=AccessContext(tenant_id="tenant-a"))
+        provider = FakeMemoryProvider()
+        mgr.add_provider(provider)
+
+        mgr.prefetch_all("query", session_id="session-1")
+        mgr.queue_prefetch_all("query", session_id="session-1")
+        mgr.sync_all("user msg", "assistant msg", session_id="session-1")
+
+        assert provider.prefetch_queries == ["query"]
+        assert provider.queued_prefetches == ["query"]
+        assert provider.synced_turns == [("user msg", "assistant msg")]
 
     def test_sync_failure_doesnt_block_others(self):
         """If one provider's sync fails, others still run."""

@@ -30,8 +30,9 @@ import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from agent.access_context import AccessContext
 from hermes_constants import get_hermes_home
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Mapping, Optional
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -50,9 +51,32 @@ logger = logging.getLogger(__name__)
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
-def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+def _scope_part(label: str, value: str | None) -> str:
+    """Return a filesystem-safe scope component with a short collision guard."""
+    import hashlib
+
+    raw = str(value or "default")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip(".-")[:48] or "default"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{label}-{slug}-{digest}"
+
+
+def get_memory_dir(
+    access_context: AccessContext | Mapping[str, Any] | None = None,
+) -> Path:
+    """Return the memory directory for personal or enterprise-scoped storage."""
+    ctx = AccessContext.coerce(access_context)
+    base = get_hermes_home() / "memories"
+    if ctx.is_empty():
+        return base
+    return (
+        base
+        / "enterprise"
+        / _scope_part("tenant", ctx.tenant_id)
+        / _scope_part("workspace", ctx.workspace_id)
+        / _scope_part("agent", ctx.agent_id)
+        / _scope_part("user", ctx.user_id)
+    )
 
 ENTRY_DELIMITER = "\n§\n"
 
@@ -113,17 +137,31 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        *,
+        memory_dir: Path | str | None = None,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        ctx = AccessContext.coerce(access_context)
+        if memory_dir is not None:
+            self.memory_dir = Path(memory_dir)
+        elif ctx.is_empty():
+            self.memory_dir = get_memory_dir()
+        else:
+            self.memory_dir = get_memory_dir(ctx)
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
-        mem_dir = get_memory_dir()
+        mem_dir = self.memory_dir
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
@@ -176,9 +214,8 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
-        mem_dir = get_memory_dir()
+    def _path_for(self, target: str) -> Path:
+        mem_dir = self.memory_dir
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
@@ -194,7 +231,7 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
@@ -578,7 +615,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

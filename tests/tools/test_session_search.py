@@ -406,6 +406,25 @@ class TestSessionSearch:
         ))
         assert result["success"] is True
 
+    def test_access_context_passed_to_db_search(self):
+        """Enterprise session_search must stay inside the active access context."""
+        from unittest.mock import MagicMock
+        from agent.access_context import AccessContext
+        from tools.session_search_tool import session_search
+
+        ctx = AccessContext(tenant_id="tenant-a", user_id="user-1")
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+
+        result = json.loads(session_search(
+            query="test",
+            db=mock_db,
+            access_context=ctx,
+        ))
+
+        assert result["success"] is True
+        assert mock_db.search_messages.call_args.kwargs["access_context"] == ctx
+
     def test_current_root_session_excludes_child_lineage(self):
         """Delegation child hits should be excluded when they resolve to the current root session."""
         from unittest.mock import MagicMock

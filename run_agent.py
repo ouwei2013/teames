@@ -42,7 +42,6 @@ import uuid
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs, urlunparse
 from openai import OpenAI
-import fire
 from datetime import datetime
 from pathlib import Path
 
@@ -81,6 +80,7 @@ from tools.browser_tool import cleanup_browser
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.access_context import AccessContext
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -882,6 +882,10 @@ class AIAgent:
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        tenant_id: str = None,
+        workspace_id: str = None,
+        agent_id: str = None,
+        access_context: AccessContext | Dict[str, Any] | None = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
@@ -956,6 +960,13 @@ class AIAgent:
         self._chat_type = chat_type
         self._thread_id = thread_id
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        self.access_context = AccessContext.coerce(
+            access_context,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            agent_id=agent_id,
+        )
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1564,7 +1575,7 @@ class AIAgent:
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
                     },
-                    user_id=None,
+                    **self.access_context.session_kwargs(),
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
@@ -1611,6 +1622,7 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        access_context=self.access_context,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -1625,10 +1637,16 @@ class AIAgent:
             try:
                 _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-                if _mem_provider_name:
+                if _mem_provider_name and not self.access_context.is_empty():
+                    logger.warning(
+                        "Skipping external memory provider '%s' for enterprise access "
+                        "context because provider isolation support is not declared.",
+                        _mem_provider_name,
+                    )
+                elif _mem_provider_name:
                     from agent.memory_manager import MemoryManager as _MemoryManager
                     from plugins.memory import load_memory_provider as _load_mem
-                    self._memory_manager = _MemoryManager()
+                    self._memory_manager = _MemoryManager(access_context=self.access_context)
                     _mp = _load_mem(_mem_provider_name)
                     if _mp and _mp.is_available():
                         self._memory_manager.add_provider(_mp)
@@ -1638,6 +1656,7 @@ class AIAgent:
                             "platform": platform or "cli",
                             "hermes_home": str(get_hermes_home()),
                             "agent_context": "primary",
+                            "access_context": self.access_context,
                         }
                         # Thread session title for memory provider scoping
                         # (e.g. honcho uses this to derive chat-scoped session keys)
@@ -3358,6 +3377,7 @@ class AIAgent:
                 self.session_id,
                 source=self.platform or "cli",
                 model=self.model,
+                **self.access_context.session_kwargs(),
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
@@ -4276,8 +4296,15 @@ class AIAgent:
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:
-            self._memory_manager.sync_all(original_user_message, final_response)
-            self._memory_manager.queue_prefetch_all(original_user_message)
+            self._memory_manager.sync_all(
+                original_user_message,
+                final_response,
+                session_id=self.session_id,
+            )
+            self._memory_manager.queue_prefetch_all(
+                original_user_message,
+                session_id=self.session_id,
+            )
         except Exception:
             pass
 
@@ -8103,6 +8130,7 @@ class AIAgent:
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
+                    **self.access_context.session_kwargs(),
                     parent_session_id=old_session_id,
                 )
                 # Auto-number the title for the continuation session
@@ -8231,6 +8259,7 @@ class AIAgent:
                 limit=function_args.get("limit", 3),
                 db=self._session_db,
                 current_session_id=self.session_id,
+                access_context=self.access_context,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -8743,6 +8772,7 @@ class AIAgent:
                         limit=function_args.get("limit", 3),
                         db=self._session_db,
                         current_session_id=self.session_id,
+                        access_context=self.access_context,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
@@ -9510,7 +9540,12 @@ class AIAgent:
         if self._memory_manager:
             try:
                 _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-                self._memory_manager.on_turn_start(self._user_turn_count, _turn_msg)
+                self._memory_manager.on_turn_start(
+                    self._user_turn_count,
+                    _turn_msg,
+                    access_context=self.access_context,
+                    session_id=self.session_id,
+                )
             except Exception:
                 pass
 
@@ -9523,7 +9558,13 @@ class AIAgent:
         if self._memory_manager:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
-                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+                _ext_prefetch_cache = (
+                    self._memory_manager.prefetch_all(
+                        _query,
+                        session_id=self.session_id,
+                    )
+                    or ""
+                )
             except Exception:
                 pass
 
@@ -12769,4 +12810,11 @@ def main(
 
 
 if __name__ == "__main__":
+    try:
+        import fire
+    except ImportError as exc:
+        raise SystemExit(
+            "The standalone run_agent.py CLI requires the optional 'fire' package. "
+            "Install project dependencies or run Hermes through hermes_cli.main."
+        ) from exc
     fire.Fire(main)

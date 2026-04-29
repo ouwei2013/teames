@@ -34,6 +34,7 @@ import re
 import inspect
 from typing import Any, Dict, List, Optional
 
+from agent.access_context import AccessContext
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
@@ -88,10 +89,30 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, access_context: AccessContext | Dict[str, Any] | None = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self._access_context = AccessContext.coerce(access_context)
+
+    def set_access_context(self, access_context: AccessContext | Dict[str, Any] | None) -> None:
+        """Update the runtime access context used for provider calls."""
+        self._access_context = AccessContext.coerce(access_context)
+
+    def _access_kwargs_for(self, callable_obj) -> Dict[str, Any]:
+        """Return context kwargs only when the provider method accepts them."""
+        if self._access_context.is_empty():
+            return {}
+        try:
+            signature = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            return {}
+        params = signature.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return {"access_context": self._access_context}
+        if "access_context" in params:
+            return {"access_context": self._access_context}
+        return {}
 
     # -- Registration --------------------------------------------------------
 
@@ -185,7 +206,11 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = provider.prefetch(query, session_id=session_id)
+                result = provider.prefetch(
+                    query,
+                    session_id=session_id,
+                    **self._access_kwargs_for(provider.prefetch),
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -199,7 +224,11 @@ class MemoryManager:
         """Queue background prefetch on all providers for the next turn."""
         for provider in self._providers:
             try:
-                provider.queue_prefetch(query, session_id=session_id)
+                provider.queue_prefetch(
+                    query,
+                    session_id=session_id,
+                    **self._access_kwargs_for(provider.queue_prefetch),
+                )
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
@@ -212,7 +241,12 @@ class MemoryManager:
         """Sync a completed turn to all providers."""
         for provider in self._providers:
             try:
-                provider.sync_turn(user_content, assistant_content, session_id=session_id)
+                provider.sync_turn(
+                    user_content,
+                    assistant_content,
+                    session_id=session_id,
+                    **self._access_kwargs_for(provider.sync_turn),
+                )
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' sync_turn failed: %s",
@@ -259,6 +293,8 @@ class MemoryManager:
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         try:
+            if not self._access_context.is_empty():
+                kwargs.setdefault("access_context", self._access_context)
             return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
             logger.error(
@@ -350,6 +386,12 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        scoped_metadata = dict(metadata or {})
+        if not self._access_context.is_empty():
+            scoped_metadata.setdefault(
+                "access_context",
+                self._access_context.as_dict(),
+            )
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -357,10 +399,10 @@ class MemoryManager:
                 metadata_mode = self._provider_memory_write_metadata_mode(provider)
                 if metadata_mode == "keyword":
                     provider.on_memory_write(
-                        action, target, content, metadata=dict(metadata or {})
+                        action, target, content, metadata=dict(scoped_metadata)
                     )
                 elif metadata_mode == "positional":
-                    provider.on_memory_write(action, target, content, dict(metadata or {}))
+                    provider.on_memory_write(action, target, content, dict(scoped_metadata))
                 else:
                     provider.on_memory_write(action, target, content)
             except Exception as e:
@@ -404,6 +446,8 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+        if "access_context" not in kwargs and not self._access_context.is_empty():
+            kwargs["access_context"] = self._access_context
         for provider in self._providers:
             try:
                 provider.initialize(session_id=session_id, **kwargs)

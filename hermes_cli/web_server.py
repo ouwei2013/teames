@@ -106,6 +106,13 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
     "/api/dashboard/plugins/rescan",
+    "/api/enterprise/invites/redeem",
+    "/api/enterprise/me",
+    "/api/enterprise/chat",
+    "/api/enterprise/portal/cron/jobs",
+    "/api/enterprise/portal/skills/toggle",
+    "/api/enterprise/portal/skills",
+    "/api/enterprise/portal/tools/toolsets",
 })
 
 
@@ -224,7 +231,12 @@ async def host_header_middleware(request: Request, call_next):
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
+    is_public = (
+        path in _PUBLIC_API_PATHS
+        or path.startswith("/api/plugins/")
+        or path.startswith("/api/enterprise/portal/cron/jobs/")
+    )
+    if path.startswith("/api/") and not is_public:
         if not _has_valid_session_token(request):
             return JSONResponse(
                 status_code=401,
@@ -432,6 +444,58 @@ class EnvVarDelete(BaseModel):
 
 class EnvVarReveal(BaseModel):
     key: str
+
+
+class EnterpriseInitBody(BaseModel):
+    name: str
+    tenant_id: Optional[str] = None
+    admin_email: Optional[str] = None
+    admin_name: Optional[str] = None
+
+
+class EnterpriseInviteCreate(BaseModel):
+    email: Optional[str] = None
+    role: str = "member"
+    max_uses: int = 1
+    expires_days: Optional[int] = 7
+    agent_ids: Optional[List[str]] = None
+
+
+class EnterpriseInviteRedeem(BaseModel):
+    code: str
+    email: Optional[str] = None
+    name: Optional[str] = None
+
+
+class EnterpriseChatBody(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    agent_id: Optional[str] = None
+
+
+class EnterpriseAgentBody(BaseModel):
+    name: str
+    description: Optional[str] = None
+    role_prompt: Optional[str] = None
+    task_prompt: Optional[str] = None
+    tone_prompt: Optional[str] = None
+    instructions: Optional[str] = None
+    escalation_prompt: Optional[str] = None
+    knowledge: Optional[str] = None
+    status: Optional[str] = None
+
+
+class EnterpriseSkillToggle(BaseModel):
+    agent_id: str
+    name: str
+    enabled: bool
+
+
+class EnterpriseCronJobCreate(BaseModel):
+    agent_id: str
+    prompt: str
+    schedule: str
+    name: Optional[str] = None
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
@@ -781,6 +845,649 @@ async def search_sessions(q: str = "", limit: int = 20):
     except Exception:
         _log.exception("GET /api/sessions/search failed")
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+@app.get("/api/enterprise/status")
+async def enterprise_status():
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            tenant = store.get_default_tenant()
+            return {
+                "initialized": tenant is not None,
+                "tenant": tenant,
+                "users": store.list_users() if tenant else [],
+                "agents": store.list_agents() if tenant else [],
+            }
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/status failed")
+        raise HTTPException(status_code=500, detail="Enterprise status failed")
+
+
+@app.post("/api/enterprise/init")
+async def enterprise_init(body: EnterpriseInitBody):
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            return store.initialize_tenant(
+                name=body.name,
+                tenant_id=body.tenant_id,
+                admin_email=body.admin_email,
+                admin_name=body.admin_name,
+            )
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/init failed")
+        raise HTTPException(status_code=500, detail="Enterprise initialization failed")
+
+
+@app.get("/api/enterprise/users")
+async def enterprise_users():
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            return {"users": store.list_users()}
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/users failed")
+        raise HTTPException(status_code=500, detail="Enterprise users failed")
+
+
+@app.get("/api/enterprise/agents")
+async def enterprise_agents():
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            return {"agents": store.list_agents()}
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/agents failed")
+        raise HTTPException(status_code=500, detail="Enterprise agents failed")
+
+
+@app.post("/api/enterprise/agents")
+async def enterprise_create_agent(body: EnterpriseAgentBody):
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            agent = store.create_agent(
+                name=body.name,
+                description=body.description,
+                role_prompt=body.role_prompt,
+                task_prompt=body.task_prompt,
+                tone_prompt=body.tone_prompt,
+                instructions=body.instructions,
+                escalation_prompt=body.escalation_prompt,
+                knowledge=body.knowledge,
+            )
+            return {"agent": agent}
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/agents failed")
+        raise HTTPException(status_code=500, detail="Enterprise agent creation failed")
+
+
+@app.put("/api/enterprise/agents/{agent_id}")
+async def enterprise_update_agent(agent_id: str, body: EnterpriseAgentBody):
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            agent = store.update_agent(
+                agent_id,
+                name=body.name,
+                description=body.description,
+                role_prompt=body.role_prompt,
+                task_prompt=body.task_prompt,
+                tone_prompt=body.tone_prompt,
+                instructions=body.instructions,
+                escalation_prompt=body.escalation_prompt,
+                knowledge=body.knowledge,
+                status=body.status,
+            )
+            return {"agent": agent}
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        _log.exception("PUT /api/enterprise/agents/%s failed", agent_id)
+        raise HTTPException(status_code=500, detail="Enterprise agent update failed")
+
+
+@app.get("/api/enterprise/invites")
+async def enterprise_invites():
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            return {"invites": store.list_invites()}
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/invites failed")
+        raise HTTPException(status_code=500, detail="Enterprise invites failed")
+
+
+@app.post("/api/enterprise/invites")
+async def enterprise_create_invite(body: EnterpriseInviteCreate):
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            return store.create_invite(
+                email=body.email,
+                role=body.role,
+                max_uses=body.max_uses,
+                expires_days=body.expires_days,
+                agent_ids=body.agent_ids,
+            )
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/invites failed")
+        raise HTTPException(status_code=500, detail="Enterprise invite creation failed")
+
+
+@app.post("/api/enterprise/invites/redeem")
+async def enterprise_redeem_invite(body: EnterpriseInviteRedeem):
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            result = store.redeem_invite(body.code, email=body.email, name=body.name)
+            return {
+                "user": result["user"],
+                "api_key": result["api_key"],
+                "api_base": "/v1",
+                "agents": result.get("agents", []),
+            }
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/invites/redeem failed")
+        raise HTTPException(status_code=500, detail="Enterprise invite redemption failed")
+
+
+def _enterprise_bearer_token(request: Request) -> str:
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:].strip()
+    return ""
+
+
+@app.get("/api/enterprise/me")
+async def enterprise_me(request: Request):
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            return {
+                "user": auth["user"],
+                "agents": auth.get("agents", []),
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/enterprise/me failed")
+        raise HTTPException(status_code=500, detail="Enterprise profile failed")
+
+
+def _compile_enterprise_skill_prompt(skill_names: List[str]) -> str:
+    """Load user-selected skill instructions for enterprise chat/cron prompts."""
+    if not skill_names:
+        return ""
+    try:
+        from tools.skills_tool import skill_view
+    except Exception:
+        return ""
+
+    sections = []
+    remaining_budget = 24000
+    for name in skill_names:
+        try:
+            payload = json.loads(skill_view(name, preprocess=False))
+        except Exception:
+            continue
+        if not isinstance(payload, dict) or not payload.get("success"):
+            continue
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > remaining_budget:
+            content = content[:remaining_budget].rstrip()
+        sections.append(f"## Skill: {payload.get('name') or name}\n{content}")
+        remaining_budget -= len(content)
+        if remaining_budget <= 0:
+            break
+    if not sections:
+        return ""
+    return "# User-Selected Skills\n" + "\n\n".join(sections)
+
+
+def _append_enterprise_skill_prompt(system_message: str, skill_names: List[str]) -> str:
+    skill_prompt = _compile_enterprise_skill_prompt(skill_names)
+    if not skill_prompt:
+        return system_message
+    return f"{system_message}\n\n{skill_prompt}"
+
+
+def _enterprise_enabled_toolsets(toolsets) -> list[str]:
+    """Toolsets safe for the enterprise browser portal.
+
+    Skills are currently process/profile-scoped under HERMES_HOME. Until
+    writable skills are tenant/user scoped, do not expose skill read/write
+    tools in enterprise user sessions.
+    """
+    blocked = {"skills"}
+    return sorted(str(toolset) for toolset in toolsets if str(toolset) not in blocked)
+
+
+@app.get("/api/enterprise/portal/skills")
+async def enterprise_portal_skills(request: Request, agent_id: Optional[str] = None):
+    try:
+        from enterprise import EnterpriseStore
+        from tools.skills_tool import _find_all_skills
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            agent = store.resolve_user_agent(auth["user"], agent_id=agent_id)
+            selected = set(store.list_user_agent_skill_names(auth["user"], agent["id"]))
+            skills = _find_all_skills(skip_disabled=True)
+            for skill in skills:
+                skill["enabled"] = skill.get("name") in selected
+            return {"agent": agent, "skills": skills, "selected": sorted(selected)}
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/portal/skills failed")
+        raise HTTPException(status_code=500, detail="Enterprise skills failed")
+
+
+@app.put("/api/enterprise/portal/skills/toggle")
+async def enterprise_portal_toggle_skill(request: Request, body: EnterpriseSkillToggle):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            selected = store.set_user_agent_skill(
+                auth["user"],
+                body.agent_id,
+                body.name,
+                body.enabled,
+            )
+            return {
+                "ok": True,
+                "name": body.name,
+                "enabled": body.enabled,
+                "selected": selected,
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("PUT /api/enterprise/portal/skills/toggle failed")
+        raise HTTPException(status_code=500, detail="Enterprise skill toggle failed")
+
+
+@app.get("/api/enterprise/portal/tools/toolsets")
+async def enterprise_portal_toolsets(request: Request, agent_id: Optional[str] = None):
+    try:
+        from enterprise import EnterpriseStore
+        from hermes_cli.tools_config import (
+            _get_effective_configurable_toolsets,
+            _get_platform_tools,
+            _toolset_has_keys,
+        )
+        from toolsets import resolve_toolset
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            agent = store.resolve_user_agent(auth["user"], agent_id=agent_id)
+        finally:
+            store.close()
+
+        config = load_config()
+        enabled_toolsets = set(
+            _enterprise_enabled_toolsets(
+                _get_platform_tools(config, "api_server", include_default_mcp_servers=False)
+            )
+        )
+        result = []
+        for name, label, desc in _get_effective_configurable_toolsets():
+            try:
+                tools = sorted(set(resolve_toolset(name)))
+            except Exception:
+                tools = []
+            result.append({
+                "name": name,
+                "label": label,
+                "description": desc,
+                "enabled": name in enabled_toolsets,
+                "available": name in enabled_toolsets,
+                "configured": _toolset_has_keys(name, config),
+                "tools": tools,
+            })
+        return {"agent": agent, "toolsets": result}
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/portal/tools/toolsets failed")
+        raise HTTPException(status_code=500, detail="Enterprise toolsets failed")
+
+
+def _enterprise_job_matches(job: Dict[str, Any], user: Dict[str, Any], agent_id: str) -> bool:
+    meta = job.get("enterprise") if isinstance(job, dict) else None
+    if not isinstance(meta, dict):
+        return False
+    return (
+        meta.get("tenant_id") == user.get("tenant_id")
+        and meta.get("user_id") == user.get("id")
+        and meta.get("agent_id") == agent_id
+    )
+
+
+def _enterprise_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(job)
+    meta = payload.get("enterprise")
+    if isinstance(meta, dict):
+        payload["agent_id"] = meta.get("agent_id")
+        payload["tenant_id"] = meta.get("tenant_id")
+        payload["user_id"] = meta.get("user_id")
+    return payload
+
+
+@app.get("/api/enterprise/portal/cron/jobs")
+async def enterprise_portal_cron_jobs(request: Request, agent_id: Optional[str] = None):
+    try:
+        from cron.jobs import list_jobs
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            agent = store.resolve_user_agent(auth["user"], agent_id=agent_id)
+            jobs = [
+                _enterprise_job_payload(job)
+                for job in list_jobs(include_disabled=True)
+                if _enterprise_job_matches(job, auth["user"], agent["id"])
+            ]
+            return {"agent": agent, "jobs": jobs}
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/portal/cron/jobs failed")
+        raise HTTPException(status_code=500, detail="Enterprise cron jobs failed")
+
+
+@app.post("/api/enterprise/portal/cron/jobs")
+async def enterprise_portal_create_cron_job(request: Request, body: EnterpriseCronJobCreate):
+    try:
+        from agent.access_context import AccessContext
+        from cron.jobs import create_job, update_job
+        from enterprise import EnterpriseStore
+        from gateway.run import _load_gateway_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            agent = store.resolve_user_agent(auth["user"], agent_id=body.agent_id)
+            skill_names = store.list_user_agent_skill_names(auth["user"], agent["id"])
+            access_context = AccessContext(
+                tenant_id=auth["user"]["tenant_id"],
+                workspace_id="default",
+                user_id=auth["user"]["id"],
+                agent_id=agent["id"],
+            )
+            system_message = _append_enterprise_skill_prompt(
+                store.compile_agent_prompt(agent),
+                skill_names,
+            )
+        finally:
+            store.close()
+
+        user_config = _load_gateway_config()
+        enabled_toolsets = _enterprise_enabled_toolsets(
+            _get_platform_tools(user_config, "cron")
+        )
+        job = create_job(
+            prompt=body.prompt.strip(),
+            schedule=body.schedule.strip(),
+            name=(body.name or "").strip() or None,
+            deliver="local",
+            skills=skill_names,
+            enabled_toolsets=enabled_toolsets,
+            origin={"platform": "enterprise_portal", "agent_id": agent["id"]},
+        )
+        updated = update_job(
+            job["id"],
+            {
+                "enterprise": {
+                    "tenant_id": auth["user"]["tenant_id"],
+                    "user_id": auth["user"]["id"],
+                    "agent_id": agent["id"],
+                    "agent_name": agent["name"],
+                },
+                "access_context": access_context.as_dict(),
+                "enterprise_system_message": system_message,
+            },
+        )
+        return _enterprise_job_payload(updated or job)
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _log.exception("POST /api/enterprise/portal/cron/jobs failed")
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _load_enterprise_scoped_cron_job(request: Request, job_id: str):
+    from cron.jobs import get_job
+    from enterprise import EnterpriseStore
+
+    store = EnterpriseStore()
+    try:
+        auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+        if not auth:
+            raise HTTPException(status_code=401, detail="Invalid user token")
+        job = get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        meta = job.get("enterprise") if isinstance(job, dict) else None
+        agent_id = meta.get("agent_id") if isinstance(meta, dict) else None
+        if not agent_id or not _enterprise_job_matches(job, auth["user"], agent_id):
+            raise HTTPException(status_code=404, detail="Job not found")
+        try:
+            store.resolve_user_agent(auth["user"], agent_id=agent_id)
+        except PermissionError:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
+    finally:
+        store.close()
+
+
+@app.post("/api/enterprise/portal/cron/jobs/{job_id}/pause")
+async def enterprise_portal_pause_cron_job(request: Request, job_id: str):
+    from cron.jobs import pause_job
+    _load_enterprise_scoped_cron_job(request, job_id)
+    job = pause_job(job_id)
+    return _enterprise_job_payload(job)
+
+
+@app.post("/api/enterprise/portal/cron/jobs/{job_id}/resume")
+async def enterprise_portal_resume_cron_job(request: Request, job_id: str):
+    from cron.jobs import resume_job
+    _load_enterprise_scoped_cron_job(request, job_id)
+    job = resume_job(job_id)
+    return _enterprise_job_payload(job)
+
+
+@app.delete("/api/enterprise/portal/cron/jobs/{job_id}")
+async def enterprise_portal_delete_cron_job(request: Request, job_id: str):
+    from cron.jobs import remove_job
+    _load_enterprise_scoped_cron_job(request, job_id)
+    if not remove_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"ok": True}
+
+
+@app.post("/api/enterprise/chat")
+async def enterprise_chat(request: Request, body: EnterpriseChatBody):
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    try:
+        from enterprise import EnterpriseStore
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if auth:
+                agent = store.resolve_user_agent(
+                    auth["user"],
+                    agent_id=(body.agent_id or None),
+                )
+                auth["agent"] = agent
+                auth["agents"] = store.list_user_agents(auth["user"]["id"])
+                auth["access_context"] = AccessContext(
+                    tenant_id=auth["user"]["tenant_id"],
+                    workspace_id="default",
+                    user_id=auth["user"]["id"],
+                    agent_id=agent["id"],
+                )
+                auth["system_message"] = _append_enterprise_skill_prompt(
+                    store.compile_agent_prompt(agent),
+                    store.list_user_agent_skill_names(auth["user"], agent["id"]),
+                )
+        finally:
+            store.close()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("Enterprise user authentication failed")
+        raise HTTPException(status_code=500, detail="Enterprise authentication failed")
+
+    if not auth:
+        raise HTTPException(status_code=401, detail="Invalid user token")
+
+    access_context = auth["access_context"]
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        import uuid as _uuid
+        session_id = f"web-{_uuid.uuid4().hex[:16]}"
+
+    def _run_chat():
+        from gateway.run import (
+            _load_gateway_config,
+            _resolve_gateway_model,
+            _resolve_runtime_agent_kwargs,
+        )
+        from hermes_cli.tools_config import _get_platform_tools
+        from run_agent import AIAgent
+        from hermes_state import SessionDB
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+        user_config = _load_gateway_config()
+        enabled_toolsets = _enterprise_enabled_toolsets(
+            _get_platform_tools(user_config, "api_server")
+        )
+        db = SessionDB()
+        try:
+            history = db.get_messages_as_conversation(
+                session_id,
+                access_context=access_context,
+            )
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                session_id=session_id,
+                platform="web",
+                session_db=db,
+                access_context=access_context,
+            )
+            result = agent.run_conversation(
+                user_message=message,
+                system_message=auth.get("system_message"),
+                conversation_history=history,
+                task_id="enterprise-web",
+            )
+            return {
+                "session_id": session_id,
+                "final_response": result.get("final_response", ""),
+                "user": auth["user"],
+                "agent": auth.get("agent"),
+                "agents": auth.get("agents", []),
+            }
+        finally:
+            db.close()
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, _run_chat)
+    except Exception as exc:
+        _log.exception("Enterprise chat failed")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {exc}")
 
 
 def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:

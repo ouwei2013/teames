@@ -8,9 +8,11 @@ from tools.memory_tool import (
     MemoryStore,
     memory_tool,
     _scan_memory_content,
+    get_memory_dir,
     ENTRY_DELIMITER,
     MEMORY_SCHEMA,
 )
+from agent.access_context import AccessContext
 
 
 # =========================================================================
@@ -206,6 +208,34 @@ class TestMemoryStorePersistence:
         store = MemoryStore()
         store.load_from_disk()
         assert len(store.memory_entries) == 2
+
+    def test_enterprise_user_memory_is_scoped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        first = AccessContext(
+            tenant_id="tenant-a",
+            workspace_id="default",
+            agent_id="default",
+            user_id="user-1",
+        )
+        second = AccessContext(
+            tenant_id="tenant-a",
+            workspace_id="default",
+            agent_id="default",
+            user_id="user-2",
+        )
+
+        store1 = MemoryStore(access_context=first)
+        store1.load_from_disk()
+        store1.add("user", "Name: Alice")
+
+        store2 = MemoryStore(access_context=second)
+        store2.load_from_disk()
+        assert store2.user_entries == []
+
+        store1_reloaded = MemoryStore(access_context=first)
+        store1_reloaded.load_from_disk()
+        assert store1_reloaded.user_entries == ["Name: Alice"]
+        assert get_memory_dir(first) != get_memory_dir(second)
 
 
 class TestMemoryStoreSnapshot:

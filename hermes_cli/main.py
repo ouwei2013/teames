@@ -1229,6 +1229,97 @@ def cmd_gateway(args):
     gateway_command(args)
 
 
+def cmd_enterprise(args):
+    """Enterprise tenant, invite, and user onboarding commands."""
+    from enterprise import EnterpriseStore
+
+    store = EnterpriseStore()
+    try:
+        action = getattr(args, "enterprise_action", None)
+        if action == "init":
+            result = store.initialize_tenant(
+                name=args.name,
+                tenant_id=getattr(args, "tenant_id", None),
+                admin_email=getattr(args, "admin_email", None),
+                admin_name=getattr(args, "admin_name", None),
+            )
+            tenant = result["tenant"]
+            if result.get("created"):
+                print(f"Enterprise tenant created: {tenant['name']} ({tenant['id']})")
+                print()
+                print("Admin API key:")
+                print(result["admin_api_key"])
+                print()
+                print("Save this key now; it is shown only once.")
+            else:
+                print(f"Enterprise tenant already initialized: {tenant['name']} ({tenant['id']})")
+            return
+
+        if action == "invite":
+            invite = store.create_invite(
+                email=getattr(args, "email", None),
+                role=getattr(args, "role", "member"),
+                max_uses=getattr(args, "max_uses", 1),
+                expires_days=getattr(args, "expires_days", 7),
+            )
+            print("Invite code:")
+            print(invite["code"])
+            if invite.get("email"):
+                print(f"Restricted to: {invite['email']}")
+            print(f"Role: {invite['role']}")
+            return
+
+        if action == "redeem":
+            result = store.redeem_invite(
+                args.code,
+                email=getattr(args, "email", None),
+                name=getattr(args, "name", None),
+            )
+            print(f"User created: {result['user']['name']} ({result['user']['id']})")
+            print()
+            print("User API key:")
+            print(result["api_key"])
+            print()
+            print("Use this key as the OpenAI-compatible Bearer token.")
+            return
+
+        if action == "users":
+            users = store.list_users()
+            if not users:
+                print("No enterprise users.")
+                return
+            for u in users:
+                email = u.get("email") or "-"
+                disabled = " disabled" if u.get("disabled_at") else ""
+                print(f"{u['id']}\t{u['role']}\t{email}\t{u.get('name') or '-'}{disabled}")
+            return
+
+        if action == "invites":
+            invites = store.list_invites()
+            if not invites:
+                print("No enterprise invites.")
+                return
+            for inv in invites:
+                email = inv.get("email") or "-"
+                uses = f"{inv.get('uses', 0)}/{inv.get('max_uses', 1)}"
+                status = "revoked" if inv.get("revoked_at") else "active"
+                if inv.get("expires_at") and inv["expires_at"] < _time.time():
+                    status = "expired"
+                print(f"{status}\t{inv['role']}\t{uses}\t{email}")
+            return
+
+        tenant = store.get_default_tenant()
+        if not tenant:
+            print("Enterprise tenant is not initialized.")
+            print("Run: hermes enterprise init --name \"Your Company\"")
+            return
+        print(f"Enterprise tenant: {tenant['name']} ({tenant['id']})")
+        print(f"Users: {len(store.list_users())}")
+        print(f"Invites: {len(store.list_invites())}")
+    finally:
+        store.close()
+
+
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
@@ -6778,6 +6869,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "chat",
         "model",
         "gateway",
+        "enterprise",
         "setup",
         "whatsapp",
         "login",
@@ -7623,6 +7715,54 @@ For more help on a command:
         action="store_true",
         help="Stop ALL gateway processes across all profiles",
     )
+
+    # =========================================================================
+    # enterprise command
+    # =========================================================================
+    enterprise_parser = subparsers.add_parser(
+        "enterprise",
+        help="Manage enterprise tenant users and invites",
+        description="Initialize an enterprise tenant and manage invite-based user onboarding",
+    )
+    enterprise_subparsers = enterprise_parser.add_subparsers(dest="enterprise_action")
+    enterprise_parser.set_defaults(func=cmd_enterprise)
+
+    enterprise_init = enterprise_subparsers.add_parser(
+        "init",
+        help="Initialize the enterprise tenant and first admin",
+    )
+    enterprise_init.add_argument("--name", required=True, help="Company or tenant name")
+    enterprise_init.add_argument("--tenant-id", help="Optional stable tenant id")
+    enterprise_init.add_argument("--admin-email", help="Initial admin email")
+    enterprise_init.add_argument("--admin-name", help="Initial admin display name")
+    enterprise_init.set_defaults(func=cmd_enterprise)
+
+    enterprise_invite = enterprise_subparsers.add_parser(
+        "invite",
+        help="Create an invite code for a user",
+    )
+    enterprise_invite.add_argument("--email", help="Restrict the invite to this email")
+    enterprise_invite.add_argument(
+        "--role",
+        choices=["member", "admin"],
+        default="member",
+        help="Role for the invited user",
+    )
+    enterprise_invite.add_argument("--max-uses", type=int, default=1, help="Maximum number of redemptions")
+    enterprise_invite.add_argument("--expires-days", type=int, default=7, help="Invite expiry in days")
+    enterprise_invite.set_defaults(func=cmd_enterprise)
+
+    enterprise_redeem = enterprise_subparsers.add_parser(
+        "redeem",
+        help="Redeem an invite code and print a user API key",
+    )
+    enterprise_redeem.add_argument("code", help="Invite code")
+    enterprise_redeem.add_argument("--email", help="User email")
+    enterprise_redeem.add_argument("--name", help="User display name")
+    enterprise_redeem.set_defaults(func=cmd_enterprise)
+
+    enterprise_subparsers.add_parser("users", help="List enterprise users").set_defaults(func=cmd_enterprise)
+    enterprise_subparsers.add_parser("invites", help="List enterprise invites").set_defaults(func=cmd_enterprise)
 
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser(

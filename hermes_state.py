@@ -22,8 +22,9 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from agent.access_context import AccessContext
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -40,6 +41,9 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    workspace_id TEXT,
+    agent_id TEXT,
     source TEXT NOT NULL,
     user_id TEXT,
     model TEXT,
@@ -66,6 +70,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
+    visibility TEXT DEFAULT 'private',
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -92,9 +97,6 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
-CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 """
 
@@ -166,6 +168,46 @@ class SessionDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
 
         self._init_schema()
+
+    @staticmethod
+    def _coerce_access_context(
+        access_context: AccessContext | Mapping[str, Any] | None,
+    ) -> AccessContext | None:
+        if access_context is None:
+            return None
+        return AccessContext.coerce(access_context)
+
+    @classmethod
+    def _access_where(
+        cls,
+        access_context: AccessContext | Mapping[str, Any] | None,
+        *,
+        alias: str = "s",
+    ) -> tuple[list[str], list[Any]]:
+        """Return SQL predicates that constrain reads to an access context.
+
+        Personal mode passes no context and remains unrestricted. Enterprise
+        callers should pass a context on every read path so session/history
+        lookups cannot cross tenant, workspace, user, or agent boundaries.
+        """
+        ctx = cls._coerce_access_context(access_context)
+        if not ctx or ctx.is_empty():
+            return [], []
+
+        prefix = f"{alias}." if alias else ""
+        fields = (
+            ("tenant_id", ctx.tenant_id),
+            ("workspace_id", ctx.workspace_id),
+            ("user_id", ctx.user_id),
+            ("agent_id", ctx.agent_id),
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in fields:
+            if value is not None:
+                clauses.append(f"{prefix}{column} = ?")
+                params.append(value)
+        return clauses, params
 
     # ── Core write helper ──
 
@@ -267,7 +309,11 @@ class SessionDB:
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
         row = cursor.fetchone()
         if row is None:
-            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+            # Existing installs can predate schema_version. Treat them as v1
+            # and run every additive migration below instead of stamping the
+            # latest version onto an old sessions table.
+            current_version = 1
+            cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (current_version,))
         else:
             current_version = row["version"] if isinstance(row, sqlite3.Row) else row[0]
             if current_version < 2:
@@ -366,6 +412,72 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 9")
+            if current_version < 10:
+                # v10: enterprise/multi-tenant session ownership metadata.
+                # Existing personal sessions keep NULL ownership fields so
+                # legacy unscoped reads continue to behave exactly as before.
+                for name, column_type in [
+                    ("tenant_id", "TEXT"),
+                    ("workspace_id", "TEXT"),
+                    ("agent_id", "TEXT"),
+                    ("visibility", "TEXT DEFAULT 'private'"),
+                ]:
+                    try:
+                        safe_name = name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.execute("UPDATE schema_version SET version = 10")
+
+        # Defensive repair: if a database has no/incorrect schema_version row,
+        # ensure the actual table shape is fixed before creating indexes.
+        self._ensure_columns(
+            cursor,
+            "sessions",
+            [
+                ("model_config", "TEXT"),
+                ("system_prompt", "TEXT"),
+                ("parent_session_id", "TEXT"),
+                ("ended_at", "REAL"),
+                ("end_reason", "TEXT"),
+                ("message_count", "INTEGER DEFAULT 0"),
+                ("tool_call_count", "INTEGER DEFAULT 0"),
+                ("input_tokens", "INTEGER DEFAULT 0"),
+                ("output_tokens", "INTEGER DEFAULT 0"),
+                ("title", "TEXT"),
+                ("cache_read_tokens", "INTEGER DEFAULT 0"),
+                ("cache_write_tokens", "INTEGER DEFAULT 0"),
+                ("reasoning_tokens", "INTEGER DEFAULT 0"),
+                ("billing_provider", "TEXT"),
+                ("billing_base_url", "TEXT"),
+                ("billing_mode", "TEXT"),
+                ("estimated_cost_usd", "REAL"),
+                ("actual_cost_usd", "REAL"),
+                ("cost_status", "TEXT"),
+                ("cost_source", "TEXT"),
+                ("pricing_version", "TEXT"),
+                ("api_call_count", "INTEGER DEFAULT 0"),
+                ("tenant_id", "TEXT"),
+                ("workspace_id", "TEXT"),
+                ("agent_id", "TEXT"),
+                ("visibility", "TEXT DEFAULT 'private'"),
+            ],
+        )
+        self._ensure_columns(
+            cursor,
+            "messages",
+            [
+                ("finish_reason", "TEXT"),
+                ("reasoning", "TEXT"),
+                ("reasoning_details", "TEXT"),
+                ("codex_reasoning_items", "TEXT"),
+                ("reasoning_content", "TEXT"),
+                ("codex_message_items", "TEXT"),
+            ],
+        )
+        cursor.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -377,6 +489,20 @@ class SessionDB:
         except sqlite3.OperationalError:
             pass  # Index already exists
 
+        for index_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_tenant ON sessions(tenant_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(tenant_id, workspace_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(tenant_id, user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(tenant_id, agent_id)",
+        ]:
+            try:
+                cursor.execute(index_sql)
+            except sqlite3.OperationalError:
+                pass
+
         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
         try:
             cursor.execute("SELECT * FROM messages_fts LIMIT 0")
@@ -384,6 +510,30 @@ class SessionDB:
             cursor.executescript(FTS_SQL)
 
         self._conn.commit()
+
+    @staticmethod
+    def _ensure_columns(
+        cursor: sqlite3.Cursor,
+        table_name: str,
+        columns: list[tuple[str, str]],
+    ) -> None:
+        """Add missing columns to an existing table.
+
+        Used as a repair step for installs whose recorded schema version does
+        not match the real SQLite table shape. Column names/types are hardcoded
+        by callers; they are quoted defensively for SQLite DDL.
+        """
+        existing = {
+            row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            for row in cursor.execute(f'PRAGMA table_info("{table_name}")')
+        }
+        for name, column_type in columns:
+            if name in existing:
+                continue
+            safe_name = name.replace('"', '""')
+            cursor.execute(
+                f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {column_type}'
+            )
 
     # =========================================================================
     # Session lifecycle
@@ -397,16 +547,24 @@ class SessionDB:
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
         user_id: str = None,
+        tenant_id: str = None,
+        workspace_id: str = None,
+        agent_id: str = None,
+        visibility: str = "private",
         parent_session_id: str = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
         def _do(conn):
             conn.execute(
-                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR IGNORE INTO sessions (id, tenant_id, workspace_id, agent_id,
+                   source, user_id, model, model_config, system_prompt,
+                   parent_session_id, started_at, visibility)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
+                    tenant_id,
+                    workspace_id,
+                    agent_id,
                     source,
                     user_id,
                     model,
@@ -414,6 +572,7 @@ class SessionDB:
                     system_prompt,
                     parent_session_id,
                     time.time(),
+                    visibility,
                 ),
             )
         self._execute_write(_do)
@@ -554,6 +713,11 @@ class SessionDB:
         session_id: str,
         source: str = "unknown",
         model: str = None,
+        user_id: str = None,
+        tenant_id: str = None,
+        workspace_id: str = None,
+        agent_id: str = None,
+        visibility: str = "private",
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -564,29 +728,51 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
+                   (id, tenant_id, workspace_id, agent_id, source, user_id,
+                    model, started_at, visibility)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    tenant_id,
+                    workspace_id,
+                    agent_id,
+                    source,
+                    user_id,
+                    model,
+                    time.time(),
+                    visibility,
+                ),
             )
         self._execute_write(_do)
 
-    def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_session(
+        self,
+        session_id: str,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
+        access_clauses, access_params = self._access_where(access_context, alias="")
+        where = ["id = ?", *access_clauses]
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+                f"SELECT * FROM sessions WHERE {' AND '.join(where)}",
+                (session_id, *access_params),
             )
             row = cursor.fetchone()
         return dict(row) if row else None
 
-    def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
+    def resolve_session_id(
+        self,
+        session_id_or_prefix: str,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
         Returns the exact ID when it exists. Otherwise treats the input as a
         prefix and returns the single matching session ID if the prefix is
         unambiguous. Returns None for no matches or ambiguous prefixes.
         """
-        exact = self.get_session(session_id_or_prefix)
+        exact = self.get_session(session_id_or_prefix, access_context=access_context)
         if exact:
             return exact["id"]
 
@@ -596,10 +782,13 @@ class SessionDB:
             .replace("%", "\\%")
             .replace("_", "\\_")
         )
+        access_clauses, access_params = self._access_where(access_context, alias="")
+        where = ["id LIKE ? ESCAPE '\\'", *access_clauses]
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
-                (f"{escaped}%",),
+                f"SELECT id FROM sessions WHERE {' AND '.join(where)} "
+                "ORDER BY started_at DESC LIMIT 2",
+                (f"{escaped}%", *access_params),
             )
             matches = [row["id"] for row in cursor.fetchall()]
         if len(matches) == 1:
@@ -808,6 +997,7 @@ class SessionDB:
         offset: int = 0,
         include_children: bool = False,
         project_compression_tips: bool = True,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -830,6 +1020,9 @@ class SessionDB:
         """
         where_clauses = []
         params = []
+        access_clauses, access_params = self._access_where(access_context, alias="s")
+        where_clauses.extend(access_clauses)
+        params.extend(access_params)
 
         if not include_children:
             where_clauses.append("s.parent_session_id IS NULL")
@@ -893,7 +1086,7 @@ class SessionDB:
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
-                tip_row = self._get_session_rich_row(tip_id)
+                tip_row = self._get_session_rich_row(tip_id, access_context=access_context)
                 if not tip_row:
                     projected.append(s)
                     continue
@@ -913,12 +1106,18 @@ class SessionDB:
 
         return sessions
 
-    def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def _get_session_rich_row(
+        self,
+        session_id: str,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a single session with the same enriched columns as
         ``list_sessions_rich`` (preview + last_active). Returns None if the
         session doesn't exist.
         """
-        query = """
+        access_clauses, access_params = self._access_where(access_context, alias="s")
+        where = ["s.id = ?", *access_clauses]
+        query = f"""
             SELECT s.*,
                 COALESCE(
                     (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
@@ -932,10 +1131,10 @@ class SessionDB:
                     s.started_at
                 ) AS last_active
             FROM sessions s
-            WHERE s.id = ?
+            WHERE {' AND '.join(where)}
         """
         with self._lock:
-            cursor = self._conn.execute(query, (session_id,))
+            cursor = self._conn.execute(query, (session_id, *access_params))
             row = cursor.fetchone()
         if not row:
             return None
@@ -1036,8 +1235,14 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_messages(
+        self,
+        session_id: str,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
+        if access_context is not None and not self.get_session(session_id, access_context=access_context):
+            return []
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
@@ -1121,11 +1326,17 @@ class SessionDB:
                 current = child_id
         return session_id
 
-    def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_messages_as_conversation(
+        self,
+        session_id: str,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
         Used by the gateway to restore conversation history.
         """
+        if access_context is not None and not self.get_session(session_id, access_context=access_context):
+            return []
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
@@ -1258,6 +1469,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1281,6 +1493,9 @@ class SessionDB:
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
         params: list = [query]
+        access_clauses, access_params = self._access_where(access_context, alias="s")
+        where_clauses.extend(access_clauses)
+        params.extend(access_params)
 
         if source_filter is not None:
             source_placeholders = ",".join("?" for _ in source_filter)
@@ -1338,6 +1553,9 @@ class SessionDB:
             raw_query = query.strip('"').strip()
             like_where = ["m.content LIKE ?"]
             like_params: list = [f"%{raw_query}%"]
+            like_access_clauses, like_access_params = self._access_where(access_context, alias="s")
+            like_where.extend(like_access_clauses)
+            like_params.extend(like_access_params)
             if source_filter is not None:
                 like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                 like_params.extend(source_filter)
@@ -1424,34 +1642,39 @@ class SessionDB:
         source: str = None,
         limit: int = 20,
         offset: int = 0,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         """List sessions, optionally filtered by source."""
+        where_clauses, params = self._access_where(access_context, alias="")
+        if source:
+            where_clauses.append("source = ?")
+            params.append(source)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        params.extend([limit, offset])
         with self._lock:
-            if source:
-                cursor = self._conn.execute(
-                    "SELECT * FROM sessions WHERE source = ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (source, limit, offset),
-                )
-            else:
-                cursor = self._conn.execute(
-                    "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                )
+            cursor = self._conn.execute(
+                f"SELECT * FROM sessions {where_sql} ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                params,
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     # =========================================================================
     # Utility
     # =========================================================================
 
-    def session_count(self, source: str = None) -> int:
+    def session_count(
+        self,
+        source: str = None,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> int:
         """Count sessions, optionally filtered by source."""
+        where_clauses, params = self._access_where(access_context, alias="")
+        if source:
+            where_clauses.append("source = ?")
+            params.append(source)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         with self._lock:
-            if source:
-                cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
-                )
-            else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
+            cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions {where_sql}", params)
             return cursor.fetchone()[0]
 
     def message_count(self, session_id: str = None) -> int:
@@ -1469,20 +1692,32 @@ class SessionDB:
     # Export and cleanup
     # =========================================================================
 
-    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def export_session(
+        self,
+        session_id: str,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> Optional[Dict[str, Any]]:
         """Export a single session with all its messages as a dict."""
-        session = self.get_session(session_id)
+        session = self.get_session(session_id, access_context=access_context)
         if not session:
             return None
-        messages = self.get_messages(session_id)
+        messages = self.get_messages(session_id, access_context=access_context)
         return {**session, "messages": messages}
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+    def export_all(
+        self,
+        source: str = None,
+        access_context: AccessContext | Mapping[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
         Suitable for writing to a JSONL file for backup/analysis.
         """
-        sessions = self.search_sessions(source=source, limit=100000)
+        sessions = self.search_sessions(
+            source=source,
+            limit=100000,
+            access_context=access_context,
+        )
         results = []
         for session in sessions:
             messages = self.get_messages(session["id"])
@@ -1677,4 +1912,3 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
-

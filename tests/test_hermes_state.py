@@ -4,6 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
+from agent.access_context import AccessContext
 from hermes_state import SessionDB
 
 
@@ -34,6 +35,41 @@ class TestSessionLifecycle:
         assert session["source"] == "cli"
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
+
+    def test_create_session_persists_access_context_columns(self, db):
+        db.create_session(
+            session_id="enterprise-session",
+            source="api",
+            tenant_id="tenant-a",
+            workspace_id="workspace-1",
+            user_id="user-1",
+            agent_id="agent-sales",
+        )
+
+        session = db.get_session("enterprise-session")
+        assert session["tenant_id"] == "tenant-a"
+        assert session["workspace_id"] == "workspace-1"
+        assert session["user_id"] == "user-1"
+        assert session["agent_id"] == "agent-sales"
+        assert session["visibility"] == "private"
+
+    def test_get_session_honors_access_context(self, db):
+        db.create_session(
+            session_id="tenant-a-session",
+            source="api",
+            tenant_id="tenant-a",
+            user_id="user-1",
+        )
+        db.create_session(
+            session_id="tenant-b-session",
+            source="api",
+            tenant_id="tenant-b",
+            user_id="user-1",
+        )
+
+        ctx = AccessContext(tenant_id="tenant-a", user_id="user-1")
+        assert db.get_session("tenant-a-session", access_context=ctx) is not None
+        assert db.get_session("tenant-b-session", access_context=ctx) is None
 
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None
@@ -406,6 +442,36 @@ class TestFTS5Search:
         sources = [r["source"] for r in results]
         assert all(s == "telegram" for s in sources)
 
+    def test_search_messages_honors_access_context(self, db):
+        db.create_session(
+            session_id="tenant-a-session",
+            source="api",
+            tenant_id="tenant-a",
+            user_id="user-1",
+        )
+        db.append_message(
+            "tenant-a-session",
+            role="user",
+            content="shared keyword belongs to tenant a",
+        )
+        db.create_session(
+            session_id="tenant-b-session",
+            source="api",
+            tenant_id="tenant-b",
+            user_id="user-1",
+        )
+        db.append_message(
+            "tenant-b-session",
+            role="user",
+            content="shared keyword belongs to tenant b",
+        )
+
+        results = db.search_messages(
+            "shared keyword",
+            access_context=AccessContext(tenant_id="tenant-a", user_id="user-1"),
+        )
+        assert {r["session_id"] for r in results} == {"tenant-a-session"}
+
     def test_search_default_sources_include_acp(self, db):
         db.create_session(session_id="s1", source="acp")
         db.append_message("s1", role="user", content="ACP question about Python")
@@ -773,6 +839,31 @@ class TestSearchSessions:
         assert len(page1) == 2
         assert len(page2) == 2
         assert page1[0]["id"] != page2[0]["id"]
+
+    def test_search_sessions_honors_access_context(self, db):
+        db.create_session(
+            session_id="tenant-a-session",
+            source="api",
+            tenant_id="tenant-a",
+            workspace_id="workspace-1",
+            user_id="user-1",
+        )
+        db.create_session(
+            session_id="tenant-b-session",
+            source="api",
+            tenant_id="tenant-b",
+            workspace_id="workspace-1",
+            user_id="user-1",
+        )
+
+        sessions = db.search_sessions(
+            access_context=AccessContext(
+                tenant_id="tenant-a",
+                workspace_id="workspace-1",
+                user_id="user-1",
+            )
+        )
+        assert [s["id"] for s in sessions] == ["tenant-a-session"]
 
 
 # =========================================================================
@@ -1938,4 +2029,3 @@ class TestAutoMaintenance:
         assert marker is not None
         # Should parse as a float timestamp close to now.
         assert abs(float(marker) - time.time()) < 60
-

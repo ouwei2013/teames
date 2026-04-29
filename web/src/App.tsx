@@ -59,6 +59,8 @@ import AnalyticsPage from "@/pages/AnalyticsPage";
 import CronPage from "@/pages/CronPage";
 import SkillsPage from "@/pages/SkillsPage";
 import ChatPage from "@/pages/ChatPage";
+import EnterpriseAdminPage from "@/pages/EnterpriseAdminPage";
+import EnterprisePortalPage from "@/pages/EnterprisePortalPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -83,6 +85,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
   "/analytics": AnalyticsPage,
+  "/enterprise": EnterpriseAdminPage,
   "/logs": LogsPage,
   "/cron": CronPage,
   "/skills": SkillsPage,
@@ -103,6 +106,11 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "analytics",
     label: "Analytics",
     icon: BarChart3,
+  },
+  {
+    path: "/enterprise",
+    label: "Enterprise",
+    icon: Shield,
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
@@ -246,6 +254,8 @@ export default function App() {
   const closeMobile = useCallback(() => setMobileOpen(false), []);
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
+  const isEnterprisePortalRoute =
+    normalizedPath === "/portal" || normalizedPath === "/accept-invite";
   const isChatRoute = normalizedPath === "/chat";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
 
@@ -306,6 +316,16 @@ export default function App() {
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
+
+  if (isEnterprisePortalRoute) {
+    return (
+      <div className="font-mondwest flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black uppercase text-midground antialiased">
+        <SelectionSwitcher />
+        <Backdrop />
+        <EnterprisePortalPage />
+      </div>
+    );
+  }
 
   return (
     <div

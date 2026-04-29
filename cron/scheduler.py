@@ -988,6 +988,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
+        access_context = None
+        if isinstance(job.get("access_context"), dict):
+            try:
+                from agent.access_context import AccessContext
+
+                access_context = AccessContext.coerce(job.get("access_context"))
+            except Exception:
+                logger.debug("Job '%s': invalid access_context ignored", job_id, exc_info=True)
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -1016,6 +1025,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            access_context=access_context,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -1034,7 +1044,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        enterprise_system_message = job.get("enterprise_system_message")
+        if isinstance(enterprise_system_message, str) and enterprise_system_message.strip():
+            _cron_future = _cron_pool.submit(
+                _cron_context.run,
+                agent.run_conversation,
+                prompt,
+                enterprise_system_message,
+            )
+        else:
+            _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
