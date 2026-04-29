@@ -107,3 +107,54 @@ def test_invite_scopes_user_to_selected_business_agent(tmp_path):
         assert "Do not invent" in prompt
     finally:
         store.close()
+
+
+def test_local_agent_bridge_requires_device_owned_poll_and_response(tmp_path):
+    store = EnterpriseStore(tmp_path / "enterprise.db")
+    try:
+        store.initialize_tenant(name="Acme", tenant_id="acme")
+        invite = store.create_invite(email="user@example.com", role="member")
+        redeemed = store.redeem_invite(invite["code"], email="user@example.com")
+        auth = store.authenticate_api_key(redeemed["api_key"])
+        assert auth is not None
+        agent_id = auth["agents"][0]["id"]
+
+        device_code = store.create_local_device_code(
+            auth["user"],
+            agent_id,
+            label="Work laptop",
+        )
+        registered = store.redeem_local_device_code(
+            device_code["code"],
+            device_name="Local Hermes",
+        )
+        assert registered["device_token"].startswith("hmdt_")
+        device_auth = store.authenticate_device_token(registered["device_token"])
+        assert device_auth is not None
+        assert device_auth["access_context"].tenant_id == "acme"
+        assert device_auth["access_context"].user_id == auth["user"]["id"]
+        assert device_auth["access_context"].agent_id == agent_id
+
+        request = store.create_local_agent_request(
+            device_id=device_auth["device"]["id"],
+            request="Please summarize locally available status.",
+        )
+        assert request["status"] == "pending"
+
+        polled = store.poll_local_agent_requests(device_auth["device"])
+        assert [item["id"] for item in polled] == [request["id"]]
+        assert polled[0]["status"] == "delivered"
+
+        response = store.respond_local_agent_request(
+            device_auth["device"],
+            request["id"],
+            "Summary only, no private data shared.",
+        )
+        assert response["status"] == "responded"
+        assert response["response"] == "Summary only, no private data shared."
+
+        listed = store.list_local_agent_requests(device_id=device_auth["device"]["id"])
+        assert listed[0]["id"] == request["id"]
+        assert listed[0]["response"] == "Summary only, no private data shared."
+    finally:
+        store.close()

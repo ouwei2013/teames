@@ -113,6 +113,10 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/enterprise/portal/skills/toggle",
     "/api/enterprise/portal/skills",
     "/api/enterprise/portal/tools/toolsets",
+    "/api/enterprise/portal/local-devices",
+    "/api/enterprise/portal/local-devices/code",
+    "/api/enterprise/local-agent/register",
+    "/api/enterprise/local-agent/requests",
 })
 
 
@@ -235,6 +239,7 @@ async def auth_middleware(request: Request, call_next):
         path in _PUBLIC_API_PATHS
         or path.startswith("/api/plugins/")
         or path.startswith("/api/enterprise/portal/cron/jobs/")
+        or path.startswith("/api/enterprise/local-agent/requests/")
     )
     if path.startswith("/api/") and not is_public:
         if not _has_valid_session_token(request):
@@ -496,6 +501,27 @@ class EnterpriseCronJobCreate(BaseModel):
     prompt: str
     schedule: str
     name: Optional[str] = None
+
+
+class EnterpriseLocalDeviceCodeCreate(BaseModel):
+    agent_id: str
+    label: Optional[str] = None
+    expires_minutes: int = 30
+
+
+class EnterpriseLocalDeviceRegister(BaseModel):
+    code: str
+    name: Optional[str] = None
+
+
+class EnterpriseLocalRequestCreate(BaseModel):
+    device_id: str
+    request: str
+
+
+class EnterpriseLocalRequestResponse(BaseModel):
+    response: str
+    status: str = "responded"
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
@@ -1219,6 +1245,200 @@ async def enterprise_portal_toolsets(request: Request, agent_id: Optional[str] =
     except Exception:
         _log.exception("GET /api/enterprise/portal/tools/toolsets failed")
         raise HTTPException(status_code=500, detail="Enterprise toolsets failed")
+
+
+@app.get("/api/enterprise/portal/local-devices")
+async def enterprise_portal_local_devices(request: Request, agent_id: Optional[str] = None):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            agent = store.resolve_user_agent(auth["user"], agent_id=agent_id)
+            return {
+                "agent": agent,
+                "devices": store.list_local_devices(user=auth["user"], agent_id=agent["id"]),
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/portal/local-devices failed")
+        raise HTTPException(status_code=500, detail="Enterprise local devices failed")
+
+
+@app.post("/api/enterprise/portal/local-devices/code")
+async def enterprise_portal_local_device_code(request: Request, body: EnterpriseLocalDeviceCodeCreate):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            code = store.create_local_device_code(
+                auth["user"],
+                body.agent_id,
+                label=body.label,
+                expires_minutes=body.expires_minutes,
+            )
+            return code
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/portal/local-devices/code failed")
+        raise HTTPException(status_code=500, detail="Enterprise local device code failed")
+
+
+@app.get("/api/enterprise/local-devices")
+async def enterprise_local_devices():
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            return {"devices": store.list_local_devices(include_revoked=True)}
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/local-devices failed")
+        raise HTTPException(status_code=500, detail="Enterprise local devices failed")
+
+
+@app.post("/api/enterprise/local-requests")
+async def enterprise_create_local_request(body: EnterpriseLocalRequestCreate):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            item = store.create_local_agent_request(
+                device_id=body.device_id,
+                request=body.request,
+            )
+            return {"request": item}
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/local-requests failed")
+        raise HTTPException(status_code=500, detail="Enterprise local request failed")
+
+
+@app.get("/api/enterprise/local-requests")
+async def enterprise_local_requests(device_id: Optional[str] = None):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            return {"requests": store.list_local_agent_requests(device_id=device_id)}
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/local-requests failed")
+        raise HTTPException(status_code=500, detail="Enterprise local requests failed")
+
+
+@app.post("/api/enterprise/local-agent/register")
+async def enterprise_local_agent_register(body: EnterpriseLocalDeviceRegister):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            result = store.redeem_local_device_code(body.code, device_name=body.name)
+            return {
+                "device": result["device"],
+                "device_token": result["device_token"],
+                "user": result["user"],
+                "agent": result["agent"],
+            }
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/local-agent/register failed")
+        raise HTTPException(status_code=500, detail="Enterprise local agent registration failed")
+
+
+def _enterprise_device_bearer_token(request: Request) -> str:
+    return _enterprise_bearer_token(request)
+
+
+@app.get("/api/enterprise/local-agent/requests")
+async def enterprise_local_agent_requests(request: Request, limit: int = 10):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_device_token(_enterprise_device_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid local device token")
+            return {
+                "device": auth["device"],
+                "user": auth["user"],
+                "agent": auth["agent"],
+                "requests": store.poll_local_agent_requests(
+                    auth["device"],
+                    limit=limit,
+                ),
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/enterprise/local-agent/requests failed")
+        raise HTTPException(status_code=500, detail="Enterprise local agent poll failed")
+
+
+@app.post("/api/enterprise/local-agent/requests/{request_id}/response")
+async def enterprise_local_agent_request_response(
+    request: Request,
+    request_id: str,
+    body: EnterpriseLocalRequestResponse,
+):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_device_token(_enterprise_device_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid local device token")
+            item = store.respond_local_agent_request(
+                auth["device"],
+                request_id,
+                body.response,
+                status=body.status,
+            )
+            return {"request": item}
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/local-agent/requests/%s/response failed", request_id)
+        raise HTTPException(status_code=500, detail="Enterprise local agent response failed")
 
 
 def _enterprise_job_matches(job: Dict[str, Any], user: Dict[str, Any], agent_id: str) -> bool:

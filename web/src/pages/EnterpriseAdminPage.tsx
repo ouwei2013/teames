@@ -3,9 +3,11 @@ import {
   Bot,
   Check,
   Copy,
-  KeyRound,
-  Loader2,
-  RefreshCw,
+	  KeyRound,
+	  Laptop,
+	  Loader2,
+	  MessageSquare,
+	  RefreshCw,
   ShieldCheck,
   Ticket,
   UserPlus,
@@ -29,9 +31,11 @@ import {
   api,
   type EnterpriseAgent,
   type EnterpriseAgentPayload,
-  type EnterpriseInvite,
-  type EnterpriseInviteCreated,
-  type EnterpriseStatusResponse,
+	  type EnterpriseInvite,
+	  type EnterpriseInviteCreated,
+	  type EnterpriseLocalDevice,
+	  type EnterpriseLocalRequest,
+	  type EnterpriseStatusResponse,
   type EnterpriseUser,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -72,6 +76,8 @@ export default function EnterpriseAdminPage() {
   const [users, setUsers] = useState<EnterpriseUser[]>([]);
   const [agents, setAgents] = useState<EnterpriseAgent[]>([]);
   const [invites, setInvites] = useState<EnterpriseInvite[]>([]);
+  const [localDevices, setLocalDevices] = useState<EnterpriseLocalDevice[]>([]);
+  const [localRequests, setLocalRequests] = useState<EnterpriseLocalRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingInit, setSavingInit] = useState(false);
   const [creatingInvite, setCreatingInvite] = useState(false);
@@ -91,6 +97,9 @@ export default function EnterpriseAdminPage() {
   const [maxUses, setMaxUses] = useState("1");
   const [expiresDays, setExpiresDays] = useState("7");
   const [inviteAgentIds, setInviteAgentIds] = useState<string[]>([]);
+  const [selectedLocalDeviceId, setSelectedLocalDeviceId] = useState("");
+  const [localRequestText, setLocalRequestText] = useState("");
+  const [sendingLocalRequest, setSendingLocalRequest] = useState(false);
 
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [agentForm, setAgentForm] = useState<EnterpriseAgentPayload>({
@@ -119,10 +128,12 @@ export default function EnterpriseAdminPage() {
       setUsers(nextStatus.users || []);
       setAgents(nextStatus.agents || []);
       if (nextStatus.initialized) {
-        const [userResult, agentResult, inviteResult] = await Promise.all([
+        const [userResult, agentResult, inviteResult, deviceResult, requestResult] = await Promise.all([
           api.getEnterpriseUsers(),
           api.getEnterpriseAgents(),
           api.getEnterpriseInvites(),
+          api.getEnterpriseLocalDevices(),
+          api.getEnterpriseLocalRequests(),
         ]);
         setUsers(userResult.users || []);
         setAgents(agentResult.agents || []);
@@ -132,9 +143,19 @@ export default function EnterpriseAdminPage() {
           return kept.length ? kept : (agentResult.agents[0] ? [agentResult.agents[0].id] : []);
         });
         setInvites(inviteResult.invites || []);
+        setLocalDevices(deviceResult.devices || []);
+        setLocalRequests(requestResult.requests || []);
+        setSelectedLocalDeviceId((current) => {
+          if (current && (deviceResult.devices || []).some((device) => device.id === current)) {
+            return current;
+          }
+          return deviceResult.devices?.[0]?.id || "";
+        });
       } else {
         setAgents([]);
         setInvites([]);
+        setLocalDevices([]);
+        setLocalRequests([]);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -293,6 +314,28 @@ export default function EnterpriseAdminPage() {
     }
   }
 
+  async function sendLocalRequest(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedLocalDeviceId || !localRequestText.trim()) return;
+    setSendingLocalRequest(true);
+    setError(null);
+    try {
+      await api.createEnterpriseLocalRequest({
+        device_id: selectedLocalDeviceId,
+        request: localRequestText.trim(),
+      });
+      setLocalRequestText("");
+      showToast("Local agent request sent", "success");
+      const requestResult = await api.getEnterpriseLocalRequests();
+      setLocalRequests(requestResult.requests || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("Local request failed", "error");
+    } finally {
+      setSendingLocalRequest(false);
+    }
+  }
+
   return (
     <main className="mx-auto flex w-full max-w-7xl flex-col gap-4 text-midground">
       <Toast toast={toast} />
@@ -407,7 +450,7 @@ export default function EnterpriseAdminPage() {
         </Card>
       ) : (
         <>
-          <section className="grid gap-3 md:grid-cols-4">
+          <section className="grid gap-3 md:grid-cols-5">
             <MetricCard
               icon={ShieldCheck}
               label="Tenant"
@@ -432,7 +475,120 @@ export default function EnterpriseAdminPage() {
               value={String(invites.filter((invite) => inviteState(invite).label === "Active").length)}
               detail="Currently usable invites"
             />
+            <MetricCard
+              icon={Laptop}
+              label="Local"
+              value={String(localDevices.filter((device) => !device.revoked_at).length)}
+              detail="Connected local agents"
+            />
           </section>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Laptop className="h-4 w-4" />
+                Local Agent Bridge
+              </CardTitle>
+              <CardDescription className="normal-case">
+                Send collaboration requests to user-owned local agents. Devices decide locally what to share.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <form onSubmit={sendLocalRequest} className="grid gap-3 lg:grid-cols-[minmax(0,0.35fr)_minmax(0,1fr)_auto]">
+                <label className="block">
+                  <span className="mb-1 block font-courier text-xs normal-case text-muted-foreground">
+                    Device
+                  </span>
+                  <Select value={selectedLocalDeviceId} onValueChange={setSelectedLocalDeviceId}>
+                    {localDevices.map((device) => (
+                      <SelectOption key={device.id} value={device.id}>
+                        {(device.user_name || device.user_email || device.id) + " / " + (device.name || "Local Agent")}
+                      </SelectOption>
+                    ))}
+                  </Select>
+                </label>
+                <label className="block">
+                  <span className="mb-1 block font-courier text-xs normal-case text-muted-foreground">
+                    Request
+                  </span>
+                  <Input
+                    value={localRequestText}
+                    onChange={(event) => setLocalRequestText(event.target.value)}
+                    className="normal-case"
+                    placeholder="Ask the local agent to summarize or verify something locally."
+                  />
+                </label>
+                <div className="flex items-end">
+                  <Button
+                    type="submit"
+                    disabled={sendingLocalRequest || !selectedLocalDeviceId || !localRequestText.trim()}
+                  >
+                    {sendingLocalRequest ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <MessageSquare className="h-3.5 w-3.5" />}
+                    Send
+                  </Button>
+                </div>
+              </form>
+
+              <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                <div className="border border-border">
+                  <div className="border-b border-border px-3 py-2 font-courier text-xs normal-case text-muted-foreground">
+                    Devices
+                  </div>
+                  <div className="max-h-64 overflow-y-auto">
+                    {localDevices.map((device) => (
+                      <button
+                        key={device.id}
+                        type="button"
+                        onClick={() => setSelectedLocalDeviceId(device.id)}
+                        className={cn(
+                          "block w-full border-b border-border/60 px-3 py-3 text-left font-courier text-xs normal-case",
+                          selectedLocalDeviceId === device.id ? "bg-foreground/10 text-midground" : "text-muted-foreground",
+                        )}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate text-midground">{device.name}</span>
+                          <Badge variant={device.revoked_at ? "outline" : "success"}>{device.revoked_at ? "Revoked" : "Active"}</Badge>
+                        </div>
+                        <div className="mt-1 truncate">
+                          {device.user_name || device.user_email || device.user_id} / {device.agent_name || device.agent_id}
+                        </div>
+                        <div className="mt-1">Last seen: {formatDate(device.last_seen_at)}</div>
+                      </button>
+                    ))}
+                    {localDevices.length === 0 && (
+                      <div className="px-3 py-6 font-courier text-xs normal-case text-muted-foreground">
+                        No local agents connected yet.
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="border border-border">
+                  <div className="border-b border-border px-3 py-2 font-courier text-xs normal-case text-muted-foreground">
+                    Recent Requests
+                  </div>
+                  <div className="max-h-64 overflow-y-auto">
+                    {localRequests.slice(0, 12).map((item) => (
+                      <div key={item.id} className="border-b border-border/60 px-3 py-3 font-courier text-xs normal-case">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate text-midground">{item.device_name || item.device_id}</span>
+                          <Badge variant={item.status === "responded" ? "success" : item.status === "rejected" ? "warning" : "outline"}>{item.status}</Badge>
+                        </div>
+                        <p className="mt-2 line-clamp-2 text-muted-foreground">{item.request}</p>
+                        {item.response && (
+                          <p className="mt-2 line-clamp-3 whitespace-pre-wrap text-midground">{item.response}</p>
+                        )}
+                      </div>
+                    ))}
+                    {localRequests.length === 0 && (
+                      <div className="px-3 py-6 font-courier text-xs normal-case text-muted-foreground">
+                        No local-agent requests yet.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
 
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
             <Card>

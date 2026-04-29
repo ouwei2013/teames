@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   Bot,
   Clock,
+  Copy,
+  Laptop,
   Loader2,
   LogOut,
   Package,
@@ -21,6 +23,8 @@ import {
   api,
   type CronJob,
   type EnterpriseAgent,
+  type EnterpriseLocalDevice,
+  type EnterpriseLocalDeviceCode,
   type EnterpriseUser,
   type SkillInfo,
   type ToolsetInfo,
@@ -41,7 +45,7 @@ type StoredSession = {
   sessionIds?: Record<string, string>;
 };
 
-type PortalView = "chat" | "cron" | "skills" | "tools";
+type PortalView = "chat" | "cron" | "skills" | "tools" | "local";
 
 const STORAGE_KEY = "hermes.enterprise.portal";
 
@@ -99,11 +103,15 @@ export default function EnterprisePortalPage() {
   const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [toolsets, setToolsets] = useState<ToolsetInfo[]>([]);
+  const [localDevices, setLocalDevices] = useState<EnterpriseLocalDevice[]>([]);
+  const [localCode, setLocalCode] = useState<EnterpriseLocalDeviceCode | null>(null);
   const [panelLoading, setPanelLoading] = useState(false);
   const [cronName, setCronName] = useState("");
   const [cronPrompt, setCronPrompt] = useState("");
   const [cronSchedule, setCronSchedule] = useState("");
+  const [localDeviceLabel, setLocalDeviceLabel] = useState("");
   const [creatingCron, setCreatingCron] = useState(false);
+  const [creatingLocalCode, setCreatingLocalCode] = useState(false);
   const [busyItem, setBusyItem] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -173,9 +181,13 @@ export default function EnterprisePortalPage() {
           ? api.getEnterprisePortalSkills(session.token, selectedAgent.id).then((result) => {
               if (!cancelled) setSkills(result.skills || []);
             })
-          : api.getEnterprisePortalToolsets(session.token, selectedAgent.id).then((result) => {
-              if (!cancelled) setToolsets(result.toolsets || []);
-            });
+          : view === "tools"
+            ? api.getEnterprisePortalToolsets(session.token, selectedAgent.id).then((result) => {
+                if (!cancelled) setToolsets(result.toolsets || []);
+              })
+            : api.getEnterprisePortalLocalDevices(session.token, selectedAgent.id).then((result) => {
+                if (!cancelled) setLocalDevices(result.devices || []);
+              });
     load
       .catch((err) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
@@ -386,6 +398,33 @@ export default function EnterprisePortalPage() {
     }
   }
 
+  async function createLocalDeviceCode(event: FormEvent) {
+    event.preventDefault();
+    if (!session || !selectedAgent) return;
+    setCreatingLocalCode(true);
+    setError(null);
+    try {
+      const code = await api.createEnterprisePortalLocalDeviceCode({
+        token: session.token,
+        agent_id: selectedAgent.id,
+        label: localDeviceLabel.trim() || undefined,
+        expires_minutes: 30,
+      });
+      setLocalCode(code);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCreatingLocalCode(false);
+    }
+  }
+
+  async function copyLocalJoinCommand() {
+    if (!localCode) return;
+    await navigator.clipboard.writeText(
+      `hermes enterprise local join ${localCode.code} --server ${window.location.origin}`,
+    );
+  }
+
   return (
     <main className="relative z-2 flex h-dvh min-h-0 w-full flex-col overflow-hidden px-4 py-4 text-midground sm:px-6 lg:px-8">
       <header className="mx-auto flex w-full max-w-5xl shrink-0 items-center justify-between gap-3 border-b border-border pb-3">
@@ -497,12 +536,13 @@ export default function EnterprisePortalPage() {
         </section>
       ) : (
         <section className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col pt-4">
-          <nav className="mb-3 grid shrink-0 grid-cols-4 gap-2">
+          <nav className="mb-3 grid shrink-0 grid-cols-5 gap-2">
             {[
               { key: "chat" as const, label: "Chat", icon: Send },
               { key: "cron" as const, label: "Cron", icon: Clock },
               { key: "skills" as const, label: "Skills", icon: Package },
               { key: "tools" as const, label: "Tools", icon: Wrench },
+              { key: "local" as const, label: "Local", icon: Laptop },
             ].map((item) => {
               const Icon = item.icon;
               return (
@@ -686,6 +726,68 @@ export default function EnterprisePortalPage() {
                         {toolset.tools.slice(0, 8).join(", ")}
                       </p>
                     )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {view === "local" && (
+            <div className="min-h-0 flex-1 overflow-y-auto border border-border bg-card/50 p-3 sm:p-4">
+              <form onSubmit={createLocalDeviceCode} className="grid gap-3 border-b border-border pb-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+                <Input
+                  value={localDeviceLabel}
+                  onChange={(event) => setLocalDeviceLabel(event.target.value)}
+                  placeholder="Local device label"
+                  className="normal-case"
+                />
+                <Button type="submit" disabled={creatingLocalCode || !selectedAgent}>
+                  {creatingLocalCode ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Laptop className="h-3.5 w-3.5" />}
+                  Connect Local Agent
+                </Button>
+              </form>
+
+              {localCode && (
+                <div className="mt-4 border border-border bg-background/50 p-3">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <div className="font-courier text-xs normal-case text-muted-foreground">
+                      Run this on the local machine
+                    </div>
+                    <Button type="button" variant="outline" size="sm" onClick={copyLocalJoinCommand}>
+                      <Copy className="h-3.5 w-3.5" />
+                      Copy
+                    </Button>
+                  </div>
+                  <code className="block overflow-x-auto whitespace-nowrap border border-border bg-black/30 px-2 py-2 font-courier text-xs normal-case text-midground">
+                    hermes enterprise local join {localCode.code} --server {window.location.origin}
+                  </code>
+                  <p className="mt-2 font-courier text-xs normal-case text-muted-foreground">
+                    Expires: {formatTime(new Date(localCode.expires_at * 1000).toISOString())}
+                  </p>
+                </div>
+              )}
+
+              <div className="mt-4 space-y-3">
+                {panelLoading && <PanelLoading />}
+                {!panelLoading && localDevices.length === 0 && <EmptyPanel text="No local agents connected for this business agent." />}
+                {localDevices.map((device) => (
+                  <div key={device.id} className="border border-border bg-background/50 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-mondwest text-sm uppercase text-midground">
+                          {device.name}
+                        </div>
+                        <div className="mt-1 font-courier text-xs normal-case text-muted-foreground">
+                          {device.agent_name || device.agent_id}
+                        </div>
+                      </div>
+                      <span className="border border-success/50 px-2 py-1 font-courier text-xs normal-case text-success">
+                        Active
+                      </span>
+                    </div>
+                    <div className="mt-2 font-courier text-xs normal-case text-muted-foreground">
+                      Last seen: {formatTime(device.last_seen_at ? new Date(device.last_seen_at * 1000).toISOString() : null)}
+                    </div>
                   </div>
                 ))}
               </div>

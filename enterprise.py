@@ -96,6 +96,46 @@ CREATE TABLE IF NOT EXISTS user_agent_skills (
     PRIMARY KEY (user_id, agent_id, skill_name)
 );
 
+CREATE TABLE IF NOT EXISTS local_device_codes (
+    code_hash TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    label TEXT,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    redeemed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS local_devices (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    name TEXT NOT NULL,
+    api_key_hash TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    last_seen_at REAL,
+    revoked_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS local_agent_requests (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    device_id TEXT NOT NULL REFERENCES local_devices(id),
+    requester_user_id TEXT,
+    request TEXT NOT NULL,
+    response TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    delivered_at REAL,
+    responded_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_enterprise_users_tenant ON users(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_users_key ON users(api_key_hash);
 CREATE INDEX IF NOT EXISTS idx_enterprise_invites_tenant ON invites(tenant_id);
@@ -104,6 +144,14 @@ CREATE INDEX IF NOT EXISTS idx_enterprise_access_user ON user_agent_access(user_
 CREATE INDEX IF NOT EXISTS idx_enterprise_access_agent ON user_agent_access(agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_user_agent_skills
     ON user_agent_skills(tenant_id, user_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_local_devices_tenant
+    ON local_devices(tenant_id, user_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_local_device_codes_user
+    ON local_device_codes(tenant_id, user_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_local_requests_device
+    ON local_agent_requests(device_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_enterprise_local_requests_tenant
+    ON local_agent_requests(tenant_id, user_id, agent_id, created_at);
 """
 
 
@@ -121,6 +169,22 @@ def _new_invite_code() -> str:
 
 def _new_agent_id() -> str:
     return "agent_" + uuid.uuid4().hex[:12]
+
+
+def _new_device_id() -> str:
+    return "dev_" + uuid.uuid4().hex[:12]
+
+
+def _new_device_code() -> str:
+    return "hmd_" + secrets.token_urlsafe(18)
+
+
+def _new_device_token() -> str:
+    return "hmdt_" + secrets.token_urlsafe(32)
+
+
+def _new_bridge_request_id() -> str:
+    return "lreq_" + uuid.uuid4().hex[:12]
 
 
 def _clean_text(value: Optional[str]) -> Optional[str]:
@@ -543,6 +607,348 @@ class EnterpriseStore:
                    WHERE tenant_id = ? AND user_id = ? AND agent_id = ?""",
                 (user["tenant_id"], user["id"], agent["id"]),
             )
+
+    def create_local_device_code(
+        self,
+        user: Dict[str, Any],
+        agent_id: str,
+        *,
+        label: Optional[str] = None,
+        expires_minutes: int = 30,
+    ) -> Dict[str, Any]:
+        agent = self.resolve_user_agent(user, agent_id)
+        code = _new_device_code()
+        now = time.time()
+        expires_at = now + max(1, int(expires_minutes or 30)) * 60
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO local_device_codes
+                   (code_hash, tenant_id, user_id, agent_id, label, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    _hash_secret(code),
+                    user["tenant_id"],
+                    user["id"],
+                    agent["id"],
+                    _clean_text(label),
+                    now,
+                    expires_at,
+                ),
+            )
+        return {
+            "code": code,
+            "tenant_id": user["tenant_id"],
+            "user_id": user["id"],
+            "agent_id": agent["id"],
+            "agent_name": agent["name"],
+            "label": _clean_text(label),
+            "created_at": now,
+            "expires_at": expires_at,
+        }
+
+    def redeem_local_device_code(
+        self,
+        code: str,
+        *,
+        device_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        normalized = (code or "").strip()
+        if not normalized:
+            raise ValueError("device code is required")
+        now = time.time()
+        code_hash = _hash_secret(normalized)
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM local_device_codes WHERE code_hash = ?",
+                (code_hash,),
+            ).fetchone()
+            if not row:
+                raise ValueError("invalid device code")
+            device_code = dict(row)
+            if device_code.get("redeemed_at") is not None:
+                raise ValueError("device code has already been used")
+            if float(device_code["expires_at"]) < now:
+                raise ValueError("device code has expired")
+
+            user = self._conn.execute(
+                "SELECT * FROM users WHERE id = ? AND tenant_id = ? AND disabled_at IS NULL",
+                (device_code["user_id"], device_code["tenant_id"]),
+            ).fetchone()
+            if not user:
+                raise ValueError("device code user is no longer active")
+            agent = self.get_agent(device_code["agent_id"], tenant_id=device_code["tenant_id"])
+            if not agent or agent.get("status") != "active":
+                raise ValueError("device code agent is no longer active")
+
+            token = _new_device_token()
+            device_id = _new_device_id()
+            name = (device_name or device_code.get("label") or "").strip() or "Local Hermes Agent"
+            self._conn.execute(
+                """INSERT INTO local_devices
+                   (id, tenant_id, user_id, agent_id, name, api_key_hash, status,
+                    created_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                (
+                    device_id,
+                    device_code["tenant_id"],
+                    device_code["user_id"],
+                    device_code["agent_id"],
+                    name,
+                    _hash_secret(token),
+                    now,
+                    now,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE local_device_codes SET redeemed_at = ? WHERE code_hash = ?",
+                (now, code_hash),
+            )
+        device = self.get_local_device(device_id)
+        return {
+            "device": device,
+            "device_token": token,
+            "user": dict(user),
+            "agent": agent,
+        }
+
+    def get_local_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """SELECT d.*, u.email AS user_email, u.name AS user_name,
+                      a.name AS agent_name
+               FROM local_devices d
+               JOIN users u ON u.id = d.user_id AND u.tenant_id = d.tenant_id
+               JOIN agents a ON a.id = d.agent_id AND a.tenant_id = d.tenant_id
+               WHERE d.id = ?""",
+            (device_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_local_devices(
+        self,
+        *,
+        user: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[str] = None,
+        include_revoked: bool = False,
+    ) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        where = []
+        if user is not None:
+            where.append("d.tenant_id = ?")
+            params.append(user["tenant_id"])
+            where.append("d.user_id = ?")
+            params.append(user["id"])
+            if agent_id:
+                agent = self.resolve_user_agent(user, agent_id)
+                where.append("d.agent_id = ?")
+                params.append(agent["id"])
+        elif agent_id:
+            where.append("d.agent_id = ?")
+            params.append(agent_id)
+        if not include_revoked:
+            where.append("d.revoked_at IS NULL")
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        rows = self._conn.execute(
+            f"""SELECT d.*, u.email AS user_email, u.name AS user_name,
+                       a.name AS agent_name
+                FROM local_devices d
+                JOIN users u ON u.id = d.user_id AND u.tenant_id = d.tenant_id
+                JOIN agents a ON a.id = d.agent_id AND a.tenant_id = d.tenant_id
+                {where_sql}
+                ORDER BY d.last_seen_at DESC, d.created_at DESC""",
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def authenticate_device_token(self, token: str) -> Optional[Dict[str, Any]]:
+        normalized = (token or "").strip()
+        if not normalized:
+            return None
+        row = self._conn.execute(
+            """SELECT d.*, u.email AS user_email, u.name AS user_name, u.role AS user_role,
+                      a.name AS agent_name
+               FROM local_devices d
+               JOIN users u ON u.id = d.user_id AND u.tenant_id = d.tenant_id
+               JOIN agents a ON a.id = d.agent_id AND a.tenant_id = d.tenant_id
+               WHERE d.api_key_hash = ? AND d.revoked_at IS NULL AND d.status = 'active'
+                     AND u.disabled_at IS NULL AND a.status = 'active'""",
+            (_hash_secret(normalized),),
+        ).fetchone()
+        if not row:
+            return None
+        device = dict(row)
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE local_devices SET last_seen_at = ? WHERE id = ?",
+                (now, device["id"]),
+            )
+        user = self._conn.execute(
+            "SELECT * FROM users WHERE id = ? AND tenant_id = ?",
+            (device["user_id"], device["tenant_id"]),
+        ).fetchone()
+        agent = self.get_agent(device["agent_id"], tenant_id=device["tenant_id"])
+        access_context = AccessContext(
+            tenant_id=device["tenant_id"],
+            workspace_id="default",
+            user_id=device["user_id"],
+            agent_id=device["agent_id"],
+        )
+        return {
+            "device": {**device, "last_seen_at": now},
+            "user": dict(user) if user else None,
+            "agent": agent,
+            "access_context": access_context,
+        }
+
+    def create_local_agent_request(
+        self,
+        *,
+        device_id: str,
+        request: str,
+        requester_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        device = self.get_local_device(device_id)
+        if not device or device.get("revoked_at") is not None or device.get("status") != "active":
+            raise ValueError("local device not found or inactive")
+        text = (request or "").strip()
+        if not text:
+            raise ValueError("request is required")
+        now = time.time()
+        request_id = _new_bridge_request_id()
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO local_agent_requests
+                   (id, tenant_id, user_id, agent_id, device_id, requester_user_id,
+                    request, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (
+                    request_id,
+                    device["tenant_id"],
+                    device["user_id"],
+                    device["agent_id"],
+                    device["id"],
+                    requester_user_id,
+                    text,
+                    now,
+                    now,
+                ),
+            )
+        result = self.get_local_agent_request(request_id)
+        if not result:
+            raise RuntimeError("failed to create local agent request")
+        return result
+
+    def get_local_agent_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """SELECT r.*, d.name AS device_name, u.email AS user_email,
+                      u.name AS user_name, a.name AS agent_name
+               FROM local_agent_requests r
+               JOIN local_devices d ON d.id = r.device_id
+               JOIN users u ON u.id = r.user_id AND u.tenant_id = r.tenant_id
+               JOIN agents a ON a.id = r.agent_id AND a.tenant_id = r.tenant_id
+               WHERE r.id = ?""",
+            (request_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_local_agent_requests(
+        self,
+        *,
+        device_id: Optional[str] = None,
+        user: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        where = []
+        if device_id:
+            where.append("r.device_id = ?")
+            params.append(device_id)
+        if user is not None:
+            where.append("r.tenant_id = ?")
+            params.append(user["tenant_id"])
+            where.append("r.user_id = ?")
+            params.append(user["id"])
+        if agent_id:
+            where.append("r.agent_id = ?")
+            params.append(agent_id)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            where.append(f"r.status IN ({placeholders})")
+            params.extend(statuses)
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        params.append(max(1, min(int(limit or 50), 200)))
+        rows = self._conn.execute(
+            f"""SELECT r.*, d.name AS device_name, u.email AS user_email,
+                       u.name AS user_name, a.name AS agent_name
+                FROM local_agent_requests r
+                JOIN local_devices d ON d.id = r.device_id
+                JOIN users u ON u.id = r.user_id AND u.tenant_id = r.tenant_id
+                JOIN agents a ON a.id = r.agent_id AND a.tenant_id = r.tenant_id
+                {where_sql}
+                ORDER BY r.created_at DESC
+                LIMIT ?""",
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def poll_local_agent_requests(
+        self,
+        device: Dict[str, Any],
+        *,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        rows = self.list_local_agent_requests(
+            device_id=device["id"],
+            statuses=["pending", "delivered"],
+            limit=limit,
+        )
+        now = time.time()
+        pending_ids = [row["id"] for row in rows if row.get("status") == "pending"]
+        if pending_ids:
+            placeholders = ", ".join("?" for _ in pending_ids)
+            with self._conn:
+                self._conn.execute(
+                    f"""UPDATE local_agent_requests
+                        SET status = 'delivered', delivered_at = COALESCE(delivered_at, ?),
+                            updated_at = ?
+                        WHERE id IN ({placeholders})""",
+                    (now, now, *pending_ids),
+                )
+        return [self.get_local_agent_request(row["id"]) or row for row in rows]
+
+    def respond_local_agent_request(
+        self,
+        device: Dict[str, Any],
+        request_id: str,
+        response: str,
+        *,
+        status: str = "responded",
+    ) -> Dict[str, Any]:
+        if status not in {"responded", "rejected"}:
+            raise ValueError("status must be responded or rejected")
+        text = (response or "").strip()
+        if not text:
+            raise ValueError("response is required")
+        row = self._conn.execute(
+            "SELECT * FROM local_agent_requests WHERE id = ? AND device_id = ?",
+            (request_id, device["id"]),
+        ).fetchone()
+        if not row:
+            raise ValueError("local agent request not found")
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """UPDATE local_agent_requests
+                   SET response = ?, status = ?, responded_at = ?, updated_at = ?
+                   WHERE id = ? AND device_id = ?""",
+                (text, status, now, now, request_id, device["id"]),
+            )
+        result = self.get_local_agent_request(request_id)
+        if not result:
+            raise RuntimeError("failed to update local agent request")
+        return result
 
     @staticmethod
     def compile_agent_prompt(agent: Dict[str, Any]) -> str:

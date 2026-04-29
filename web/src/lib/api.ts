@@ -404,6 +404,43 @@ export const api = {
       method: "DELETE",
       headers: { Authorization: `Bearer ${token}` },
     }),
+  getEnterprisePortalLocalDevices: (token: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+    return fetchJSON<{ agent: EnterpriseAgent; devices: EnterpriseLocalDevice[] }>(
+      `/api/enterprise/portal/local-devices${qs}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  },
+  createEnterprisePortalLocalDeviceCode: (payload: {
+    token: string;
+    agent_id: string;
+    label?: string;
+    expires_minutes?: number;
+  }) =>
+    fetchJSON<EnterpriseLocalDeviceCode>("/api/enterprise/portal/local-devices/code", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${payload.token}`,
+      },
+      body: JSON.stringify({
+        agent_id: payload.agent_id,
+        label: payload.label,
+        expires_minutes: payload.expires_minutes,
+      }),
+    }),
+  getEnterpriseLocalDevices: () =>
+    fetchJSON<{ devices: EnterpriseLocalDevice[] }>("/api/enterprise/local-devices"),
+  createEnterpriseLocalRequest: (payload: { device_id: string; request: string }) =>
+    fetchJSON<{ request: EnterpriseLocalRequest }>("/api/enterprise/local-requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  getEnterpriseLocalRequests: (deviceId?: string) => {
+    const qs = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "";
+    return fetchJSON<{ requests: EnterpriseLocalRequest[] }>(`/api/enterprise/local-requests${qs}`);
+  },
 };
 
 export interface EnterpriseUser {
@@ -503,6 +540,52 @@ export interface EnterpriseChatResponse {
   user: EnterpriseUser;
   agent?: EnterpriseAgent;
   agents?: EnterpriseAgent[];
+}
+
+export interface EnterpriseLocalDevice {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  agent_id: string;
+  name: string;
+  status: string;
+  created_at: number;
+  last_seen_at?: number | null;
+  revoked_at?: number | null;
+  user_email?: string | null;
+  user_name?: string | null;
+  agent_name?: string | null;
+}
+
+export interface EnterpriseLocalDeviceCode {
+  code: string;
+  tenant_id: string;
+  user_id: string;
+  agent_id: string;
+  agent_name: string;
+  label?: string | null;
+  created_at: number;
+  expires_at: number;
+}
+
+export interface EnterpriseLocalRequest {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  agent_id: string;
+  device_id: string;
+  requester_user_id?: string | null;
+  request: string;
+  response?: string | null;
+  status: string;
+  created_at: number;
+  updated_at: number;
+  delivered_at?: number | null;
+  responded_at?: number | null;
+  device_name?: string | null;
+  user_email?: string | null;
+  user_name?: string | null;
+  agent_name?: string | null;
 }
 
 export interface ActionResponse {
