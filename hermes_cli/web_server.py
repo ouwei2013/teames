@@ -46,6 +46,7 @@ from hermes_cli.config import (
     check_config_version,
     redact_key,
 )
+from agent.access_context import AccessContext
 from gateway.status import get_running_pid, read_runtime_status
 
 try:
