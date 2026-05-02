@@ -111,6 +111,7 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/enterprise/invites/redeem",
     "/api/enterprise/me",
     "/api/enterprise/chat",
+    "/api/enterprise/chat/stream",
     "/api/enterprise/portal/cron/jobs",
     "/api/enterprise/portal/skills/toggle",
     "/api/enterprise/portal/skills",
@@ -2506,6 +2507,232 @@ async def enterprise_chat(request: Request, body: EnterpriseChatBody):
     except Exception as exc:
         _log.exception("Enterprise chat failed")
         raise HTTPException(status_code=500, detail=f"Chat failed: {exc}")
+
+
+@app.post("/api/enterprise/chat/stream")
+async def enterprise_chat_stream(request: Request, body: EnterpriseChatBody):
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if auth:
+                agent = store.resolve_user_agent(
+                    auth["user"],
+                    agent_id=(body.agent_id or None),
+                )
+                auth["agent"] = agent
+                auth["agents"] = store.list_user_agents(auth["user"]["id"])
+                auth["access_context"] = AccessContext(
+                    tenant_id=auth["user"]["tenant_id"],
+                    workspace_id="default",
+                    user_id=auth["user"]["id"],
+                    agent_id=agent["id"],
+                )
+                auth["system_message"] = _append_enterprise_skill_prompt(
+                    store.compile_agent_prompt(agent),
+                    store.list_user_agent_skill_names(auth["user"], agent["id"]),
+                    store.list_agent_custom_skills(
+                        agent["id"],
+                        tenant_id=agent["tenant_id"],
+                        enabled_only=True,
+                    )
+                    + store.list_user_agent_custom_skills(
+                        auth["user"],
+                        agent["id"],
+                        enabled_only=True,
+                    ),
+                )
+        finally:
+            store.close()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("Enterprise user authentication failed")
+        raise HTTPException(status_code=500, detail="Enterprise authentication failed")
+
+    if not auth:
+        raise HTTPException(status_code=401, detail="Invalid user token")
+
+    access_context = auth["access_context"]
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        import uuid as _uuid
+        session_id = f"web-{_uuid.uuid4().hex[:16]}"
+
+    event_queue: "queue.Queue[Any]" = queue.Queue()
+    done = object()
+
+    def _emit(event: Dict[str, Any]) -> None:
+        try:
+            event_queue.put(event)
+        except Exception:
+            _log.debug("Enterprise chat stream enqueue failed", exc_info=True)
+
+    def _run_chat_stream() -> None:
+        from gateway.run import (
+            _load_gateway_config,
+            _resolve_gateway_model,
+            _resolve_runtime_agent_kwargs,
+        )
+        from gateway.session_context import (
+            clear_enterprise_vars,
+            clear_session_vars,
+            set_enterprise_vars,
+            set_session_vars,
+        )
+        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+        user_config = _load_gateway_config()
+        enabled_toolsets = _enterprise_enabled_toolsets(
+            _get_platform_tools(user_config, "api_server")
+        )
+        if "enterprise_skills" not in enabled_toolsets:
+            enabled_toolsets.append("enterprise_skills")
+        live_trace: List[Dict[str, Any]] = []
+
+        def _emit_trace(item: Dict[str, Any]) -> None:
+            live_trace.append(item)
+            _emit({"type": "trace", "trace": item})
+
+        def _record_status(kind: str, msg: str) -> None:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="status",
+                    title=str(msg),
+                    status="warning" if kind == "warn" else "info",
+                )
+            )
+
+        def _record_tool_progress(event: str, tool_name: str, preview: Any = None, args: Any = None, **kwargs: Any) -> None:
+            del args
+            status = "running"
+            title = f"Starting {tool_name}"
+            detail = str(preview or "")
+            if event == "tool.completed":
+                status = "error" if kwargs.get("is_error") else "success"
+                duration = kwargs.get("duration")
+                title = f"Completed {tool_name}"
+                detail = f"{duration:.1f}s" if isinstance(duration, (int, float)) else ""
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="tool_progress",
+                    title=title,
+                    detail=detail,
+                    status=status,
+                    tool=tool_name,
+                )
+            )
+
+        def _record_tool_gen(tool_name: str) -> None:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="tool_generation",
+                    title=f"Preparing tool call: {tool_name}",
+                    status="running",
+                    tool=tool_name,
+                )
+            )
+
+        def _record_stream_delta(text: Any) -> None:
+            if isinstance(text, str) and text:
+                _emit({"type": "delta", "delta": text})
+
+        db = SessionDB()
+        try:
+            history = db.get_messages_as_conversation(
+                session_id,
+                access_context=access_context,
+            )
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                session_id=session_id,
+                platform="web",
+                session_db=db,
+                access_context=access_context,
+                status_callback=_record_status,
+                tool_progress_callback=_record_tool_progress,
+                tool_gen_callback=_record_tool_gen,
+                stream_delta_callback=_record_stream_delta,
+            )
+            system_message = auth.get("system_message") or ""
+            session_tokens = set_session_vars(
+                platform="enterprise_portal",
+                chat_id=session_id,
+                chat_name=auth.get("agent", {}).get("name") or "",
+                user_id=auth["user"]["id"],
+                user_name=auth["user"].get("email") or "",
+                session_key=session_id,
+            )
+            enterprise_tokens = set_enterprise_vars(
+                tenant_id=auth["user"]["tenant_id"],
+                user_id=auth["user"]["id"],
+                agent_id=auth.get("agent", {}).get("id") or "",
+                agent_name=auth.get("agent", {}).get("name") or "",
+                system_message=system_message,
+            )
+            try:
+                result = agent.run_conversation(
+                    user_message=message,
+                    system_message=system_message,
+                    conversation_history=history,
+                    task_id="enterprise-web",
+                )
+            finally:
+                clear_enterprise_vars(enterprise_tokens)
+                clear_session_vars(session_tokens)
+            _emit(
+                {
+                    "type": "final",
+                    "session_id": session_id,
+                    "final_response": result.get("final_response", ""),
+                    "trace": (live_trace + _builder_trace_from_messages(result.get("messages") or []))[-40:],
+                    "user": auth["user"],
+                    "agent": auth.get("agent"),
+                    "agents": auth.get("agents", []),
+                }
+            )
+        except Exception as exc:
+            _log.exception("Enterprise chat stream failed")
+            _emit({"type": "error", "detail": f"Chat failed: {exc}"})
+        finally:
+            try:
+                db.close()
+            finally:
+                event_queue.put(done)
+
+    def _event_stream():
+        worker = threading.Thread(target=_run_chat_stream, daemon=True)
+        worker.start()
+        while True:
+            event = event_queue.get()
+            if event is done:
+                break
+            yield _enterprise_builder_json_line(event)
+        worker.join(timeout=0.2)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _normalize_config_for_web(config: Dict[str, Any]) -> Dict[str, Any]:

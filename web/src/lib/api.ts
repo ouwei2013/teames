@@ -26,6 +26,7 @@ function isPublicApiPath(url: string): boolean {
     path === "/api/enterprise/invites/redeem" ||
     path === "/api/enterprise/me" ||
     path === "/api/enterprise/chat" ||
+    path === "/api/enterprise/chat/stream" ||
     path.startsWith("/api/enterprise/portal/") ||
     path.startsWith("/api/plugins/")
   );
@@ -124,6 +125,67 @@ export async function streamEnterpriseBuilderChat(
   async function handleLine(line: string) {
     if (!line.trim()) return;
     const event = JSON.parse(line) as EnterpriseBuilderStreamEvent;
+    if (event.type === "trace") {
+      handlers.onTrace?.(event.trace);
+    } else if (event.type === "delta") {
+      handlers.onDelta?.(event.delta);
+    } else if (event.type === "final") {
+      handlers.onFinal?.(event);
+    } else if (event.type === "error") {
+      handlers.onError?.(event.detail);
+      throw new Error(event.detail);
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      await handleLine(line);
+    }
+  }
+  buffer += decoder.decode();
+  await handleLine(buffer);
+}
+
+export async function streamEnterpriseChat(
+  payload: { token: string; message: string; session_id?: string; agent_id?: string },
+  handlers: {
+    onTrace?: (trace: EnterpriseBuilderTraceItem) => void;
+    onDelta?: (delta: string) => void;
+    onFinal?: (result: EnterpriseChatResponse) => void;
+    onError?: (detail: string) => void;
+  },
+): Promise<void> {
+  const url = "/api/enterprise/chat/stream";
+  const res = await fetch(`${BASE}${url}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${payload.token}`,
+    },
+    body: JSON.stringify({
+      message: payload.message,
+      session_id: payload.session_id,
+      agent_id: payload.agent_id,
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${text || res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  async function handleLine(line: string) {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as EnterpriseChatStreamEvent;
     if (event.type === "trace") {
       handlers.onTrace?.(event.trace);
     } else if (event.type === "delta") {
@@ -639,6 +701,7 @@ export interface EnterpriseChatResponse {
   user: EnterpriseUser;
   agent?: EnterpriseAgent;
   agents?: EnterpriseAgent[];
+  trace?: EnterpriseBuilderTraceItem[];
 }
 
 export interface EnterpriseBuilderChatResponse {
@@ -653,6 +716,12 @@ export type EnterpriseBuilderStreamEvent =
   | { type: "trace"; trace: EnterpriseBuilderTraceItem }
   | { type: "delta"; delta: string }
   | ({ type: "final" } & EnterpriseBuilderChatResponse)
+  | { type: "error"; detail: string };
+
+export type EnterpriseChatStreamEvent =
+  | { type: "trace"; trace: EnterpriseBuilderTraceItem }
+  | { type: "delta"; delta: string }
+  | ({ type: "final" } & EnterpriseChatResponse)
   | { type: "error"; detail: string };
 
 export interface EnterpriseBuilderTraceItem {

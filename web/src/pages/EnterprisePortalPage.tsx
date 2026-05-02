@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   Bot,
+  CheckCircle2,
   Clock,
+  Circle,
+  CircleAlert,
   Copy,
   Laptop,
   Loader2,
@@ -17,12 +20,15 @@ import {
   Wrench,
 } from "lucide-react";
 import { Typography } from "@nous-research/ui";
+import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   api,
+  streamEnterpriseChat,
   type CronJob,
   type EnterpriseAgent,
+  type EnterpriseBuilderTraceItem,
   type EnterpriseLocalDevice,
   type EnterpriseLocalDeviceCode,
   type EnterpriseUser,
@@ -35,6 +41,7 @@ type PortalMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  trace?: EnterpriseBuilderTraceItem[];
 };
 
 type StoredSession = {
@@ -169,6 +176,10 @@ export default function EnterprisePortalPage() {
     });
   }, [messages, sending]);
 
+  function updateAssistantMessage(id: string, updater: (message: PortalMessage) => PortalMessage) {
+    setMessages((current) => current.map((message) => (message.id === id ? updater(message) : message)));
+  }
+
   useEffect(() => {
     if (!session?.token || !selectedAgent || view === "chat") return;
     let cancelled = false;
@@ -292,41 +303,73 @@ export default function EnterprisePortalPage() {
       role: "user",
       content: input.trim(),
     };
+    const assistantId = crypto.randomUUID();
     setInput("");
     setError(null);
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [
+      ...current,
+      userMessage,
+      { id: assistantId, role: "assistant", content: "", trace: [] },
+    ]);
     setSending(true);
 
     try {
-      const result = await api.enterpriseChat({
-        token: session.token,
-        message: userMessage.content,
-        session_id: session.sessionIds?.[selectedAgent.id],
-        agent_id: selectedAgent.id,
-      });
-      const nextAgentId = result.agent?.id || selectedAgent.id;
-      const nextSession = {
-        ...session,
-        agents: result.agents || session.agents,
-        selectedAgentId: nextAgentId,
-        sessionIds: {
-          ...(session.sessionIds || {}),
-          [nextAgentId]: result.session_id,
-        },
-        user: result.user || session.user,
-      };
-      saveStoredSession(nextSession);
-      setSession(nextSession);
-      setMessages((current) => [
-        ...current,
+      await streamEnterpriseChat(
         {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: result.final_response || "(No response)",
+          token: session.token,
+          message: userMessage.content,
+          session_id: session.sessionIds?.[selectedAgent.id],
+          agent_id: selectedAgent.id,
         },
-      ]);
+        {
+          onDelta: (delta) => {
+            updateAssistantMessage(assistantId, (message) => ({
+              ...message,
+              content: `${message.content}${delta}`,
+            }));
+          },
+          onTrace: (trace) => {
+            updateAssistantMessage(assistantId, (message) => ({
+              ...message,
+              trace: [...(message.trace || []), trace],
+            }));
+          },
+          onFinal: (result) => {
+            const nextAgentId = result.agent?.id || selectedAgent.id;
+            const nextSession = {
+              ...session,
+              agents: result.agents || session.agents,
+              selectedAgentId: nextAgentId,
+              sessionIds: {
+                ...(session.sessionIds || {}),
+                [nextAgentId]: result.session_id,
+              },
+              user: result.user || session.user,
+            };
+            saveStoredSession(nextSession);
+            setSession(nextSession);
+            updateAssistantMessage(assistantId, (message) => ({
+              ...message,
+              content: result.final_response || message.content || "(No response)",
+              trace: result.trace || message.trace || [],
+            }));
+          },
+          onError: (detail) => {
+            setError(detail);
+            updateAssistantMessage(assistantId, (message) => ({
+              ...message,
+              content: message.content || `Chat failed: ${detail}`,
+            }));
+          },
+        },
+      );
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const messageText = err instanceof Error ? err.message : String(err);
+      setError(messageText);
+      updateAssistantMessage(assistantId, (message) => ({
+        ...message,
+        content: message.content || `Chat failed: ${messageText}`,
+      }));
     } finally {
       setSending(false);
     }
@@ -629,25 +672,36 @@ export default function EnterprisePortalPage() {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {messages.map((message) => (
+                  {messages.map((message, index) => {
+                    const isLatestAssistant =
+                      sending && message.role === "assistant" && index === messages.length - 1;
+                    const hasTrace = Boolean(message.trace && message.trace.length > 0);
+                    return (
                     <div
                       key={message.id}
                       className={cn(
-                        "max-w-[min(760px,92%)] border border-border px-3 py-2 font-courier text-sm leading-relaxed normal-case whitespace-pre-wrap",
+                        "max-w-[min(760px,92%)] border border-border px-3 py-2 font-courier text-sm leading-relaxed normal-case",
                         message.role === "user"
                           ? "ml-auto bg-foreground/10 text-midground"
                           : "mr-auto bg-background/60 text-midground",
                       )}
                     >
-                      {message.content}
+                      {message.role === "assistant" && hasTrace && (
+                        <TraceList trace={message.trace || []} />
+                      )}
+                      {message.content ? (
+                        <div className={cn("break-words", message.role === "assistant" && hasTrace ? "mt-3" : "")}>
+                          <Markdown content={message.content} streaming={isLatestAssistant} />
+                        </div>
+                      ) : isLatestAssistant ? (
+                        <div className="flex items-center gap-2 text-muted-foreground">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          Thinking
+                        </div>
+                      ) : null}
                     </div>
-                  ))}
-                  {sending && (
-                    <div className="mr-auto flex items-center gap-2 border border-border bg-background/60 px-3 py-2 font-courier text-sm normal-case text-muted-foreground">
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Thinking
-                    </div>
-                  )}
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -885,6 +939,51 @@ function PanelLoading() {
     <div className="flex items-center gap-2 font-courier text-xs normal-case text-muted-foreground">
       <Loader2 className="h-3.5 w-3.5 animate-spin" />
       Loading
+    </div>
+  );
+}
+
+function TraceList({ trace }: { trace: EnterpriseBuilderTraceItem[] }) {
+  return (
+    <div className="border-b border-border/70 pb-2">
+      <div className="mb-2 font-courier text-[11px] uppercase tracking-normal text-muted-foreground">
+        Activity
+      </div>
+      <div className="space-y-2">
+        {trace.map((item, index) => {
+          const Icon =
+            item.status === "success"
+              ? CheckCircle2
+              : item.status === "error"
+                ? CircleAlert
+                : Circle;
+          const isWarning = item.status === "warning";
+          return (
+            <div key={`${item.title}-${index}`} className="flex gap-2 font-courier text-xs normal-case">
+              <Icon
+                className={cn(
+                  "mt-0.5 h-3.5 w-3.5 shrink-0",
+                  item.status === "success" && "text-success",
+                  item.status === "error" && "text-destructive",
+                  isWarning && "text-warning",
+                  item.status !== "success" && item.status !== "error" && !isWarning && "text-muted-foreground",
+                )}
+              />
+              <div className="min-w-0">
+                <div className="text-midground">{item.title}</div>
+                {item.detail && (
+                  <div className="mt-0.5 break-words text-muted-foreground">{item.detail}</div>
+                )}
+                {item.result && (
+                  <div className="mt-0.5 break-words text-muted-foreground">
+                    Result: {item.result}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
