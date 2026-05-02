@@ -1420,6 +1420,38 @@ def _enterprise_local_listen(args) -> None:
         _sleep_time.sleep(interval)
 
 
+def _enterprise_local_serve(args) -> None:
+    """Start the browser UI for a user-owned local enterprise agent."""
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ImportError as e:
+        print("Local agent web UI requires fastapi + uvicorn.")
+        print(
+            f"Install the web extras in this environment:\n"
+            f"  cd {PROJECT_ROOT}\n"
+            f"  {sys.executable} -m pip install -e .\n"
+            "If `pip` is missing in this venv, use:  uv pip install -e ."
+        )
+        print(f"Import error: {e}")
+        sys.exit(1)
+
+    if "HERMES_WEB_DIST" not in os.environ:
+        if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
+            sys.exit(1)
+
+    from hermes_cli.web_server import start_server
+
+    start_server(
+        host=getattr(args, "host", "127.0.0.1"),
+        port=int(getattr(args, "port", 9130) or 9130),
+        open_browser=not bool(getattr(args, "no_open", False)),
+        allow_public=bool(getattr(args, "insecure", False)),
+        embedded_chat=False,
+        initial_path="/local",
+    )
+
+
 def _enterprise_local_command(args) -> None:
     action = getattr(args, "local_action", None)
     if action == "join":
@@ -1430,8 +1462,10 @@ def _enterprise_local_command(args) -> None:
         _enterprise_local_respond(args)
     elif action == "listen":
         _enterprise_local_listen(args)
+    elif action == "serve":
+        _enterprise_local_serve(args)
     else:
-        print("Local agent commands: join, poll, respond, listen")
+        print("Local agent commands: join, poll, respond, listen, serve")
 
 
 def cmd_enterprise(args):
@@ -8012,6 +8046,20 @@ For more help on a command:
     enterprise_local_listen.add_argument("--interval", type=int, default=5, help="Polling interval in seconds")
     enterprise_local_listen.add_argument("--once", action="store_true", help="Handle current requests and exit")
     enterprise_local_listen.set_defaults(func=cmd_enterprise)
+
+    enterprise_local_serve = enterprise_local_subparsers.add_parser(
+        "serve",
+        help="Start the browser UI for this local enterprise agent",
+    )
+    enterprise_local_serve.add_argument("--port", type=int, default=9130, help="Port (default 9130)")
+    enterprise_local_serve.add_argument("--host", default="127.0.0.1", help="Host (default 127.0.0.1)")
+    enterprise_local_serve.add_argument("--no-open", action="store_true", help="Don't open browser automatically")
+    enterprise_local_serve.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Allow binding to non-localhost (DANGEROUS: exposes local tools on the network)",
+    )
+    enterprise_local_serve.set_defaults(func=cmd_enterprise)
 
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser(

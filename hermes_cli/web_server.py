@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -53,7 +54,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -83,6 +84,8 @@ _DASHBOARD_EMBEDDED_CHAT_ENABLED = False
 _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
+_LOCAL_WEB_CONNECT_STATES: Dict[str, Dict[str, Any]] = {}
+_LOCAL_WEB_CONNECT_STATE_TTL = 10 * 60
 
 # CORS: restrict to localhost origins only.  The web UI is intended to run
 # locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
@@ -119,6 +122,7 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/enterprise/portal/local-devices",
     "/api/enterprise/portal/local-devices/code",
     "/api/enterprise/local-agent/register",
+    "/api/enterprise/local-web/callback",
     "/api/enterprise/local-agent/agents",
     "/api/enterprise/local-agent/chat",
     "/api/enterprise/local-agent/requests",
@@ -486,6 +490,17 @@ class EnterpriseChatBody(BaseModel):
 class EnterpriseBuilderChatBody(BaseModel):
     message: str
     session_id: Optional[str] = None
+
+
+class EnterpriseLocalWebConnectBody(BaseModel):
+    server: str
+    name: Optional[str] = None
+
+
+class EnterpriseLocalWebJoinBody(BaseModel):
+    server: str
+    code: str
+    name: Optional[str] = None
 
 
 class EnterpriseAgentBody(BaseModel):
@@ -1795,6 +1810,403 @@ async def enterprise_local_agent_register(body: EnterpriseLocalDeviceRegister):
     except Exception:
         _log.exception("POST /api/enterprise/local-agent/register failed")
         raise HTTPException(status_code=500, detail="Enterprise local agent registration failed")
+
+
+def _enterprise_local_web_config_path() -> Path:
+    return get_hermes_home() / "enterprise-local.json"
+
+
+def _read_enterprise_local_web_config() -> Dict[str, Any]:
+    path = _enterprise_local_web_config_path()
+    if not path.exists():
+        return {}
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_enterprise_local_web_config(config: Dict[str, Any]) -> None:
+    path = _enterprise_local_web_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _enterprise_local_web_http_json(
+    server: str,
+    path: str,
+    *,
+    method: str = "GET",
+    token: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    normalized_server = (server or "").strip().rstrip("/")
+    if not normalized_server.startswith(("http://", "https://")):
+        raise ValueError("Remote server must start with http:// or https://")
+    data = None
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(normalized_server + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{exc.code} {exc.reason}: {detail}") from exc
+
+
+def _refresh_enterprise_local_web_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    server = str(config.get("server") or "").rstrip("/")
+    token = str(config.get("device_token") or "")
+    if not server or not token:
+        return config
+    result = _enterprise_local_web_http_json(
+        server,
+        "/api/enterprise/local-agent/agents",
+        token=token,
+    )
+    agents = result.get("agents") or []
+    default_agent_id = result.get("default_agent_id")
+    agent = next((item for item in agents if item.get("id") == default_agent_id), None)
+    if not agent and agents:
+        agent = agents[0]
+    config.update(
+        {
+            "server": server,
+            "device": result.get("device") or config.get("device"),
+            "user": result.get("user") or config.get("user"),
+            "agent": agent or config.get("agent"),
+            "agents": agents,
+            "default_agent_id": default_agent_id,
+        }
+    )
+    _write_enterprise_local_web_config(config)
+    return config
+
+
+def _enterprise_local_web_status() -> Dict[str, Any]:
+    config = _read_enterprise_local_web_config()
+    status = {
+        "joined": bool(config.get("server") and config.get("device_token")),
+        "server": config.get("server"),
+        "device": config.get("device"),
+        "user": config.get("user"),
+        "agent": config.get("agent"),
+        "agents": config.get("agents") or ([config["agent"]] if config.get("agent") else []),
+        "default_agent_id": config.get("default_agent_id") or (config.get("agent") or {}).get("id"),
+        "config_path": str(_enterprise_local_web_config_path()),
+    }
+    if not status["joined"]:
+        return status
+    try:
+        refreshed = _refresh_enterprise_local_web_config(config)
+        status.update(
+            {
+                "server": refreshed.get("server"),
+                "device": refreshed.get("device"),
+                "user": refreshed.get("user"),
+                "agent": refreshed.get("agent"),
+                "agents": refreshed.get("agents") or status["agents"],
+                "default_agent_id": refreshed.get("default_agent_id") or status["default_agent_id"],
+            }
+        )
+    except Exception as exc:
+        status["remote_error"] = str(exc)
+    return status
+
+
+def _join_enterprise_local_web(server: str, code: str, name: Optional[str] = None) -> Dict[str, Any]:
+    normalized_server = (server or "").strip().rstrip("/")
+    result = _enterprise_local_web_http_json(
+        normalized_server,
+        "/api/enterprise/local-agent/register",
+        method="POST",
+        payload={"code": code, "name": name},
+    )
+    config = {
+        "server": normalized_server,
+        "device_token": result["device_token"],
+        "device": result.get("device"),
+        "user": result.get("user"),
+        "agent": result.get("agent"),
+    }
+    try:
+        config = _refresh_enterprise_local_web_config(config)
+    except Exception:
+        _write_enterprise_local_web_config(config)
+    return _enterprise_local_web_status()
+
+
+def _enterprise_local_web_prompt(config: Dict[str, Any]) -> str:
+    user = config.get("user") or {}
+    device = config.get("device") or {}
+    agent = config.get("agent") or {}
+    agents = config.get("agents") or []
+    remote_agent_lines = [
+        f"- {item.get('name') or item.get('id')} ({item.get('id')})"
+        for item in agents
+    ]
+    return (
+        "You are a local Hermes agent running on the user's own computer. "
+        "You can help with local tasks using the local Hermes tools and local profile state. "
+        "If the user asks about company policy, HR, customer support, business-specific "
+        "knowledge, or another assigned business agent, use enterprise_remote to consult "
+        "the remote business agent assigned to this user. Do not send private local files, "
+        "secrets, credentials, screenshots, account data, or internal documents to remote "
+        "business agents unless the local user explicitly agrees. Prefer summaries and "
+        "minimal necessary excerpts over raw data.\n\n"
+        f"Remote server: {config.get('server') or 'not connected'}\n"
+        f"Local device: {device.get('name') or device.get('id') or 'unknown'}\n"
+        f"Enterprise user: {user.get('email') or user.get('name') or user.get('id') or 'unknown'}\n"
+        f"Default business agent: {agent.get('name') or agent.get('id') or 'none'}\n"
+        "Assigned remote business agents:\n"
+        + ("\n".join(remote_agent_lines) if remote_agent_lines else "- none")
+    )
+
+
+def _cleanup_local_web_connect_states() -> None:
+    now = time.time()
+    expired = [
+        state for state, item in _LOCAL_WEB_CONNECT_STATES.items()
+        if now - float(item.get("created_at", 0)) > _LOCAL_WEB_CONNECT_STATE_TTL
+    ]
+    for state in expired:
+        _LOCAL_WEB_CONNECT_STATES.pop(state, None)
+
+
+@app.get("/api/enterprise/local-web/status")
+async def enterprise_local_web_status():
+    return _enterprise_local_web_status()
+
+
+@app.post("/api/enterprise/local-web/connect-url")
+async def enterprise_local_web_connect_url(request: Request, body: EnterpriseLocalWebConnectBody):
+    server = (body.server or "").strip().rstrip("/")
+    if not server.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Remote server must start with http:// or https://")
+    _cleanup_local_web_connect_states()
+    state = secrets.token_urlsafe(24)
+    _LOCAL_WEB_CONNECT_STATES[state] = {
+        "server": server,
+        "name": (body.name or "").strip() or None,
+        "created_at": time.time(),
+    }
+    callback_url = str(request.url_for("enterprise_local_web_callback"))
+    params = urllib.parse.urlencode(
+        {
+            "local_callback": callback_url,
+            "local_state": state,
+            "local_name": (body.name or "").strip(),
+        }
+    )
+    return {
+        "url": f"{server}/portal?{params}",
+        "state": state,
+        "expires_at": time.time() + _LOCAL_WEB_CONNECT_STATE_TTL,
+    }
+
+
+@app.post("/api/enterprise/local-web/join")
+async def enterprise_local_web_join(body: EnterpriseLocalWebJoinBody):
+    try:
+        return _join_enterprise_local_web(body.server, body.code, name=body.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _log.exception("POST /api/enterprise/local-web/join failed")
+        raise HTTPException(status_code=500, detail=f"Local web join failed: {exc}")
+
+
+@app.get("/api/enterprise/local-web/callback", name="enterprise_local_web_callback")
+async def enterprise_local_web_callback(code: str, state: str):
+    try:
+        _cleanup_local_web_connect_states()
+        pending = _LOCAL_WEB_CONNECT_STATES.pop(state, None)
+        if not pending:
+            raise ValueError("Connection session expired or invalid")
+        _join_enterprise_local_web(
+            str(pending.get("server") or ""),
+            code,
+            name=pending.get("name"),
+        )
+        return RedirectResponse(url="/local?connected=1", status_code=303)
+    except Exception as exc:
+        detail = urllib.parse.quote(str(exc), safe="")
+        return RedirectResponse(url=f"/local?error={detail}", status_code=303)
+
+
+@app.post("/api/enterprise/local-web/chat/stream")
+async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    config = _read_enterprise_local_web_config()
+    try:
+        if config.get("server") and config.get("device_token"):
+            config = _refresh_enterprise_local_web_config(config)
+    except Exception:
+        pass
+
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        import uuid as _uuid
+        session_id = f"enterprise-local-web-{_uuid.uuid4().hex[:16]}"
+
+    event_queue: "queue.Queue[Any]" = queue.Queue()
+    done = object()
+
+    def _emit(event: Dict[str, Any]) -> None:
+        try:
+            event_queue.put(event)
+        except Exception:
+            _log.debug("Enterprise local web stream enqueue failed", exc_info=True)
+
+    def _run_local_chat_stream() -> None:
+        from gateway.run import (
+            _load_gateway_config,
+            _resolve_gateway_model,
+            _resolve_runtime_agent_kwargs,
+        )
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "cli")) | {"enterprise_remote"})
+        live_trace: List[Dict[str, Any]] = []
+
+        def _emit_trace(item: Dict[str, Any]) -> None:
+            live_trace.append(item)
+            _emit({"type": "trace", "trace": item})
+
+        def _record_status(kind: str, msg: str) -> None:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="status",
+                    title=str(msg),
+                    status="warning" if kind == "warn" else "info",
+                )
+            )
+
+        def _record_tool_progress(event: str, tool_name: str, preview: Any = None, args: Any = None, **kwargs: Any) -> None:
+            del args
+            status = "running"
+            title = f"Starting {tool_name}"
+            detail = str(preview or "")
+            if event == "tool.completed":
+                status = "error" if kwargs.get("is_error") else "success"
+                duration = kwargs.get("duration")
+                title = f"Completed {tool_name}"
+                detail = f"{duration:.1f}s" if isinstance(duration, (int, float)) else ""
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="tool_progress",
+                    title=title,
+                    detail=detail,
+                    status=status,
+                    tool=tool_name,
+                )
+            )
+
+        def _record_tool_gen(tool_name: str) -> None:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="tool_generation",
+                    title=f"Preparing tool call: {tool_name}",
+                    status="running",
+                    tool=tool_name,
+                )
+            )
+
+        def _record_stream_delta(text: Any) -> None:
+            if isinstance(text, str) and text:
+                _emit({"type": "delta", "delta": text})
+
+        db = SessionDB()
+        try:
+            history = db.get_messages_as_conversation(session_id)
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                session_id=session_id,
+                platform="enterprise_local_web",
+                session_db=db,
+                status_callback=_record_status,
+                tool_progress_callback=_record_tool_progress,
+                tool_gen_callback=_record_tool_gen,
+                stream_delta_callback=_record_stream_delta,
+            )
+            session_tokens = set_session_vars(
+                platform="enterprise_local_web",
+                chat_id=session_id,
+                chat_name="Enterprise Local Agent",
+                user_id=(config.get("user") or {}).get("id") or "local-user",
+                user_name=(config.get("user") or {}).get("email") or "",
+                session_key=session_id,
+            )
+            try:
+                result = agent.run_conversation(
+                    user_message=message,
+                    system_message=_enterprise_local_web_prompt(config),
+                    conversation_history=history,
+                    task_id="enterprise-local-web",
+                )
+            finally:
+                clear_session_vars(session_tokens)
+            _emit(
+                {
+                    "type": "final",
+                    "session_id": session_id,
+                    "final_response": result.get("final_response", ""),
+                    "trace": (live_trace + _builder_trace_from_messages(result.get("messages") or []))[-40:],
+                    "local": _enterprise_local_web_status(),
+                }
+            )
+        except Exception as exc:
+            _log.exception("Enterprise local web chat failed")
+            _emit({"type": "error", "detail": f"Local chat failed: {exc}"})
+        finally:
+            try:
+                db.close()
+            finally:
+                event_queue.put(done)
+
+    def _event_stream():
+        worker = threading.Thread(target=_run_local_chat_stream, daemon=True)
+        worker.start()
+        while True:
+            event = event_queue.get()
+            if event is done:
+                break
+            yield _enterprise_builder_json_line(event)
+        worker.join(timeout=0.2)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/enterprise/local-agent/agents")
@@ -5276,6 +5688,7 @@ def start_server(
     allow_public: bool = False,
     *,
     embedded_chat: bool = False,
+    initial_path: str = "/",
 ):
     """Start the web UI server."""
     import uvicorn
@@ -5308,7 +5721,8 @@ def start_server(
 
         def _open():
             time.sleep(1.0)
-            webbrowser.open(f"http://{host}:{port}")
+            path = initial_path if initial_path.startswith("/") else f"/{initial_path}"
+            webbrowser.open(f"http://{host}:{port}{path}")
 
         threading.Thread(target=_open, daemon=True).start()
 

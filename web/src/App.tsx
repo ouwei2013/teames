@@ -61,6 +61,7 @@ import SkillsPage from "@/pages/SkillsPage";
 import ChatPage from "@/pages/ChatPage";
 import EnterpriseAdminPage from "@/pages/EnterpriseAdminPage";
 import EnterpriseBuilderPage from "@/pages/EnterpriseBuilderPage";
+import EnterpriseLocalPage from "@/pages/EnterpriseLocalPage";
 import EnterprisePortalPage from "@/pages/EnterprisePortalPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
@@ -263,6 +264,7 @@ export default function App() {
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isEnterprisePortalRoute =
     normalizedPath === "/portal" || normalizedPath === "/accept-invite";
+  const isEnterpriseLocalRoute = normalizedPath === "/local";
   const isChatRoute = normalizedPath === "/chat";
   const isBuilderRoute = normalizedPath === "/enterprise-builder";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
@@ -331,6 +333,16 @@ export default function App() {
         <SelectionSwitcher />
         <Backdrop />
         <EnterprisePortalPage />
+      </div>
+    );
+  }
+
+  if (isEnterpriseLocalRoute) {
+    return (
+      <div className="font-mondwest flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black uppercase text-midground antialiased">
+        <SelectionSwitcher />
+        <Backdrop />
+        <EnterpriseLocalPage />
       </div>
     );
   }

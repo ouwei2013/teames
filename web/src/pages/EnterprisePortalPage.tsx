@@ -119,9 +119,21 @@ export default function EnterprisePortalPage() {
   const [localDeviceLabel, setLocalDeviceLabel] = useState("");
   const [creatingCron, setCreatingCron] = useState(false);
   const [creatingLocalCode, setCreatingLocalCode] = useState(false);
+  const [connectingLocalBrowser, setConnectingLocalBrowser] = useState(false);
   const [busyItem, setBusyItem] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const notifiedCronRunsRef = useRef<Record<string, string>>({});
+  const localConnectParams = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      callback: params.get("local_callback") || "",
+      state: params.get("local_state") || "",
+      name: params.get("local_name") || "",
+    };
+  }, []);
+  const isLocalBrowserConnect = Boolean(
+    localConnectParams.callback && localConnectParams.state,
+  );
 
   const displayName = useMemo(() => {
     if (!session) return "";
@@ -520,6 +532,34 @@ export default function EnterprisePortalPage() {
     );
   }
 
+  async function connectLocalBrowser() {
+    if (!session || !selectedAgent || !isLocalBrowserConnect) return;
+    setConnectingLocalBrowser(true);
+    setError(null);
+    try {
+      const code = await api.createEnterprisePortalLocalDeviceCode({
+        token: session.token,
+        agent_id: selectedAgent.id,
+        label: localConnectParams.name || localDeviceLabel.trim() || undefined,
+        expires_minutes: 10,
+      });
+      const callback = new URL(localConnectParams.callback);
+      if (
+        !["http:", "https:"].includes(callback.protocol) ||
+        !["127.0.0.1", "localhost", "::1"].includes(callback.hostname)
+      ) {
+        throw new Error("Local callback must be a localhost URL");
+      }
+      callback.searchParams.set("code", code.code);
+      callback.searchParams.set("state", localConnectParams.state);
+      window.location.href = callback.toString();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConnectingLocalBrowser(false);
+    }
+  }
+
   return (
     <main className="relative z-2 flex h-dvh min-h-0 w-full flex-col overflow-hidden px-4 py-4 text-midground sm:px-6 lg:px-8">
       <header className="mx-auto flex w-full max-w-5xl shrink-0 items-center justify-between gap-3 border-b border-border pb-3">
@@ -571,6 +611,23 @@ export default function EnterprisePortalPage() {
         )}
       </header>
 
+      {isLocalBrowserConnect && session && (
+        <section className="mx-auto mt-4 flex w-full max-w-5xl shrink-0 items-center justify-between gap-3 border border-border bg-card/70 p-3">
+          <div className="min-w-0 font-courier text-xs normal-case text-muted-foreground">
+            Connect this browser's local Hermes agent to{" "}
+            <span className="text-midground">{selectedAgent?.name || "this business agent"}</span>.
+          </div>
+          <Button
+            type="button"
+            onClick={connectLocalBrowser}
+            disabled={connectingLocalBrowser || !selectedAgent}
+          >
+            {connectingLocalBrowser ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Laptop className="h-3.5 w-3.5" />}
+            Connect This Computer
+          </Button>
+        </section>
+      )}
+
       {!session ? (
         <section className="mx-auto flex w-full max-w-md flex-1 items-center">
           <form
@@ -580,6 +637,11 @@ export default function EnterprisePortalPage() {
             <Typography className="font-bold text-[1.15rem] leading-none tracking-[0.08em]">
               Join workspace
             </Typography>
+            {isLocalBrowserConnect && (
+              <p className="mt-3 font-courier text-xs normal-case text-muted-foreground">
+                Sign in with an invite first, then approve connecting this computer as a local Hermes agent.
+              </p>
+            )}
             <div className="mt-5 space-y-3">
               <label className="block">
                 <span className="mb-1 block font-courier text-xs normal-case text-muted-foreground">
