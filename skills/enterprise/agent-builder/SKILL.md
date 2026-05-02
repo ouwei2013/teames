@@ -33,8 +33,26 @@ Use `enterprise_builder` for enterprise mutations. Do not edit `enterprise.db` d
    - tenant/agent-specific enterprise skills that need to be created
    - data-fetch scripts needed for private business data
    - cron or follow-up workflows
-4. If the admin gives enough detail, apply the setup with `enterprise_builder`.
-5. If critical details are missing, ask focused questions before applying.
+4. For vague requests, produce a draft or ask focused questions. Do not create anything yet.
+5. Apply the setup with `enterprise_builder` only after the admin explicitly confirms the specific draft.
+
+## Draft-First Rule
+
+For an initial message like "create an agent for my bakery business", do not call mutating `enterprise_builder` actions. That request identifies an industry, but it is missing business-specific details.
+
+First ask for the most important missing information, or provide a clearly labeled starter draft and ask whether to apply it. Useful questions include:
+
+- business name and location, if relevant
+- products/services and menu or catalog details
+- order, pickup, delivery, cancellation, and refund policies
+- allergy, safety, legal, or compliance boundaries
+- whether the agent should answer only FAQs or also fetch live data
+- which users should be invited
+- preferred tone and languages
+
+Only call mutating actions such as `create_agent`, `update_agent`, `create_agent_skill`, `set_skill_catalog`, or `create_invite` after the admin confirms with language such as "apply this", "yes create it", "save this agent", or equivalent.
+
+When calling a mutating `enterprise_builder` action after confirmation, set `confirmed_by_admin: true`. Never set it to true for vague initial requirements.
 
 ## Data-Fetch Skills
 
@@ -59,6 +77,7 @@ For example, if the admin says order history is in `order_history` and profile d
 ## Safety Rules
 
 - Do not claim an agent, invite, skill, script, or allowlist was created until `enterprise_builder` returns success.
+- Do not call mutating `enterprise_builder` actions until the admin has approved a specific draft.
 - Do not store database passwords, API keys, or customer secrets in prompts, `SKILL.md`, scripts, or knowledge fields.
 - Scripts should read credentials from environment variables or a future secure connector layer.
 - Use least privilege: generated scripts should query only the tables and rows needed for the current user workflow.
@@ -68,11 +87,11 @@ For example, if the admin says order history is in `order_history` and profile d
 
 - `status`: inspect tenant, users, and agents.
 - `list_builtin_skills`: inspect native skills that can be allowlisted for business agents.
-- `create_agent`: create a business agent with prompt fields and knowledge.
-- `update_agent`: revise an existing business agent.
-- `set_skill_catalog`: make a native built-in skill visible or hidden for a business agent.
-- `create_agent_skill`: create a tenant/agent-scoped enterprise skill package, including optional `scripts/*.py`.
-- `create_invite`: generate an invite for a user and assign accessible agents.
+- `create_agent`: create a business agent with prompt fields and knowledge after explicit admin approval.
+- `update_agent`: revise an existing business agent after explicit admin approval.
+- `set_skill_catalog`: make a native built-in skill visible or hidden for a business agent after explicit admin approval.
+- `create_agent_skill`: create a tenant/agent-scoped enterprise skill package, including optional `scripts/*.py`, after explicit admin approval.
+- `create_invite`: generate an invite for a user and assign accessible agents after explicit admin approval.
 
 ## Response Style
 

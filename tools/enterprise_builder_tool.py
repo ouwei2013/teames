@@ -108,6 +108,7 @@ def enterprise_builder(
     category: Optional[str] = "business",
     content: Optional[str] = None,
     files: Optional[List[Dict[str, Any]]] = None,
+    confirmed_by_admin: bool = False,
     task_id: str | None = None,
 ) -> str:
     del task_id
@@ -118,6 +119,20 @@ def enterprise_builder(
         return _tool_error(str(exc))
 
     from enterprise import EnterpriseStore
+
+    mutating_actions = {
+        "create_agent",
+        "update_agent",
+        "set_skill_catalog",
+        "create_invite",
+        "create_agent_skill",
+    }
+    if normalized_action in mutating_actions and not confirmed_by_admin:
+        return _tool_error(
+            "Mutating builder actions require explicit admin confirmation. "
+            "First ask clarifying questions or present a draft, then call this "
+            "tool only after the admin confirms the specific change."
+        )
 
     store = EnterpriseStore()
     try:
@@ -284,7 +299,8 @@ ENTERPRISE_BUILDER_SCHEMA = {
         "Admin-only tool for building enterprise business agents. It can create "
         "or update business agents, enable built-in skills for an agent, create "
         "tenant/agent-scoped enterprise skill packages with supporting scripts, "
-        "and create invite links. Only use it after the admin's intent is clear; "
+        "and create invite links. Mutating actions require confirmed_by_admin=true, "
+        "which must only be set after the admin explicitly approves the specific draft; "
         "do not claim changes were made unless this tool returns success."
     ),
     "parameters": {
@@ -325,6 +341,14 @@ ENTERPRISE_BUILDER_SCHEMA = {
             "content": {
                 "type": "string",
                 "description": "SKILL.md body or complete SKILL.md content for create_agent_skill.",
+            },
+            "confirmed_by_admin": {
+                "type": "boolean",
+                "description": (
+                    "Set true only after the admin explicitly approves the specific draft "
+                    "or says to apply/create/save the proposed configuration. Do not set "
+                    "true for vague initial requests."
+                ),
             },
             "files": {
                 "type": "array",
@@ -371,6 +395,7 @@ registry.register(
         category=args.get("category", "business"),
         content=args.get("content"),
         files=args.get("files"),
+        confirmed_by_admin=args.get("confirmed_by_admin", False),
         task_id=kw.get("task_id"),
     ),
 )
