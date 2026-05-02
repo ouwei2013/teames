@@ -9,7 +9,6 @@ import {
 	  MessageSquare,
   Package,
 	  RefreshCw,
-  Send,
   ShieldCheck,
   Ticket,
   UserPlus,
@@ -44,7 +43,6 @@ import {
 import { cn } from "@/lib/utils";
 
 type InviteRole = "member" | "admin";
-type BuilderMessage = { role: "admin" | "builder"; content: string };
 
 function formatDate(value?: number | null): string {
   if (!value) return "Never";
@@ -108,16 +106,6 @@ export default function EnterpriseAdminPage() {
   const [catalogAgentId, setCatalogAgentId] = useState("");
   const [loadingCatalog, setLoadingCatalog] = useState(false);
   const [busyCatalogSkill, setBusyCatalogSkill] = useState("");
-  const [builderInput, setBuilderInput] = useState("");
-  const [builderSessionId, setBuilderSessionId] = useState("");
-  const [builderSending, setBuilderSending] = useState(false);
-  const [builderMessages, setBuilderMessages] = useState<BuilderMessage[]>([
-    {
-      role: "builder",
-      content:
-        "Tell me what kind of business agent you want to build. I can create the agent, prompts, knowledge, allowed native skills, enterprise skill packages, data-fetch script stubs, and invite links.",
-    },
-  ]);
 
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [agentForm, setAgentForm] = useState<EnterpriseAgentPayload>({
@@ -291,50 +279,6 @@ export default function EnterpriseAdminPage() {
       showToast("Skill catalog update failed", "error");
     } finally {
       setBusyCatalogSkill("");
-    }
-  }
-
-  async function sendBuilderMessage(event: FormEvent) {
-    event.preventDefault();
-    const message = builderInput.trim();
-    if (!message || builderSending) return;
-    setBuilderInput("");
-    setBuilderSending(true);
-    setError(null);
-    setBuilderMessages((current) => [...current, { role: "admin", content: message }]);
-    try {
-      const result = await api.enterpriseBuilderChat({
-        message,
-        session_id: builderSessionId || undefined,
-      });
-      setBuilderSessionId(result.session_id);
-      setBuilderMessages((current) => [
-        ...current,
-        {
-          role: "builder",
-          content: result.final_response || "Done.",
-        },
-      ]);
-      if (result.agents) {
-        setAgents(result.agents);
-        setCatalogAgentId((current) => {
-          if (current && result.agents?.some((agent) => agent.id === current)) return current;
-          return result.agents?.[0]?.id || "";
-        });
-      }
-      if (result.invites) setInvites(result.invites);
-      await loadEnterprise();
-      showToast("Builder updated", "success");
-    } catch (err) {
-      const messageText = err instanceof Error ? err.message : String(err);
-      setError(messageText);
-      setBuilderMessages((current) => [
-        ...current,
-        { role: "builder", content: `Builder failed: ${messageText}` },
-      ]);
-      showToast("Builder chat failed", "error");
-    } finally {
-      setBuilderSending(false);
     }
   }
 
@@ -607,50 +551,14 @@ export default function EnterpriseAdminPage() {
                 Agent Builder
               </CardTitle>
               <CardDescription className="normal-case">
-                Ask the native Hermes builder to create business agents, prompts, knowledge, skills, scripts, and invites.
+                Open the dedicated builder workspace to create business agents, prompts, knowledge, skills, scripts, and invites.
               </CardDescription>
             </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="max-h-[360px] overflow-y-auto border border-border bg-background/40 p-3">
-                <div className="space-y-3">
-                  {builderMessages.map((item, index) => (
-                    <div
-                      key={`${item.role}-${index}`}
-                      className={cn(
-                        "max-w-[92%] border border-border px-3 py-2 font-courier text-sm normal-case",
-                        item.role === "admin"
-                          ? "ml-auto bg-foreground/10 text-midground"
-                          : "bg-card/70 text-muted-foreground",
-                      )}
-                    >
-                      <div className="mb-1 text-[11px] uppercase tracking-normal text-muted-foreground">
-                        {item.role === "admin" ? "Admin" : "Builder"}
-                      </div>
-                      <div className="whitespace-pre-wrap break-words">{item.content}</div>
-                    </div>
-                  ))}
-                  {builderSending && (
-                    <div className="flex items-center gap-2 font-courier text-xs normal-case text-muted-foreground">
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Builder is working
-                    </div>
-                  )}
-                </div>
-              </div>
-              <form onSubmit={sendBuilderMessage} className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
-                <Textarea
-                  value={builderInput}
-                  onChange={setBuilderInput}
-                  placeholder="Create a customer support agent for my business. It should answer FAQs, use our policies, and create an order lookup skill from table order_history..."
-                  rows={3}
-                />
-                <div className="flex items-end">
-                  <Button type="submit" disabled={builderSending || !builderInput.trim()}>
-                    {builderSending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                    Send
-                  </Button>
-                </div>
-              </form>
+            <CardContent>
+              <Button type="button" onClick={() => window.location.assign("/enterprise-builder")}>
+                <MessageSquare className="h-3.5 w-3.5" />
+                Open Builder Chat
+              </Button>
             </CardContent>
           </Card>
 

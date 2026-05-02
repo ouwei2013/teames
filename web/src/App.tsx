@@ -60,6 +60,7 @@ import CronPage from "@/pages/CronPage";
 import SkillsPage from "@/pages/SkillsPage";
 import ChatPage from "@/pages/ChatPage";
 import EnterpriseAdminPage from "@/pages/EnterpriseAdminPage";
+import EnterpriseBuilderPage from "@/pages/EnterpriseBuilderPage";
 import EnterprisePortalPage from "@/pages/EnterprisePortalPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
@@ -86,6 +87,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/sessions": SessionsPage,
   "/analytics": AnalyticsPage,
   "/enterprise": EnterpriseAdminPage,
+  "/enterprise-builder": EnterpriseBuilderPage,
   "/logs": LogsPage,
   "/cron": CronPage,
   "/skills": SkillsPage,
@@ -111,6 +113,11 @@ const BUILTIN_NAV_REST: NavItem[] = [
     path: "/enterprise",
     label: "Enterprise",
     icon: Shield,
+  },
+  {
+    path: "/enterprise-builder",
+    label: "Builder",
+    icon: Sparkles,
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
@@ -257,6 +264,7 @@ export default function App() {
   const isEnterprisePortalRoute =
     normalizedPath === "/portal" || normalizedPath === "/accept-invite";
   const isChatRoute = normalizedPath === "/chat";
+  const isBuilderRoute = normalizedPath === "/enterprise-builder";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
 
   const builtinRoutes = useMemo(
@@ -519,15 +527,18 @@ export default function App() {
                 "px-3 sm:px-6",
                 isChatRoute
                   ? "pb-3 pt-1 sm:pb-4 sm:pt-2 lg:pt-4"
-                  : "pt-2 sm:pt-4 lg:pt-6 pb-4 sm:pb-8",
+                  : isBuilderRoute
+                    ? "pb-3 pt-2 sm:pb-4 sm:pt-4 lg:pt-4"
+                    : "pt-2 sm:pt-4 lg:pt-6 pb-4 sm:pb-8",
                 isDocsRoute && "min-h-0 flex-1",
+                isBuilderRoute && "min-h-0 flex-1",
               )}
             >
               <PluginSlot name="pre-main" />
               <div
                 className={cn(
                   "w-full min-w-0",
-                  (isDocsRoute || isChatRoute) && "min-h-0 flex flex-1 flex-col",
+                  (isDocsRoute || isChatRoute || isBuilderRoute) && "min-h-0 flex flex-1 flex-col",
                 )}
               >
                 <Routes>
