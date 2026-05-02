@@ -1294,7 +1294,11 @@ def _local_agent_system_prompt(agent: dict, user: dict, device: dict) -> str:
         "Decide locally how to help. If a request would expose private files, "
         "secrets, credentials, account data, screenshots, or internal documents, "
         "ask the local user for confirmation or refuse. Prefer summaries and "
-        "minimal necessary excerpts over raw data. Explain what you did and what "
+        "minimal necessary excerpts over raw data. You may use enterprise_remote "
+        "tools to consult remote business agents assigned to this user when the "
+        "request is about company policy, HR, support, or business-specific "
+        "knowledge. Do not send private local data to remote business agents "
+        "unless the local user explicitly agrees. Explain what you did and what "
         "you did not access."
     )
 

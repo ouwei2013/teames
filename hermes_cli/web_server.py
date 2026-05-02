@@ -119,6 +119,8 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/enterprise/portal/local-devices",
     "/api/enterprise/portal/local-devices/code",
     "/api/enterprise/local-agent/register",
+    "/api/enterprise/local-agent/agents",
+    "/api/enterprise/local-agent/chat",
     "/api/enterprise/local-agent/requests",
 })
 
@@ -1251,16 +1253,18 @@ def _enterprise_admin_builder_prompt(tenant: Dict[str, Any], admin_user: Dict[st
         "Use the same Hermes tool-calling and skill-loading behavior as a normal agent, "
         "but your job is to help the administrator create and configure business agents.\n\n"
         "You have access to native default skills through skills_list and skill_view, "
-        "and you have the enterprise_builder tool for controlled enterprise mutations. "
-        "Use enterprise_builder instead of editing the enterprise database directly.\n\n"
+        "the enterprise_builder tool for controlled enterprise mutations, and the "
+        "enterprise_local_bridge tool for requesting help from user-owned local agents. "
+        "Use these controlled tools instead of editing the enterprise database directly.\n\n"
         f"Tenant: {tenant.get('name') or tenant.get('id')} ({tenant.get('id')})\n"
         f"Admin user: {admin_user.get('email') or admin_user.get('name') or admin_user.get('id')} ({admin_user.get('id')})\n\n"
         "Use a draft-first workflow. For vague initial requests such as 'create an agent "
         "for my bakery business', ask focused questions or present a draft instead of "
         "creating records immediately. You may create or update agents, enable built-in "
-        "skills, create tenant/agent-scoped enterprise skill packages, and create invites "
-        "only after the admin explicitly approves the specific draft. When you call a "
-        "mutating enterprise_builder action after approval, set confirmed_by_admin=true. "
+        "skills, create tenant/agent-scoped enterprise skill packages, create invites, "
+        "and send local-agent collaboration requests only after the admin explicitly "
+        "approves the specific draft. When you call a mutating enterprise_builder or "
+        "enterprise_local_bridge action after approval, set confirmed_by_admin=true. "
         "When credentials, schema details, or safety boundaries are missing, ask focused "
         "follow-up questions before creating executable data-fetch scripts. Never say a "
         "change was applied unless enterprise_builder returned success."
@@ -1311,6 +1315,20 @@ def _summarize_builder_tool_args(tool_name: str, args: Dict[str, Any]) -> str:
         if args.get("confirmed_by_admin"):
             parts.append("confirmed")
         return ", ".join(parts)
+    if tool_name == "enterprise_local_bridge":
+        action = str(args.get("action") or "action")
+        parts = [action]
+        for key in ("device_id", "user_email", "agent_id"):
+            value = args.get(key)
+            if value:
+                parts.append(f"{key}={value}")
+        if args.get("confirmed_by_admin"):
+            parts.append("confirmed")
+        return ", ".join(parts)
+    if tool_name == "enterprise_remote":
+        action = str(args.get("action") or "action")
+        agent_id = args.get("agent_id")
+        return f"{action}, agent_id={agent_id}" if agent_id else action
     if tool_name == "skill_view":
         return str(args.get("name") or args.get("skill") or "view skill")
     if tool_name == "skills_list":
@@ -1779,6 +1797,173 @@ async def enterprise_local_agent_register(body: EnterpriseLocalDeviceRegister):
         raise HTTPException(status_code=500, detail="Enterprise local agent registration failed")
 
 
+@app.get("/api/enterprise/local-agent/agents")
+async def enterprise_local_agent_agents(request: Request):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_device_token(_enterprise_device_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid local device token")
+            agents = store.list_user_agents(auth["user"]["id"])
+            return {
+                "device": auth["device"],
+                "user": auth["user"],
+                "agents": agents,
+                "default_agent_id": auth["device"].get("agent_id") or (agents[0]["id"] if agents else None),
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/enterprise/local-agent/agents failed")
+        raise HTTPException(status_code=500, detail="Enterprise local agent agents failed")
+
+
+@app.post("/api/enterprise/local-agent/chat")
+async def enterprise_local_agent_chat(request: Request, body: EnterpriseChatBody):
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_device_token(_enterprise_device_bearer_token(request))
+            if auth:
+                agent = store.resolve_user_agent(
+                    auth["user"],
+                    agent_id=(body.agent_id or auth["device"].get("agent_id") or None),
+                )
+                auth["agent"] = agent
+                auth["agents"] = store.list_user_agents(auth["user"]["id"])
+                auth["access_context"] = AccessContext(
+                    tenant_id=auth["user"]["tenant_id"],
+                    workspace_id="enterprise_local_remote",
+                    user_id=auth["user"]["id"],
+                    agent_id=agent["id"],
+                )
+                auth["system_message"] = _append_enterprise_skill_prompt(
+                    store.compile_agent_prompt(agent),
+                    store.list_user_agent_skill_names(auth["user"], agent["id"]),
+                    store.list_agent_custom_skills(
+                        agent["id"],
+                        tenant_id=agent["tenant_id"],
+                        enabled_only=True,
+                    )
+                    + store.list_user_agent_custom_skills(
+                        auth["user"],
+                        agent["id"],
+                        enabled_only=True,
+                    ),
+                )
+        finally:
+            store.close()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("Enterprise local-agent chat authentication failed")
+        raise HTTPException(status_code=500, detail="Enterprise local-agent chat authentication failed")
+
+    if not auth:
+        raise HTTPException(status_code=401, detail="Invalid local device token")
+
+    access_context = auth["access_context"]
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        import uuid as _uuid
+        session_id = f"local-remote-{auth['device']['id']}-{auth['agent']['id']}-{_uuid.uuid4().hex[:12]}"
+
+    def _run_chat():
+        from gateway.run import (
+            _load_gateway_config,
+            _resolve_gateway_model,
+            _resolve_runtime_agent_kwargs,
+        )
+        from gateway.session_context import (
+            clear_enterprise_vars,
+            clear_session_vars,
+            set_enterprise_vars,
+            set_session_vars,
+        )
+        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+        user_config = _load_gateway_config()
+        enabled_toolsets = _enterprise_enabled_toolsets(
+            _get_platform_tools(user_config, "api_server")
+        )
+        if "enterprise_skills" not in enabled_toolsets:
+            enabled_toolsets.append("enterprise_skills")
+        db = SessionDB()
+        try:
+            history = db.get_messages_as_conversation(
+                session_id,
+                access_context=access_context,
+            )
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                session_id=session_id,
+                platform="web",
+                session_db=db,
+                access_context=access_context,
+            )
+            system_message = auth.get("system_message") or ""
+            session_tokens = set_session_vars(
+                platform="enterprise_local_remote",
+                chat_id=session_id,
+                chat_name=auth.get("agent", {}).get("name") or "",
+                user_id=auth["user"]["id"],
+                user_name=auth["user"].get("email") or "",
+                session_key=session_id,
+            )
+            enterprise_tokens = set_enterprise_vars(
+                tenant_id=auth["user"]["tenant_id"],
+                user_id=auth["user"]["id"],
+                agent_id=auth.get("agent", {}).get("id") or "",
+                agent_name=auth.get("agent", {}).get("name") or "",
+                system_message=system_message,
+            )
+            try:
+                result = agent.run_conversation(
+                    user_message=message,
+                    system_message=system_message,
+                    conversation_history=history,
+                    task_id="enterprise-local-remote",
+                )
+            finally:
+                clear_enterprise_vars(enterprise_tokens)
+                clear_session_vars(session_tokens)
+            return {
+                "session_id": session_id,
+                "final_response": result.get("final_response", ""),
+                "user": auth["user"],
+                "agent": auth.get("agent"),
+                "agents": auth.get("agents", []),
+            }
+        finally:
+            db.close()
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, _run_chat)
+    except Exception as exc:
+        _log.exception("Enterprise local-agent chat failed")
+        raise HTTPException(status_code=500, detail=f"Local-agent remote chat failed: {exc}")
+
+
 def _enterprise_device_bearer_token(request: Request) -> str:
     return _enterprise_bearer_token(request)
 
@@ -2082,7 +2267,10 @@ async def enterprise_admin_builder_chat(body: EnterpriseBuilderChatBody):
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) | {"enterprise_builder"})
+        enabled_toolsets = sorted(
+            set(_get_platform_tools(user_config, "api_server"))
+            | {"enterprise_builder", "enterprise_local_bridge"}
+        )
         live_trace: List[Dict[str, Any]] = []
 
         def _record_status(kind: str, msg: str) -> None:
@@ -2235,7 +2423,10 @@ async def enterprise_admin_builder_chat_stream(body: EnterpriseBuilderChatBody):
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) | {"enterprise_builder"})
+        enabled_toolsets = sorted(
+            set(_get_platform_tools(user_config, "api_server"))
+            | {"enterprise_builder", "enterprise_local_bridge"}
+        )
         live_trace: List[Dict[str, Any]] = []
 
         def _emit_trace(item: Dict[str, Any]) -> None:
