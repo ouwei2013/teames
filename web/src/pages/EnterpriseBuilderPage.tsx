@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
+  CheckCircle2,
   Bot,
+  Circle,
+  CircleAlert,
   Loader2,
   MessageSquare,
   Package,
@@ -20,12 +23,17 @@ import {
 import {
   api,
   type EnterpriseAgent,
+  type EnterpriseBuilderTraceItem,
   type EnterpriseInvite,
   type EnterpriseStatusResponse,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-type BuilderMessage = { role: "admin" | "builder"; content: string };
+type BuilderMessage = {
+  role: "admin" | "builder";
+  content: string;
+  trace?: EnterpriseBuilderTraceItem[];
+};
 
 function formatDate(value?: number | null): string {
   if (!value) return "Never";
@@ -111,7 +119,11 @@ export default function EnterpriseBuilderPage() {
       setSessionId(result.session_id);
       setMessages((current) => [
         ...current,
-        { role: "builder", content: result.final_response || "Done." },
+        {
+          role: "builder",
+          content: result.final_response || "Done.",
+          trace: result.trace || [],
+        },
       ]);
       if (result.agents) setAgents(result.agents);
       if (result.invites) setInvites(result.invites);
@@ -172,6 +184,9 @@ export default function EnterpriseBuilderPage() {
                       {item.role === "admin" ? "Admin" : "Builder"}
                     </div>
                     <div className="whitespace-pre-wrap break-words">{item.content}</div>
+                    {item.trace && item.trace.length > 0 && (
+                      <TraceList trace={item.trace} />
+                    )}
                   </div>
                 ))}
                 {sending && (
@@ -272,6 +287,49 @@ export default function EnterpriseBuilderPage() {
         </aside>
       </section>
     </main>
+  );
+}
+
+function TraceList({ trace }: { trace: EnterpriseBuilderTraceItem[] }) {
+  return (
+    <div className="mt-3 border-t border-border/70 pt-2">
+      <div className="mb-2 font-courier text-[11px] uppercase tracking-normal text-muted-foreground">
+        Activity
+      </div>
+      <div className="space-y-2">
+        {trace.map((item, index) => {
+          const Icon =
+            item.status === "success"
+              ? CheckCircle2
+              : item.status === "error"
+                ? CircleAlert
+                : Circle;
+          return (
+            <div key={`${item.title}-${index}`} className="flex gap-2 font-courier text-xs normal-case">
+              <Icon
+                className={cn(
+                  "mt-0.5 h-3.5 w-3.5 shrink-0",
+                  item.status === "success" && "text-success",
+                  item.status === "error" && "text-destructive",
+                  item.status !== "success" && item.status !== "error" && "text-muted-foreground",
+                )}
+              />
+              <div className="min-w-0">
+                <div className="text-midground">{item.title}</div>
+                {item.detail && (
+                  <div className="mt-0.5 break-words text-muted-foreground">{item.detail}</div>
+                )}
+                {item.result && (
+                  <div className="mt-0.5 break-words text-muted-foreground">
+                    Result: {item.result}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

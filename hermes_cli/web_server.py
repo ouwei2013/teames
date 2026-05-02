@@ -1248,6 +1248,128 @@ def _enterprise_admin_builder_prompt(tenant: Dict[str, Any], admin_user: Dict[st
     return "\n\n".join(part for part in (base, playbook) if part)
 
 
+def _sanitize_trace_value(value: Any, *, max_len: int = 240) -> Any:
+    if isinstance(value, dict):
+        clean: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if any(secret in key_text.lower() for secret in ("password", "token", "secret", "api_key", "credential")):
+                clean[key_text] = "[redacted]"
+            else:
+                clean[key_text] = _sanitize_trace_value(item, max_len=max_len)
+        return clean
+    if isinstance(value, list):
+        return [_sanitize_trace_value(item, max_len=max_len) for item in value[:8]]
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) > max_len:
+            return text[: max_len - 3].rstrip() + "..."
+        return text
+    return value
+
+
+def _parse_tool_arguments(raw_args: Any) -> Dict[str, Any]:
+    if isinstance(raw_args, dict):
+        return raw_args
+    if not isinstance(raw_args, str) or not raw_args.strip():
+        return {}
+    try:
+        parsed = json.loads(raw_args)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {"arguments": raw_args}
+
+
+def _summarize_builder_tool_args(tool_name: str, args: Dict[str, Any]) -> str:
+    if tool_name == "enterprise_builder":
+        action = str(args.get("action") or "action")
+        parts = [action]
+        for key in ("name", "agent_id", "skill_name", "email"):
+            value = args.get(key)
+            if value:
+                parts.append(f"{key}={value}")
+        if args.get("confirmed_by_admin"):
+            parts.append("confirmed")
+        return ", ".join(parts)
+    if tool_name == "skill_view":
+        return str(args.get("name") or args.get("skill") or "view skill")
+    if tool_name == "skills_list":
+        return "list available skills"
+    if tool_name == "terminal":
+        return str(args.get("command") or args.get("cmd") or "run terminal command")[:240]
+    compact = _sanitize_trace_value(args, max_len=80)
+    return json.dumps(compact, ensure_ascii=False)[:240]
+
+
+def _summarize_tool_result(content: Any) -> str:
+    text = content if isinstance(content, str) else str(content or "")
+    if not text.strip():
+        return ""
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return text[:240]
+    if not isinstance(parsed, dict):
+        return text[:240]
+    if parsed.get("success") is False:
+        return str(parsed.get("error") or "tool returned an error")[:240]
+    if "agent" in parsed and isinstance(parsed["agent"], dict):
+        agent = parsed["agent"]
+        return f"agent={agent.get('name') or agent.get('id')} id={agent.get('id')}"
+    if "skill" in parsed and isinstance(parsed["skill"], dict):
+        skill = parsed["skill"]
+        return f"skill={skill.get('name')} path={skill.get('skill_dir') or ''}".strip()
+    if "invite" in parsed and isinstance(parsed["invite"], dict):
+        invite = parsed["invite"]
+        return f"invite for {invite.get('email') or 'any email'}"
+    if "skills" in parsed and isinstance(parsed["skills"], list):
+        return f"{len(parsed['skills'])} skills"
+    if "agents" in parsed and isinstance(parsed["agents"], list):
+        return f"{len(parsed['agents'])} agents"
+    return json.dumps(_sanitize_trace_value(parsed, max_len=80), ensure_ascii=False)[:240]
+
+
+def _builder_trace_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    trace: List[Dict[str, Any]] = []
+    pending: Dict[str, int] = {}
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tool_call in msg.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                tool_name = str(function.get("name") or "tool")
+                args = _parse_tool_arguments(function.get("arguments"))
+                item = {
+                    "kind": "tool",
+                    "tool": tool_name,
+                    "title": f"Called {tool_name}",
+                    "detail": _summarize_builder_tool_args(tool_name, args),
+                    "status": "running",
+                    "arguments": _sanitize_trace_value(args),
+                }
+                pending[str(tool_call.get("id") or "")] = len(trace)
+                trace.append(item)
+        elif msg.get("role") == "tool":
+            idx = pending.get(str(msg.get("tool_call_id") or ""))
+            if idx is None:
+                continue
+            result_summary = _summarize_tool_result(msg.get("content"))
+            status = "success"
+            try:
+                parsed = json.loads(msg.get("content") or "{}")
+                if isinstance(parsed, dict) and parsed.get("success") is False:
+                    status = "error"
+            except Exception:
+                pass
+            trace[idx]["status"] = status
+            if result_summary:
+                trace[idx]["result"] = result_summary
+    return trace[-20:]
+
+
 def _enterprise_enabled_toolsets(toolsets) -> list[str]:
     """Toolsets safe for the enterprise browser portal.
 
@@ -1945,6 +2067,7 @@ async def enterprise_admin_builder_chat(body: EnterpriseBuilderChatBody):
             return {
                 "session_id": session_id,
                 "final_response": result.get("final_response", ""),
+                "trace": _builder_trace_from_messages(result.get("messages") or []),
             }
         finally:
             db.close()

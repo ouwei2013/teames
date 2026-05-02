@@ -571,8 +571,19 @@ export interface EnterpriseChatResponse {
 export interface EnterpriseBuilderChatResponse {
   session_id: string;
   final_response: string;
+  trace?: EnterpriseBuilderTraceItem[];
   agents?: EnterpriseAgent[];
   invites?: EnterpriseInvite[];
+}
+
+export interface EnterpriseBuilderTraceItem {
+  kind: string;
+  tool?: string;
+  title: string;
+  detail?: string;
+  status?: "running" | "success" | "error" | string;
+  result?: string;
+  arguments?: Record<string, unknown>;
 }
 
 export interface EnterpriseLocalDevice {
