@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   Ticket,
 } from "lucide-react";
+import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -218,9 +219,16 @@ export default function EnterpriseBuilderPage() {
                     <div className="mb-1 text-[11px] uppercase tracking-normal text-muted-foreground">
                       {item.role === "admin" ? "Admin" : "Builder"}
                     </div>
-                    <div className="whitespace-pre-wrap break-words">{item.content}</div>
                     {item.trace && item.trace.length > 0 && (
                       <TraceList trace={item.trace} />
+                    )}
+                    {item.content && (
+                      <div className={cn("break-words", item.trace?.length ? "mt-3" : "")}>
+                        <Markdown
+                          content={item.content}
+                          streaming={sending && item.role === "builder" && index === messages.length - 1}
+                        />
+                      </div>
                     )}
                   </div>
                 ))}
