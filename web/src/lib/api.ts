@@ -284,6 +284,23 @@ export const api = {
         body: JSON.stringify(payload),
       },
     ),
+  getEnterpriseAgentSkillCatalog: (agentId: string) =>
+    fetchJSON<{ agent: EnterpriseAgent; skills: SkillInfo[]; allowed: string[] }>(
+      `/api/enterprise/agents/${encodeURIComponent(agentId)}/skill-catalog`,
+    ),
+  toggleEnterpriseAgentSkillCatalog: (payload: {
+    agent_id: string;
+    name: string;
+    enabled: boolean;
+  }) =>
+    fetchJSON<{ ok: boolean; name: string; enabled: boolean; allowed: string[] }>(
+      `/api/enterprise/agents/${encodeURIComponent(payload.agent_id)}/skill-catalog`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: payload.name, enabled: payload.enabled }),
+      },
+    ),
   getEnterpriseInvites: () =>
     fetchJSON<{ invites: EnterpriseInvite[] }>("/api/enterprise/invites"),
   createEnterpriseInvite: (payload: {
@@ -760,6 +777,8 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+  allowed?: boolean;
+  source?: string;
 }
 
 export interface ToolsetInfo {

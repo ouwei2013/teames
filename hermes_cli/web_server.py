@@ -497,6 +497,11 @@ class EnterpriseSkillToggle(BaseModel):
     enabled: bool
 
 
+class EnterpriseSkillCatalogToggle(BaseModel):
+    name: str
+    enabled: bool
+
+
 class EnterpriseCronJobCreate(BaseModel):
     agent_id: str
     prompt: str
@@ -997,6 +1002,54 @@ async def enterprise_update_agent(agent_id: str, body: EnterpriseAgentBody):
         raise HTTPException(status_code=500, detail="Enterprise agent update failed")
 
 
+@app.get("/api/enterprise/agents/{agent_id}/skill-catalog")
+async def enterprise_agent_skill_catalog(agent_id: str):
+    try:
+        from enterprise import EnterpriseStore
+        from tools.skills_tool import _find_all_skills
+
+        store = EnterpriseStore()
+        try:
+            agent = store.get_agent(agent_id)
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            allowed = set(store.list_agent_skill_catalog(agent["id"], tenant_id=agent["tenant_id"], enabled_only=True))
+            skills = _find_all_skills(skip_disabled=True)
+            for skill in skills:
+                skill["allowed"] = skill.get("name") in allowed
+                skill["source"] = "builtin"
+            return {"agent": agent, "skills": skills, "allowed": sorted(allowed)}
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/enterprise/agents/%s/skill-catalog failed", agent_id)
+        raise HTTPException(status_code=500, detail="Enterprise skill catalog failed")
+
+
+@app.put("/api/enterprise/agents/{agent_id}/skill-catalog")
+async def enterprise_agent_skill_catalog_toggle(agent_id: str, body: EnterpriseSkillCatalogToggle):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            allowed = store.set_agent_skill_catalog_item(
+                agent_id,
+                body.name,
+                body.enabled,
+            )
+            return {"ok": True, "name": body.name, "enabled": body.enabled, "allowed": allowed}
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        _log.exception("PUT /api/enterprise/agents/%s/skill-catalog failed", agent_id)
+        raise HTTPException(status_code=500, detail="Enterprise skill catalog update failed")
+
+
 @app.get("/api/enterprise/invites")
 async def enterprise_invites():
     try:
@@ -1174,7 +1227,12 @@ async def enterprise_portal_skills(request: Request, agent_id: Optional[str] = N
                 raise HTTPException(status_code=401, detail="Invalid user token")
             agent = store.resolve_user_agent(auth["user"], agent_id=agent_id)
             selected = set(store.list_user_agent_skill_names(auth["user"], agent["id"]))
-            skills = _find_all_skills(skip_disabled=True)
+            allowed = set(store.list_agent_skill_catalog(agent["id"], tenant_id=agent["tenant_id"], enabled_only=True))
+            skills = [
+                skill
+                for skill in _find_all_skills(skip_disabled=True)
+                if skill.get("name") in allowed
+            ]
             for skill in skills:
                 skill["enabled"] = skill.get("name") in selected
                 skill["source"] = "builtin"
@@ -1227,6 +1285,15 @@ async def enterprise_portal_toggle_skill(request: Request, body: EnterpriseSkill
                     "enabled": bool(updated.get("enabled")) if updated else body.enabled,
                     "source": "custom",
                 }
+            allowed = set(
+                store.list_agent_skill_catalog(
+                    body.agent_id,
+                    tenant_id=auth["user"]["tenant_id"],
+                    enabled_only=True,
+                )
+            )
+            if body.name not in allowed:
+                raise HTTPException(status_code=403, detail="Skill is not available for this agent")
             selected = store.set_user_agent_skill(
                 auth["user"],
                 body.agent_id,

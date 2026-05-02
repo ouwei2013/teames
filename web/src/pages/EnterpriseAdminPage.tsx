@@ -7,6 +7,7 @@ import {
 	  Laptop,
 	  Loader2,
 	  MessageSquare,
+  Package,
 	  RefreshCw,
   ShieldCheck,
   Ticket,
@@ -37,6 +38,7 @@ import {
 	  type EnterpriseLocalRequest,
 	  type EnterpriseStatusResponse,
   type EnterpriseUser,
+  type SkillInfo,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -78,6 +80,7 @@ export default function EnterpriseAdminPage() {
   const [invites, setInvites] = useState<EnterpriseInvite[]>([]);
   const [localDevices, setLocalDevices] = useState<EnterpriseLocalDevice[]>([]);
   const [localRequests, setLocalRequests] = useState<EnterpriseLocalRequest[]>([]);
+  const [skillCatalog, setSkillCatalog] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingInit, setSavingInit] = useState(false);
   const [creatingInvite, setCreatingInvite] = useState(false);
@@ -100,6 +103,9 @@ export default function EnterpriseAdminPage() {
   const [selectedLocalDeviceId, setSelectedLocalDeviceId] = useState("");
   const [localRequestText, setLocalRequestText] = useState("");
   const [sendingLocalRequest, setSendingLocalRequest] = useState(false);
+  const [catalogAgentId, setCatalogAgentId] = useState("");
+  const [loadingCatalog, setLoadingCatalog] = useState(false);
+  const [busyCatalogSkill, setBusyCatalogSkill] = useState("");
 
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [agentForm, setAgentForm] = useState<EnterpriseAgentPayload>({
@@ -137,6 +143,12 @@ export default function EnterpriseAdminPage() {
         ]);
         setUsers(userResult.users || []);
         setAgents(agentResult.agents || []);
+        setCatalogAgentId((current) => {
+          if (current && (agentResult.agents || []).some((agent) => agent.id === current)) {
+            return current;
+          }
+          return agentResult.agents?.[0]?.id || "";
+        });
         setInviteAgentIds((current) => {
           const valid = new Set((agentResult.agents || []).map((agent) => agent.id));
           const kept = current.filter((id) => valid.has(id));
@@ -153,6 +165,8 @@ export default function EnterpriseAdminPage() {
         });
       } else {
         setAgents([]);
+        setCatalogAgentId("");
+        setSkillCatalog([]);
         setInvites([]);
         setLocalDevices([]);
         setLocalRequests([]);
@@ -167,6 +181,29 @@ export default function EnterpriseAdminPage() {
   useEffect(() => {
     void loadEnterprise();
   }, []);
+
+  useEffect(() => {
+    if (!catalogAgentId) {
+      setSkillCatalog([]);
+      return;
+    }
+    let cancelled = false;
+    setLoadingCatalog(true);
+    api
+      .getEnterpriseAgentSkillCatalog(catalogAgentId)
+      .then((result) => {
+        if (!cancelled) setSkillCatalog(result.skills || []);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingCatalog(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [catalogAgentId]);
 
   async function initializeEnterprise(event: FormEvent) {
     event.preventDefault();
@@ -218,6 +255,30 @@ export default function EnterpriseAdminPage() {
       showToast("Invite creation failed", "error");
     } finally {
       setCreatingInvite(false);
+    }
+  }
+
+  async function toggleCatalogSkill(skill: SkillInfo) {
+    if (!catalogAgentId) return;
+    setBusyCatalogSkill(skill.name);
+    setError(null);
+    try {
+      await api.toggleEnterpriseAgentSkillCatalog({
+        agent_id: catalogAgentId,
+        name: skill.name,
+        enabled: !skill.allowed,
+      });
+      setSkillCatalog((current) =>
+        current.map((item) =>
+          item.name === skill.name ? { ...item, allowed: !skill.allowed } : item,
+        ),
+      );
+      showToast(!skill.allowed ? "Skill allowed" : "Skill hidden", "success");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("Skill catalog update failed", "error");
+    } finally {
+      setBusyCatalogSkill("");
     }
   }
 
@@ -759,6 +820,71 @@ export default function EnterpriseAdminPage() {
               </CardContent>
             </Card>
           </section>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Package className="h-4 w-4" />
+                Agent Skill Catalog
+              </CardTitle>
+              <CardDescription className="normal-case">
+                Choose which built-in remote skills are visible to users of each business agent.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <label className="block max-w-md">
+                <span className="mb-1 block font-courier text-xs normal-case text-muted-foreground">
+                  Business agent
+                </span>
+                <Select value={catalogAgentId} onValueChange={setCatalogAgentId}>
+                  {agents.map((agent) => (
+                    <SelectOption key={agent.id} value={agent.id}>
+                      {agent.name}
+                    </SelectOption>
+                  ))}
+                </Select>
+              </label>
+              <div className="grid max-h-[460px] gap-3 overflow-y-auto md:grid-cols-2 xl:grid-cols-3">
+                {loadingCatalog && (
+                  <div className="font-courier text-xs normal-case text-muted-foreground">
+                    Loading skills...
+                  </div>
+                )}
+                {!loadingCatalog && skillCatalog.length === 0 && (
+                  <div className="font-courier text-xs normal-case text-muted-foreground">
+                    No built-in skills available.
+                  </div>
+                )}
+                {skillCatalog.map((skill) => (
+                  <div key={skill.name} className="border border-border bg-background/40 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-mondwest text-sm uppercase text-midground">
+                          {skill.name}
+                        </div>
+                        <div className="mt-1 font-courier text-xs normal-case text-muted-foreground">
+                          {skill.category || "general"}
+                        </div>
+                      </div>
+                      <Button
+                        type="button"
+                        variant={skill.allowed ? "default" : "outline"}
+                        size="sm"
+                        disabled={busyCatalogSkill === skill.name}
+                        onClick={() => toggleCatalogSkill(skill)}
+                      >
+                        {busyCatalogSkill === skill.name && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                        {skill.allowed ? "Visible" : "Hidden"}
+                      </Button>
+                    </div>
+                    <p className="mt-2 line-clamp-3 font-courier text-xs normal-case text-muted-foreground">
+                      {skill.description}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
 
           <section className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">
             <Card>

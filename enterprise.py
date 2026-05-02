@@ -96,6 +96,15 @@ CREATE TABLE IF NOT EXISTS user_agent_skills (
     PRIMARY KEY (user_id, agent_id, skill_name)
 );
 
+CREATE TABLE IF NOT EXISTS agent_skill_catalog (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    skill_name TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (tenant_id, agent_id, skill_name)
+);
+
 CREATE TABLE IF NOT EXISTS user_agent_custom_skills (
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -158,6 +167,8 @@ CREATE INDEX IF NOT EXISTS idx_enterprise_access_user ON user_agent_access(user_
 CREATE INDEX IF NOT EXISTS idx_enterprise_access_agent ON user_agent_access(agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_user_agent_skills
     ON user_agent_skills(tenant_id, user_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_agent_skill_catalog
+    ON agent_skill_catalog(tenant_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_user_agent_custom_skills
     ON user_agent_custom_skills(tenant_id, user_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_local_devices_tenant
@@ -577,12 +588,77 @@ class EnterpriseStore:
         agent = self.resolve_user_agent(user, agent_id)
         rows = self._conn.execute(
             """SELECT skill_name
-               FROM user_agent_skills
-               WHERE tenant_id = ? AND user_id = ? AND agent_id = ? AND enabled = 1
-               ORDER BY updated_at DESC, skill_name ASC""",
+               FROM user_agent_skills uas
+               WHERE uas.tenant_id = ?
+                 AND uas.user_id = ?
+                 AND uas.agent_id = ?
+                 AND uas.enabled = 1
+                 AND EXISTS (
+                    SELECT 1 FROM agent_skill_catalog catalog
+                    WHERE catalog.tenant_id = uas.tenant_id
+                      AND catalog.agent_id = uas.agent_id
+                      AND catalog.skill_name = uas.skill_name
+                      AND catalog.enabled = 1
+                 )
+               ORDER BY uas.updated_at DESC, skill_name ASC""",
             (user["tenant_id"], user["id"], agent["id"]),
         ).fetchall()
         return [str(row["skill_name"]) for row in rows]
+
+    def list_agent_skill_catalog(
+        self,
+        agent_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        enabled_only: bool = False,
+    ) -> List[str]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        enabled_clause = "AND enabled = 1" if enabled_only else ""
+        rows = self._conn.execute(
+            f"""SELECT skill_name
+                FROM agent_skill_catalog
+                WHERE tenant_id = ? AND agent_id = ? {enabled_clause}
+                ORDER BY updated_at DESC, skill_name ASC""",
+            (agent["tenant_id"], agent["id"]),
+        ).fetchall()
+        return [str(row["skill_name"]) for row in rows]
+
+    def set_agent_skill_catalog_item(
+        self,
+        agent_id: str,
+        skill_name: str,
+        enabled: bool,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> List[str]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        normalized = (skill_name or "").strip()
+        if not normalized:
+            raise ValueError("skill name is required")
+        with self._conn:
+            if enabled:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO agent_skill_catalog
+                       (tenant_id, agent_id, skill_name, enabled, updated_at)
+                       VALUES (?, ?, ?, 1, ?)""",
+                    (agent["tenant_id"], agent["id"], normalized, time.time()),
+                )
+            else:
+                self._conn.execute(
+                    """DELETE FROM agent_skill_catalog
+                       WHERE tenant_id = ? AND agent_id = ? AND skill_name = ?""",
+                    (agent["tenant_id"], agent["id"], normalized),
+                )
+                self._conn.execute(
+                    """DELETE FROM user_agent_skills
+                       WHERE tenant_id = ? AND agent_id = ? AND skill_name = ?""",
+                    (agent["tenant_id"], agent["id"], normalized),
+                )
+        return self.list_agent_skill_catalog(agent["id"], tenant_id=agent["tenant_id"], enabled_only=True)
 
     def list_user_agent_custom_skills(
         self,
