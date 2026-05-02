@@ -1084,18 +1084,24 @@ async def enterprise_me(request: Request):
         raise HTTPException(status_code=500, detail="Enterprise profile failed")
 
 
-def _compile_enterprise_skill_prompt(skill_names: List[str]) -> str:
+def _compile_enterprise_skill_prompt(
+    skill_names: List[str],
+    custom_skills: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """Load user-selected skill instructions for enterprise chat/cron prompts."""
-    if not skill_names:
-        return ""
-    try:
-        from tools.skills_tool import skill_view
-    except Exception:
+    if not skill_names and not custom_skills:
         return ""
 
     sections = []
     remaining_budget = 24000
+    try:
+        from tools.skills_tool import skill_view
+    except Exception:
+        skill_view = None
+
     for name in skill_names:
+        if not skill_view:
+            break
         try:
             payload = json.loads(skill_view(name, preprocess=False))
         except Exception:
@@ -1111,13 +1117,34 @@ def _compile_enterprise_skill_prompt(skill_names: List[str]) -> str:
         remaining_budget -= len(content)
         if remaining_budget <= 0:
             break
+
+    for skill in custom_skills or []:
+        if remaining_budget <= 0:
+            break
+        content = str(skill.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > remaining_budget:
+            content = content[:remaining_budget].rstrip()
+        name = str(skill.get("name") or "custom skill").strip()
+        description = str(skill.get("description") or "").strip()
+        heading = f"## Enterprise Skill: {name}"
+        if description:
+            heading = f"{heading}\n{description}"
+        sections.append(f"{heading}\n{content}")
+        remaining_budget -= len(content)
+
     if not sections:
         return ""
     return "# User-Selected Skills\n" + "\n\n".join(sections)
 
 
-def _append_enterprise_skill_prompt(system_message: str, skill_names: List[str]) -> str:
-    skill_prompt = _compile_enterprise_skill_prompt(skill_names)
+def _append_enterprise_skill_prompt(
+    system_message: str,
+    skill_names: List[str],
+    custom_skills: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    skill_prompt = _compile_enterprise_skill_prompt(skill_names, custom_skills)
     if not skill_prompt:
         return system_message
     return f"{system_message}\n\n{skill_prompt}"
@@ -1150,6 +1177,20 @@ async def enterprise_portal_skills(request: Request, agent_id: Optional[str] = N
             skills = _find_all_skills(skip_disabled=True)
             for skill in skills:
                 skill["enabled"] = skill.get("name") in selected
+                skill["source"] = "builtin"
+            custom_skills = store.list_user_agent_custom_skills(auth["user"], agent["id"])
+            for skill in custom_skills:
+                skills.insert(
+                    0,
+                    {
+                        "name": skill["name"],
+                        "description": skill.get("description") or "",
+                        "category": skill.get("category") or "custom",
+                        "enabled": bool(skill.get("enabled")),
+                        "source": "custom",
+                        "updated_at": skill.get("updated_at"),
+                    },
+                )
             return {"agent": agent, "skills": skills, "selected": sorted(selected)}
         finally:
             store.close()
@@ -1172,6 +1213,20 @@ async def enterprise_portal_toggle_skill(request: Request, body: EnterpriseSkill
             auth = store.authenticate_api_key(_enterprise_bearer_token(request))
             if not auth:
                 raise HTTPException(status_code=401, detail="Invalid user token")
+            custom = store.get_user_agent_custom_skill(auth["user"], body.agent_id, body.name)
+            if custom:
+                updated = store.set_user_agent_custom_skill_enabled(
+                    auth["user"],
+                    body.agent_id,
+                    body.name,
+                    body.enabled,
+                )
+                return {
+                    "ok": True,
+                    "name": body.name,
+                    "enabled": bool(updated.get("enabled")) if updated else body.enabled,
+                    "source": "custom",
+                }
             selected = store.set_user_agent_skill(
                 auth["user"],
                 body.agent_id,
@@ -1531,6 +1586,11 @@ async def enterprise_portal_create_cron_job(request: Request, body: EnterpriseCr
                 raise HTTPException(status_code=401, detail="Invalid user token")
             agent = store.resolve_user_agent(auth["user"], agent_id=body.agent_id)
             skill_names = store.list_user_agent_skill_names(auth["user"], agent["id"])
+            custom_skills = store.list_user_agent_custom_skills(
+                auth["user"],
+                agent["id"],
+                enabled_only=True,
+            )
             access_context = AccessContext(
                 tenant_id=auth["user"]["tenant_id"],
                 workspace_id="default",
@@ -1540,6 +1600,7 @@ async def enterprise_portal_create_cron_job(request: Request, body: EnterpriseCr
             system_message = _append_enterprise_skill_prompt(
                 store.compile_agent_prompt(agent),
                 skill_names,
+                custom_skills,
             )
         finally:
             store.close()
@@ -1659,6 +1720,11 @@ async def enterprise_chat(request: Request, body: EnterpriseChatBody):
                 auth["system_message"] = _append_enterprise_skill_prompt(
                     store.compile_agent_prompt(agent),
                     store.list_user_agent_skill_names(auth["user"], agent["id"]),
+                    store.list_user_agent_custom_skills(
+                        auth["user"],
+                        agent["id"],
+                        enabled_only=True,
+                    ),
                 )
         finally:
             store.close()
@@ -1699,6 +1765,8 @@ async def enterprise_chat(request: Request, body: EnterpriseChatBody):
         enabled_toolsets = _enterprise_enabled_toolsets(
             _get_platform_tools(user_config, "api_server")
         )
+        if "enterprise_skills" not in enabled_toolsets:
+            enabled_toolsets.append("enterprise_skills")
         db = SessionDB()
         try:
             history = db.get_messages_as_conversation(

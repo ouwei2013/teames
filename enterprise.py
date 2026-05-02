@@ -96,6 +96,20 @@ CREATE TABLE IF NOT EXISTS user_agent_skills (
     PRIMARY KEY (user_id, agent_id, skill_name)
 );
 
+CREATE TABLE IF NOT EXISTS user_agent_custom_skills (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    name TEXT NOT NULL,
+    description TEXT,
+    content TEXT NOT NULL,
+    category TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (user_id, agent_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS local_device_codes (
     code_hash TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
@@ -144,6 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_enterprise_access_user ON user_agent_access(user_
 CREATE INDEX IF NOT EXISTS idx_enterprise_access_agent ON user_agent_access(agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_user_agent_skills
     ON user_agent_skills(tenant_id, user_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_user_agent_custom_skills
+    ON user_agent_custom_skills(tenant_id, user_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_local_devices_tenant
     ON local_devices(tenant_id, user_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_local_device_codes_user
@@ -567,6 +583,111 @@ class EnterpriseStore:
             (user["tenant_id"], user["id"], agent["id"]),
         ).fetchall()
         return [str(row["skill_name"]) for row in rows]
+
+    def list_user_agent_custom_skills(
+        self,
+        user: Dict[str, Any],
+        agent_id: Optional[str] = None,
+        *,
+        enabled_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        agent = self.resolve_user_agent(user, agent_id)
+        enabled_clause = "AND enabled = 1" if enabled_only else ""
+        rows = self._conn.execute(
+            f"""SELECT *
+                FROM user_agent_custom_skills
+                WHERE tenant_id = ? AND user_id = ? AND agent_id = ? {enabled_clause}
+                ORDER BY updated_at DESC, name ASC""",
+            (user["tenant_id"], user["id"], agent["id"]),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_user_agent_custom_skill(
+        self,
+        user: Dict[str, Any],
+        agent_id: str,
+        name: str,
+    ) -> Optional[Dict[str, Any]]:
+        agent = self.resolve_user_agent(user, agent_id)
+        row = self._conn.execute(
+            """SELECT *
+               FROM user_agent_custom_skills
+               WHERE tenant_id = ? AND user_id = ? AND agent_id = ? AND name = ?""",
+            (user["tenant_id"], user["id"], agent["id"], (name or "").strip()),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_user_agent_custom_skill(
+        self,
+        user: Dict[str, Any],
+        agent_id: str,
+        *,
+        name: str,
+        content: str,
+        description: Optional[str] = None,
+        category: Optional[str] = "custom",
+        enabled: bool = True,
+    ) -> Dict[str, Any]:
+        agent = self.resolve_user_agent(user, agent_id)
+        normalized_name = (name or "").strip()
+        normalized_content = _clean_text(content)
+        if not normalized_name:
+            raise ValueError("skill name is required")
+        if not normalized_content:
+            raise ValueError("skill content is required")
+        now = time.time()
+        existing = self.get_user_agent_custom_skill(user, agent["id"], normalized_name)
+        created_at = float(existing["created_at"]) if existing else now
+        with self._conn:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO user_agent_custom_skills
+                   (tenant_id, user_id, agent_id, name, description, content,
+                    category, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user["tenant_id"],
+                    user["id"],
+                    agent["id"],
+                    normalized_name,
+                    _clean_text(description),
+                    normalized_content,
+                    (category or "custom").strip() or "custom",
+                    1 if enabled else 0,
+                    created_at,
+                    now,
+                ),
+            )
+        skill = self.get_user_agent_custom_skill(user, agent["id"], normalized_name)
+        if not skill:
+            raise RuntimeError("custom skill was not saved")
+        return skill
+
+    def set_user_agent_custom_skill_enabled(
+        self,
+        user: Dict[str, Any],
+        agent_id: str,
+        name: str,
+        enabled: bool,
+    ) -> Optional[Dict[str, Any]]:
+        agent = self.resolve_user_agent(user, agent_id)
+        normalized_name = (name or "").strip()
+        if not normalized_name:
+            raise ValueError("skill name is required")
+        with self._conn:
+            self._conn.execute(
+                """UPDATE user_agent_custom_skills
+                   SET enabled = ?, updated_at = ?
+                   WHERE tenant_id = ? AND user_id = ? AND agent_id = ? AND name = ?""",
+                (
+                    1 if enabled else 0,
+                    time.time(),
+                    user["tenant_id"],
+                    user["id"],
+                    agent["id"],
+                    normalized_name,
+                ),
+            )
+        return self.get_user_agent_custom_skill(user, agent["id"], normalized_name)
 
     def set_user_agent_skill(
         self,
@@ -1174,6 +1295,14 @@ class EnterpriseStore:
                FROM users ORDER BY created_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """SELECT id, tenant_id, email, name, role, api_key_hash, created_at, disabled_at
+               FROM users WHERE id = ? AND disabled_at IS NULL""",
+            ((user_id or "").strip(),),
+        ).fetchone()
+        return dict(row) if row else None
 
     def list_invites(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
