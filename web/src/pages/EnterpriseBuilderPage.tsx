@@ -304,6 +304,7 @@ function TraceList({ trace }: { trace: EnterpriseBuilderTraceItem[] }) {
               : item.status === "error"
                 ? CircleAlert
                 : Circle;
+          const isWarning = item.status === "warning";
           return (
             <div key={`${item.title}-${index}`} className="flex gap-2 font-courier text-xs normal-case">
               <Icon
@@ -311,7 +312,8 @@ function TraceList({ trace }: { trace: EnterpriseBuilderTraceItem[] }) {
                   "mt-0.5 h-3.5 w-3.5 shrink-0",
                   item.status === "success" && "text-success",
                   item.status === "error" && "text-destructive",
-                  item.status !== "success" && item.status !== "error" && "text-muted-foreground",
+                  isWarning && "text-warning",
+                  item.status !== "success" && item.status !== "error" && !isWarning && "text-muted-foreground",
                 )}
               />
               <div className="min-w-0">

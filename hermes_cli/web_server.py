@@ -1370,6 +1370,26 @@ def _builder_trace_from_messages(messages: List[Dict[str, Any]]) -> List[Dict[st
     return trace[-20:]
 
 
+def _builder_event_trace_item(
+    *,
+    kind: str,
+    title: str,
+    detail: str = "",
+    status: str = "info",
+    tool: Optional[str] = None,
+) -> Dict[str, Any]:
+    item: Dict[str, Any] = {
+        "kind": kind,
+        "title": title,
+        "status": status,
+    }
+    if detail:
+        item["detail"] = detail[:240]
+    if tool:
+        item["tool"] = tool
+    return item
+
+
 def _enterprise_enabled_toolsets(toolsets) -> list[str]:
     """Toolsets safe for the enterprise browser portal.
 
@@ -2021,6 +2041,47 @@ async def enterprise_admin_builder_chat(body: EnterpriseBuilderChatBody):
         model = _resolve_gateway_model()
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) | {"enterprise_builder"})
+        live_trace: List[Dict[str, Any]] = []
+
+        def _record_status(kind: str, msg: str) -> None:
+            live_trace.append(
+                _builder_event_trace_item(
+                    kind="status",
+                    title=str(msg),
+                    status="warning" if kind == "warn" else "info",
+                )
+            )
+
+        def _record_tool_progress(event: str, tool_name: str, preview: Any = None, args: Any = None, **kwargs: Any) -> None:
+            del args
+            status = "running"
+            title = f"Starting {tool_name}"
+            detail = str(preview or "")
+            if event == "tool.completed":
+                status = "error" if kwargs.get("is_error") else "success"
+                duration = kwargs.get("duration")
+                title = f"Completed {tool_name}"
+                detail = f"{duration:.1f}s" if isinstance(duration, (int, float)) else ""
+            live_trace.append(
+                _builder_event_trace_item(
+                    kind="tool_progress",
+                    title=title,
+                    detail=detail,
+                    status=status,
+                    tool=tool_name,
+                )
+            )
+
+        def _record_tool_gen(tool_name: str) -> None:
+            live_trace.append(
+                _builder_event_trace_item(
+                    kind="tool_generation",
+                    title=f"Preparing tool call: {tool_name}",
+                    status="running",
+                    tool=tool_name,
+                )
+            )
+
         db = SessionDB()
         try:
             history = db.get_messages_as_conversation(
@@ -2038,6 +2099,9 @@ async def enterprise_admin_builder_chat(body: EnterpriseBuilderChatBody):
                 platform="web",
                 session_db=db,
                 access_context=access_context,
+                status_callback=_record_status,
+                tool_progress_callback=_record_tool_progress,
+                tool_gen_callback=_record_tool_gen,
             )
             session_tokens = set_session_vars(
                 platform="enterprise_admin_builder",
@@ -2067,7 +2131,7 @@ async def enterprise_admin_builder_chat(body: EnterpriseBuilderChatBody):
             return {
                 "session_id": session_id,
                 "final_response": result.get("final_response", ""),
-                "trace": _builder_trace_from_messages(result.get("messages") or []),
+                "trace": (live_trace + _builder_trace_from_messages(result.get("messages") or []))[-40:],
             }
         finally:
             db.close()
