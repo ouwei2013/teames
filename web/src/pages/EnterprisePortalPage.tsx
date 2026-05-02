@@ -736,9 +736,15 @@ export default function EnterprisePortalPage() {
                           {skill.category || "general"}
                         </div>
                       </div>
-                      <Button type="button" variant={skill.enabled ? "default" : "outline"} size="sm" disabled={busyItem === skill.name} onClick={() => toggleSkill(skill)}>
+                      <Button
+                        type="button"
+                        variant={skill.enabled ? "default" : "outline"}
+                        size="sm"
+                        disabled={busyItem === skill.name || skill.source === "agent_custom"}
+                        onClick={() => toggleSkill(skill)}
+                      >
                         {busyItem === skill.name && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                        {skill.enabled ? "Enabled" : "Enable"}
+                        {skill.source === "agent_custom" ? "Business" : skill.enabled ? "Enabled" : "Enable"}
                       </Button>
                     </div>
                     <p className="mt-2 line-clamp-3 font-courier text-xs normal-case text-muted-foreground">

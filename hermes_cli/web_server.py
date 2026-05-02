@@ -479,6 +479,11 @@ class EnterpriseChatBody(BaseModel):
     agent_id: Optional[str] = None
 
 
+class EnterpriseBuilderChatBody(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+
 class EnterpriseAgentBody(BaseModel):
     name: str
     description: Optional[str] = None
@@ -1203,6 +1208,42 @@ def _append_enterprise_skill_prompt(
     return f"{system_message}\n\n{skill_prompt}"
 
 
+def _load_enterprise_builder_playbook() -> str:
+    skill_path = PROJECT_ROOT / "skills" / "enterprise" / "agent-builder" / "SKILL.md"
+    try:
+        content = skill_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+    return (
+        '[SYSTEM: The "enterprise-agent-builder" skill is preloaded as the '
+        "builder playbook for this admin-only session. Follow it while using "
+        "normal Hermes tools and the enterprise_builder tool.]\n\n"
+        f"[Skill directory: {skill_path.parent}]\n\n"
+        f"{content}"
+    )
+
+
+def _enterprise_admin_builder_prompt(tenant: Dict[str, Any], admin_user: Dict[str, Any]) -> str:
+    playbook = _load_enterprise_builder_playbook()
+    base = (
+        "# Enterprise Agent Builder Mode\n"
+        "You are a native Hermes Agent running as an admin-only Enterprise Agent Builder. "
+        "Use the same Hermes tool-calling and skill-loading behavior as a normal agent, "
+        "but your job is to help the administrator create and configure business agents.\n\n"
+        "You have access to native default skills through skills_list and skill_view, "
+        "and you have the enterprise_builder tool for controlled enterprise mutations. "
+        "Use enterprise_builder instead of editing the enterprise database directly.\n\n"
+        f"Tenant: {tenant.get('name') or tenant.get('id')} ({tenant.get('id')})\n"
+        f"Admin user: {admin_user.get('email') or admin_user.get('name') or admin_user.get('id')} ({admin_user.get('id')})\n\n"
+        "When the admin's request is clear, you may create or update agents, enable built-in "
+        "skills, create tenant/agent-scoped enterprise skill packages, and create invites. "
+        "When credentials, schema details, or safety boundaries are missing, ask focused "
+        "follow-up questions before creating executable data-fetch scripts. Never say a "
+        "change was applied unless enterprise_builder returned success."
+    )
+    return "\n\n".join(part for part in (base, playbook) if part)
+
+
 def _enterprise_enabled_toolsets(toolsets) -> list[str]:
     """Toolsets safe for the enterprise browser portal.
 
@@ -1236,6 +1277,22 @@ async def enterprise_portal_skills(request: Request, agent_id: Optional[str] = N
             for skill in skills:
                 skill["enabled"] = skill.get("name") in selected
                 skill["source"] = "builtin"
+            agent_skills = store.list_agent_custom_skills(
+                agent["id"],
+                tenant_id=agent["tenant_id"],
+            )
+            for skill in agent_skills:
+                skills.insert(
+                    0,
+                    {
+                        "name": skill["name"],
+                        "description": skill.get("description") or "",
+                        "category": skill.get("category") or "business",
+                        "enabled": bool(skill.get("enabled")),
+                        "source": "agent_custom",
+                        "updated_at": skill.get("updated_at"),
+                    },
+                )
             custom_skills = store.list_user_agent_custom_skills(auth["user"], agent["id"])
             for skill in custom_skills:
                 skills.insert(
@@ -1284,6 +1341,18 @@ async def enterprise_portal_toggle_skill(request: Request, body: EnterpriseSkill
                     "name": body.name,
                     "enabled": bool(updated.get("enabled")) if updated else body.enabled,
                     "source": "custom",
+                }
+            agent_custom = store.get_agent_custom_skill(
+                body.agent_id,
+                body.name,
+                tenant_id=auth["user"]["tenant_id"],
+            )
+            if agent_custom:
+                return {
+                    "ok": True,
+                    "name": body.name,
+                    "enabled": bool(agent_custom.get("enabled")),
+                    "source": "agent_custom",
                 }
             allowed = set(
                 store.list_agent_skill_catalog(
@@ -1653,7 +1722,11 @@ async def enterprise_portal_create_cron_job(request: Request, body: EnterpriseCr
                 raise HTTPException(status_code=401, detail="Invalid user token")
             agent = store.resolve_user_agent(auth["user"], agent_id=body.agent_id)
             skill_names = store.list_user_agent_skill_names(auth["user"], agent["id"])
-            custom_skills = store.list_user_agent_custom_skills(
+            custom_skills = store.list_agent_custom_skills(
+                agent["id"],
+                tenant_id=agent["tenant_id"],
+                enabled_only=True,
+            ) + store.list_user_agent_custom_skills(
                 auth["user"],
                 agent["id"],
                 enabled_only=True,
@@ -1760,6 +1833,134 @@ async def enterprise_portal_delete_cron_job(request: Request, job_id: str):
     return {"ok": True}
 
 
+@app.post("/api/enterprise/admin-builder/chat")
+async def enterprise_admin_builder_chat(body: EnterpriseBuilderChatBody):
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            tenant = store.get_default_tenant()
+            if not tenant:
+                raise HTTPException(status_code=400, detail="Enterprise tenant is not initialized")
+            users = store.list_users()
+            admin_user = next(
+                (user for user in users if user.get("role") == "admin" and not user.get("disabled_at")),
+                None,
+            ) or next((user for user in users if not user.get("disabled_at")), None)
+            if not admin_user:
+                raise HTTPException(status_code=400, detail="Enterprise admin user is not available")
+            system_message = _enterprise_admin_builder_prompt(tenant, admin_user)
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("Enterprise builder setup failed")
+        raise HTTPException(status_code=500, detail="Enterprise builder setup failed")
+
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        import uuid as _uuid
+        session_id = f"enterprise-builder-{_uuid.uuid4().hex[:16]}"
+
+    access_context = AccessContext(
+        tenant_id=tenant["id"],
+        workspace_id="enterprise_admin",
+        user_id=admin_user["id"],
+        agent_id="enterprise_builder",
+    )
+
+    def _run_builder_chat():
+        from gateway.run import (
+            _load_gateway_config,
+            _resolve_gateway_model,
+            _resolve_runtime_agent_kwargs,
+        )
+        from gateway.session_context import (
+            clear_enterprise_vars,
+            clear_session_vars,
+            set_enterprise_vars,
+            set_session_vars,
+        )
+        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) | {"enterprise_builder"})
+        db = SessionDB()
+        try:
+            history = db.get_messages_as_conversation(
+                session_id,
+                access_context=access_context,
+            )
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                session_id=session_id,
+                platform="web",
+                session_db=db,
+                access_context=access_context,
+            )
+            session_tokens = set_session_vars(
+                platform="enterprise_admin_builder",
+                chat_id=session_id,
+                chat_name="Enterprise Agent Builder",
+                user_id=admin_user["id"],
+                user_name=admin_user.get("email") or admin_user.get("name") or "",
+                session_key=session_id,
+            )
+            enterprise_tokens = set_enterprise_vars(
+                tenant_id=tenant["id"],
+                user_id=admin_user["id"],
+                agent_id="enterprise_builder",
+                agent_name="Enterprise Agent Builder",
+                system_message=system_message,
+            )
+            try:
+                result = agent.run_conversation(
+                    user_message=message,
+                    system_message=system_message,
+                    conversation_history=history,
+                    task_id="enterprise-admin-builder",
+                )
+            finally:
+                clear_enterprise_vars(enterprise_tokens)
+                clear_session_vars(session_tokens)
+            return {
+                "session_id": session_id,
+                "final_response": result.get("final_response", ""),
+            }
+        finally:
+            db.close()
+
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, _run_builder_chat)
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            result["agents"] = store.list_agents(tenant_id=tenant["id"])
+            result["invites"] = store.list_invites()
+        finally:
+            store.close()
+        return result
+    except Exception as exc:
+        _log.exception("Enterprise admin builder chat failed")
+        raise HTTPException(status_code=500, detail=f"Builder chat failed: {exc}")
+
+
 @app.post("/api/enterprise/chat")
 async def enterprise_chat(request: Request, body: EnterpriseChatBody):
     message = (body.message or "").strip()
@@ -1787,7 +1988,12 @@ async def enterprise_chat(request: Request, body: EnterpriseChatBody):
                 auth["system_message"] = _append_enterprise_skill_prompt(
                     store.compile_agent_prompt(agent),
                     store.list_user_agent_skill_names(auth["user"], agent["id"]),
-                    store.list_user_agent_custom_skills(
+                    store.list_agent_custom_skills(
+                        agent["id"],
+                        tenant_id=agent["tenant_id"],
+                        enabled_only=True,
+                    )
+                    + store.list_user_agent_custom_skills(
                         auth["user"],
                         agent["id"],
                         enabled_only=True,

@@ -301,6 +301,15 @@ export const api = {
         body: JSON.stringify({ name: payload.name, enabled: payload.enabled }),
       },
     ),
+  enterpriseBuilderChat: (payload: { message: string; session_id?: string }) =>
+    fetchJSON<EnterpriseBuilderChatResponse>("/api/enterprise/admin-builder/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: payload.message,
+        session_id: payload.session_id,
+      }),
+    }),
   getEnterpriseInvites: () =>
     fetchJSON<{ invites: EnterpriseInvite[] }>("/api/enterprise/invites"),
   createEnterpriseInvite: (payload: {
@@ -557,6 +566,13 @@ export interface EnterpriseChatResponse {
   user: EnterpriseUser;
   agent?: EnterpriseAgent;
   agents?: EnterpriseAgent[];
+}
+
+export interface EnterpriseBuilderChatResponse {
+  session_id: string;
+  final_response: string;
+  agents?: EnterpriseAgent[];
+  invites?: EnterpriseInvite[];
 }
 
 export interface EnterpriseLocalDevice {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import sqlite3
 import time
@@ -105,6 +106,22 @@ CREATE TABLE IF NOT EXISTS agent_skill_catalog (
     PRIMARY KEY (tenant_id, agent_id, skill_name)
 );
 
+CREATE TABLE IF NOT EXISTS agent_custom_skills (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    name TEXT NOT NULL,
+    description TEXT,
+    content TEXT NOT NULL,
+    category TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    skill_dir TEXT,
+    files_json TEXT,
+    created_by_user_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (tenant_id, agent_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS user_agent_custom_skills (
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -169,6 +186,8 @@ CREATE INDEX IF NOT EXISTS idx_enterprise_user_agent_skills
     ON user_agent_skills(tenant_id, user_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_agent_skill_catalog
     ON agent_skill_catalog(tenant_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_agent_custom_skills
+    ON agent_custom_skills(tenant_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_user_agent_custom_skills
     ON user_agent_custom_skills(tenant_id, user_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_local_devices_tenant
@@ -659,6 +678,116 @@ class EnterpriseStore:
                     (agent["tenant_id"], agent["id"], normalized),
                 )
         return self.list_agent_skill_catalog(agent["id"], tenant_id=agent["tenant_id"], enabled_only=True)
+
+    def list_agent_custom_skills(
+        self,
+        agent_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+        enabled_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        enabled_clause = "AND enabled = 1" if enabled_only else ""
+        rows = self._conn.execute(
+            f"""SELECT *
+                FROM agent_custom_skills
+                WHERE tenant_id = ? AND agent_id = ? {enabled_clause}
+                ORDER BY updated_at DESC, name ASC""",
+            (agent["tenant_id"], agent["id"]),
+        ).fetchall()
+        skills: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["files"] = json.loads(item.get("files_json") or "[]")
+            except Exception:
+                item["files"] = []
+            skills.append(item)
+        return skills
+
+    def get_agent_custom_skill(
+        self,
+        agent_id: str,
+        name: str,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        row = self._conn.execute(
+            """SELECT *
+               FROM agent_custom_skills
+               WHERE tenant_id = ? AND agent_id = ? AND name = ?""",
+            (agent["tenant_id"], agent["id"], (name or "").strip()),
+        ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["files"] = json.loads(item.get("files_json") or "[]")
+        except Exception:
+            item["files"] = []
+        return item
+
+    def upsert_agent_custom_skill(
+        self,
+        agent_id: str,
+        *,
+        name: str,
+        content: str,
+        description: Optional[str] = None,
+        category: Optional[str] = "business",
+        enabled: bool = True,
+        skill_dir: Optional[str] = None,
+        files: Optional[List[Dict[str, Any]]] = None,
+        created_by_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        normalized_name = (name or "").strip()
+        normalized_content = _clean_text(content)
+        if not normalized_name:
+            raise ValueError("skill name is required")
+        if not normalized_content:
+            raise ValueError("skill content is required")
+        now = time.time()
+        existing = self.get_agent_custom_skill(
+            agent["id"],
+            normalized_name,
+            tenant_id=agent["tenant_id"],
+        )
+        created_at = float(existing["created_at"]) if existing else now
+        with self._conn:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO agent_custom_skills
+                   (tenant_id, agent_id, name, description, content, category,
+                    enabled, skill_dir, files_json, created_by_user_id,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    agent["tenant_id"],
+                    agent["id"],
+                    normalized_name,
+                    _clean_text(description),
+                    normalized_content,
+                    (category or "business").strip() or "business",
+                    1 if enabled else 0,
+                    _clean_text(skill_dir),
+                    json.dumps(files or [], ensure_ascii=False),
+                    created_by_user_id,
+                    created_at,
+                    now,
+                ),
+            )
+        skill = self.get_agent_custom_skill(agent["id"], normalized_name, tenant_id=agent["tenant_id"])
+        if not skill:
+            raise RuntimeError("agent custom skill was not saved")
+        return skill
 
     def list_user_agent_custom_skills(
         self,
