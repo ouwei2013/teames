@@ -77,6 +77,79 @@ async function getSessionToken(): Promise<string> {
   throw new Error("Session token not available — page must be served by the Hermes dashboard server");
 }
 
+export async function streamEnterpriseBuilderChat(
+  payload: { message: string; session_id?: string },
+  handlers: {
+    onTrace?: (trace: EnterpriseBuilderTraceItem) => void;
+    onDelta?: (delta: string) => void;
+    onFinal?: (result: EnterpriseBuilderChatResponse) => void;
+    onError?: (detail: string) => void;
+  },
+): Promise<void> {
+  const token = await getSessionToken();
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    [SESSION_HEADER]: token,
+  });
+  const url = "/api/enterprise/admin-builder/chat/stream";
+  const res = await fetch(`${BASE}${url}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      message: payload.message,
+      session_id: payload.session_id,
+    }),
+  });
+
+  if (res.ok) {
+    window.sessionStorage.removeItem(TOKEN_RELOAD_FLAG);
+  }
+  if (shouldReloadForStaleDashboardToken(url, res.status)) {
+    const alreadyReloaded = window.sessionStorage.getItem(TOKEN_RELOAD_FLAG) === "1";
+    if (!alreadyReloaded) {
+      window.sessionStorage.setItem(TOKEN_RELOAD_FLAG, "1");
+      window.location.reload();
+      throw new Error("Dashboard session expired; reloading");
+    }
+  }
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${text || res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  async function handleLine(line: string) {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as EnterpriseBuilderStreamEvent;
+    if (event.type === "trace") {
+      handlers.onTrace?.(event.trace);
+    } else if (event.type === "delta") {
+      handlers.onDelta?.(event.delta);
+    } else if (event.type === "final") {
+      handlers.onFinal?.(event);
+    } else if (event.type === "error") {
+      handlers.onError?.(event.detail);
+      throw new Error(event.detail);
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      await handleLine(line);
+    }
+  }
+  buffer += decoder.decode();
+  await handleLine(buffer);
+}
+
 export const api = {
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   getSessions: (limit = 20, offset = 0) =>
@@ -575,6 +648,12 @@ export interface EnterpriseBuilderChatResponse {
   agents?: EnterpriseAgent[];
   invites?: EnterpriseInvite[];
 }
+
+export type EnterpriseBuilderStreamEvent =
+  | { type: "trace"; trace: EnterpriseBuilderTraceItem }
+  | { type: "delta"; delta: string }
+  | ({ type: "final" } & EnterpriseBuilderChatResponse)
+  | { type: "error"; detail: string };
 
 export interface EnterpriseBuilderTraceItem {
   kind: string;

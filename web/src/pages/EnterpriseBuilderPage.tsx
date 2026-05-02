@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/card";
 import {
   api,
+  streamEnterpriseBuilderChat,
   type EnterpriseAgent,
   type EnterpriseBuilderTraceItem,
   type EnterpriseInvite,
@@ -30,6 +31,7 @@ import {
 import { cn } from "@/lib/utils";
 
 type BuilderMessage = {
+  id: string;
   role: "admin" | "builder";
   content: string;
   trace?: EnterpriseBuilderTraceItem[];
@@ -64,6 +66,7 @@ export default function EnterpriseBuilderPage() {
   const [error, setError] = useState<string | null>(null);
   const [messages, setMessages] = useState<BuilderMessage[]>([
     {
+      id: "builder-welcome",
       role: "builder",
       content:
         "Tell me what business agent you want to build. I can create the agent, prompts, knowledge, allowed native skills, enterprise skill packages with scripts, and invite links.",
@@ -102,38 +105,70 @@ export default function EnterpriseBuilderPage() {
     };
   }, []);
 
+  function updateBuilderMessage(id: string, updater: (message: BuilderMessage) => BuilderMessage) {
+    setMessages((current) => current.map((item) => (item.id === id ? updater(item) : item)));
+  }
+
   async function sendMessage(event: FormEvent) {
     event.preventDefault();
     const message = input.trim();
     if (!message || sending) return;
 
+    const adminId = `admin-${Date.now()}`;
+    const builderId = `builder-${Date.now()}`;
     setInput("");
     setSending(true);
     setError(null);
-    setMessages((current) => [...current, { role: "admin", content: message }]);
+    setMessages((current) => [
+      ...current,
+      { id: adminId, role: "admin", content: message },
+      { id: builderId, role: "builder", content: "", trace: [] },
+    ]);
     try {
-      const result = await api.enterpriseBuilderChat({
-        message,
-        session_id: sessionId || undefined,
-      });
-      setSessionId(result.session_id);
-      setMessages((current) => [
-        ...current,
+      await streamEnterpriseBuilderChat(
         {
-          role: "builder",
-          content: result.final_response || "Done.",
-          trace: result.trace || [],
+          message,
+          session_id: sessionId || undefined,
         },
-      ]);
-      if (result.agents) setAgents(result.agents);
-      if (result.invites) setInvites(result.invites);
+        {
+          onDelta: (delta) => {
+            updateBuilderMessage(builderId, (item) => ({
+              ...item,
+              content: `${item.content}${delta}`,
+            }));
+          },
+          onTrace: (trace) => {
+            updateBuilderMessage(builderId, (item) => ({
+              ...item,
+              trace: [...(item.trace || []), trace],
+            }));
+          },
+          onFinal: (result) => {
+            setSessionId(result.session_id);
+            updateBuilderMessage(builderId, (item) => ({
+              ...item,
+              content: result.final_response || item.content || "Done.",
+              trace: result.trace || item.trace || [],
+            }));
+            if (result.agents) setAgents(result.agents);
+            if (result.invites) setInvites(result.invites);
+          },
+          onError: (detail) => {
+            setError(detail);
+            updateBuilderMessage(builderId, (item) => ({
+              ...item,
+              content: item.content || `Builder failed: ${detail}`,
+            }));
+          },
+        },
+      );
     } catch (err) {
       const messageText = err instanceof Error ? err.message : String(err);
       setError(messageText);
-      setMessages((current) => [
-        ...current,
-        { role: "builder", content: `Builder failed: ${messageText}` },
-      ]);
+      updateBuilderMessage(builderId, (item) => ({
+        ...item,
+        content: item.content || `Builder failed: ${messageText}`,
+      }));
     } finally {
       setSending(false);
     }
@@ -172,7 +207,7 @@ export default function EnterpriseBuilderPage() {
               <div className="space-y-3">
                 {messages.map((item, index) => (
                   <div
-                    key={`${item.role}-${index}`}
+                    key={item.id || `${item.role}-${index}`}
                     className={cn(
                       "max-w-[88%] border border-border px-3 py-2 font-courier text-sm normal-case",
                       item.role === "admin"
