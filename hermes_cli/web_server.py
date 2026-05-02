@@ -1024,6 +1024,24 @@ async def enterprise_agent_skill_catalog(agent_id: str):
             for skill in skills:
                 skill["allowed"] = skill.get("name") in allowed
                 skill["source"] = "builtin"
+            for skill in store.list_agent_custom_skills(
+                agent["id"],
+                tenant_id=agent["tenant_id"],
+                enabled_only=False,
+            ):
+                skills.insert(
+                    0,
+                    {
+                        "name": skill.get("name") or "",
+                        "description": skill.get("description") or skill.get("content") or "",
+                        "category": skill.get("category") or "business",
+                        "enabled": bool(skill.get("enabled")),
+                        "allowed": bool(skill.get("enabled")),
+                        "source": "agent_custom",
+                        "skill_dir": skill.get("skill_dir"),
+                        "files": skill.get("files", []),
+                    },
+                )
             return {"agent": agent, "skills": skills, "allowed": sorted(allowed)}
         finally:
             store.close()

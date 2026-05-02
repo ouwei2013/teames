@@ -846,7 +846,7 @@ export default function EnterpriseAdminPage() {
                 Agent Skill Catalog
               </CardTitle>
               <CardDescription className="normal-case">
-                Choose which built-in remote skills are visible to users of each business agent.
+                Review business skills created for this agent and choose which built-in remote skills are visible to its users.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -870,34 +870,48 @@ export default function EnterpriseAdminPage() {
                 )}
                 {!loadingCatalog && skillCatalog.length === 0 && (
                   <div className="font-courier text-xs normal-case text-muted-foreground">
-                    No built-in skills available.
+                    No skills available.
                   </div>
                 )}
                 {skillCatalog.map((skill) => (
-                  <div key={skill.name} className="border border-border bg-background/40 p-3">
+                  <div key={`${skill.source || "builtin"}-${skill.name}`} className="border border-border bg-background/40 p-3">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <div className="truncate font-mondwest text-sm uppercase text-midground">
                           {skill.name}
                         </div>
-                        <div className="mt-1 font-courier text-xs normal-case text-muted-foreground">
-                          {skill.category || "general"}
+                        <div className="mt-1 flex flex-wrap items-center gap-2 font-courier text-xs normal-case text-muted-foreground">
+                          <span>{skill.category || "general"}</span>
+                          <Badge variant={skill.source === "agent_custom" ? "success" : "outline"}>
+                            {skill.source === "agent_custom" ? "Business" : "Built-in"}
+                          </Badge>
                         </div>
                       </div>
-                      <Button
-                        type="button"
-                        variant={skill.allowed ? "default" : "outline"}
-                        size="sm"
-                        disabled={busyCatalogSkill === skill.name}
-                        onClick={() => toggleCatalogSkill(skill)}
-                      >
-                        {busyCatalogSkill === skill.name && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                        {skill.allowed ? "Visible" : "Hidden"}
-                      </Button>
+                      {skill.source === "agent_custom" ? (
+                        <Badge variant={skill.enabled ? "success" : "outline"}>
+                          {skill.enabled ? "Enabled" : "Disabled"}
+                        </Badge>
+                      ) : (
+                        <Button
+                          type="button"
+                          variant={skill.allowed ? "default" : "outline"}
+                          size="sm"
+                          disabled={busyCatalogSkill === skill.name}
+                          onClick={() => toggleCatalogSkill(skill)}
+                        >
+                          {busyCatalogSkill === skill.name && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                          {skill.allowed ? "Visible" : "Hidden"}
+                        </Button>
+                      )}
                     </div>
                     <p className="mt-2 line-clamp-3 font-courier text-xs normal-case text-muted-foreground">
                       {skill.description}
                     </p>
+                    {skill.source === "agent_custom" && skill.files && skill.files.length > 0 && (
+                      <div className="mt-2 font-courier text-[11px] normal-case text-muted-foreground">
+                        Files: {skill.files.length}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

@@ -885,6 +885,8 @@ export interface SkillInfo {
   enabled: boolean;
   allowed?: boolean;
   source?: string;
+  skill_dir?: string | null;
+  files?: Array<{ path?: string; bytes?: number } | string>;
 }
 
 export interface ToolsetInfo {
