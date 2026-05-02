@@ -88,7 +88,27 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _enterprise_context_from_env() -> Optional[Dict[str, str]]:
+    from gateway.session_context import get_session_env
+
+    tenant_id = get_session_env("HERMES_ENTERPRISE_TENANT_ID")
+    user_id = get_session_env("HERMES_ENTERPRISE_USER_ID")
+    agent_id = get_session_env("HERMES_ENTERPRISE_AGENT_ID")
+    if not (tenant_id and user_id and agent_id):
+        return None
+    return {
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "agent_name": get_session_env("HERMES_ENTERPRISE_AGENT_NAME"),
+        "system_message": get_session_env("HERMES_ENTERPRISE_SYSTEM_MESSAGE"),
+    }
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
+    if (job.get("schedule") or {}).get("kind") == "once":
+        completed = (job.get("repeat") or {}).get("completed", 0)
+        return "1/1" if completed else "once"
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
     if times is None:
@@ -278,13 +298,15 @@ def cronjob(
                             success=False,
                         )
 
+            enterprise_context = _enterprise_context_from_env()
+            origin = _origin_from_env()
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
                 name=name,
                 repeat=repeat,
-                deliver=deliver,
-                origin=_origin_from_env(),
+                deliver=(deliver if deliver is not None else ("local" if enterprise_context else None)),
+                origin=origin,
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
@@ -294,6 +316,32 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
             )
+            if enterprise_context:
+                updates = {
+                    "enterprise": {
+                        "tenant_id": enterprise_context["tenant_id"],
+                        "user_id": enterprise_context["user_id"],
+                        "agent_id": enterprise_context["agent_id"],
+                        "agent_name": enterprise_context.get("agent_name") or None,
+                    },
+                    "access_context": {
+                        "tenant_id": enterprise_context["tenant_id"],
+                        "workspace_id": "default",
+                        "user_id": enterprise_context["user_id"],
+                        "agent_id": enterprise_context["agent_id"],
+                    },
+                    "origin": {
+                        "platform": "enterprise_portal",
+                        "chat_id": origin.get("chat_id") if origin else None,
+                        "agent_id": enterprise_context["agent_id"],
+                    },
+                }
+                system_message = (enterprise_context.get("system_message") or "").strip()
+                if system_message:
+                    updates["enterprise_system_message"] = system_message
+                if (job.get("schedule") or {}).get("kind") == "once":
+                    updates["repeat"] = {"times": None, "completed": 0}
+                job = update_job(job["id"], updates) or job
             return json.dumps(
                 {
                     "success": True,

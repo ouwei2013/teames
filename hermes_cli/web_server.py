@@ -1453,6 +1453,26 @@ def _enterprise_job_matches(job: Dict[str, Any], user: Dict[str, Any], agent_id:
     )
 
 
+def _latest_cron_output(job_id: str) -> Optional[str]:
+    try:
+        from cron.jobs import OUTPUT_DIR
+
+        job_output_dir = OUTPUT_DIR / job_id
+        if not job_output_dir.exists():
+            return None
+        outputs = sorted(
+            (path for path in job_output_dir.glob("*.md") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not outputs:
+            return None
+        content = outputs[0].read_text(encoding="utf-8", errors="replace").strip()
+        return content[:8000] if content else None
+    except Exception:
+        return None
+
+
 def _enterprise_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(job)
     meta = payload.get("enterprise")
@@ -1460,6 +1480,9 @@ def _enterprise_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
         payload["agent_id"] = meta.get("agent_id")
         payload["tenant_id"] = meta.get("tenant_id")
         payload["user_id"] = meta.get("user_id")
+    latest_output = _latest_cron_output(str(payload.get("id") or ""))
+    if latest_output:
+        payload["latest_output"] = latest_output
     return payload
 
 
@@ -1663,6 +1686,12 @@ async def enterprise_chat(request: Request, body: EnterpriseChatBody):
         from hermes_cli.tools_config import _get_platform_tools
         from run_agent import AIAgent
         from hermes_state import SessionDB
+        from gateway.session_context import (
+            clear_enterprise_vars,
+            clear_session_vars,
+            set_enterprise_vars,
+            set_session_vars,
+        )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
@@ -1688,12 +1717,32 @@ async def enterprise_chat(request: Request, body: EnterpriseChatBody):
                 session_db=db,
                 access_context=access_context,
             )
-            result = agent.run_conversation(
-                user_message=message,
-                system_message=auth.get("system_message"),
-                conversation_history=history,
-                task_id="enterprise-web",
+            system_message = auth.get("system_message") or ""
+            session_tokens = set_session_vars(
+                platform="enterprise_portal",
+                chat_id=session_id,
+                chat_name=auth.get("agent", {}).get("name") or "",
+                user_id=auth["user"]["id"],
+                user_name=auth["user"].get("email") or "",
+                session_key=session_id,
             )
+            enterprise_tokens = set_enterprise_vars(
+                tenant_id=auth["user"]["tenant_id"],
+                user_id=auth["user"]["id"],
+                agent_id=auth.get("agent", {}).get("id") or "",
+                agent_name=auth.get("agent", {}).get("name") or "",
+                system_message=system_message,
+            )
+            try:
+                result = agent.run_conversation(
+                    user_message=message,
+                    system_message=system_message,
+                    conversation_history=history,
+                    task_id="enterprise-web",
+                )
+            finally:
+                clear_enterprise_vars(enterprise_tokens)
+                clear_session_vars(session_tokens)
             return {
                 "session_id": session_id,
                 "final_response": result.get("final_response", ""),

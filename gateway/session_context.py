@@ -55,6 +55,11 @@ _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
+_ENTERPRISE_TENANT_ID: ContextVar = ContextVar("HERMES_ENTERPRISE_TENANT_ID", default=_UNSET)
+_ENTERPRISE_USER_ID: ContextVar = ContextVar("HERMES_ENTERPRISE_USER_ID", default=_UNSET)
+_ENTERPRISE_AGENT_ID: ContextVar = ContextVar("HERMES_ENTERPRISE_AGENT_ID", default=_UNSET)
+_ENTERPRISE_AGENT_NAME: ContextVar = ContextVar("HERMES_ENTERPRISE_AGENT_NAME", default=_UNSET)
+_ENTERPRISE_SYSTEM_MESSAGE: ContextVar = ContextVar("HERMES_ENTERPRISE_SYSTEM_MESSAGE", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -70,6 +75,11 @@ _VAR_MAP = {
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
+    "HERMES_ENTERPRISE_TENANT_ID": _ENTERPRISE_TENANT_ID,
+    "HERMES_ENTERPRISE_USER_ID": _ENTERPRISE_USER_ID,
+    "HERMES_ENTERPRISE_AGENT_ID": _ENTERPRISE_AGENT_ID,
+    "HERMES_ENTERPRISE_AGENT_NAME": _ENTERPRISE_AGENT_NAME,
+    "HERMES_ENTERPRISE_SYSTEM_MESSAGE": _ENTERPRISE_SYSTEM_MESSAGE,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -124,6 +134,34 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_USER_ID,
         _SESSION_USER_NAME,
         _SESSION_KEY,
+    ):
+        var.set("")
+
+
+def set_enterprise_vars(
+    tenant_id: str = "",
+    user_id: str = "",
+    agent_id: str = "",
+    agent_name: str = "",
+    system_message: str = "",
+) -> list:
+    """Set enterprise-scoped context for tools called by a portal chat turn."""
+    return [
+        _ENTERPRISE_TENANT_ID.set(tenant_id),
+        _ENTERPRISE_USER_ID.set(user_id),
+        _ENTERPRISE_AGENT_ID.set(agent_id),
+        _ENTERPRISE_AGENT_NAME.set(agent_name),
+        _ENTERPRISE_SYSTEM_MESSAGE.set(system_message),
+    ]
+
+
+def clear_enterprise_vars(tokens: list) -> None:
+    for var in (
+        _ENTERPRISE_TENANT_ID,
+        _ENTERPRISE_USER_ID,
+        _ENTERPRISE_AGENT_ID,
+        _ENTERPRISE_AGENT_NAME,
+        _ENTERPRISE_SYSTEM_MESSAGE,
     ):
         var.set("")
 

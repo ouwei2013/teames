@@ -749,8 +749,10 @@ export interface CronJob {
   state: string;
   deliver?: string;
   last_run_at?: string | null;
+  last_status?: string | null;
   next_run_at?: string | null;
   last_error?: string | null;
+  latest_output?: string | null;
 }
 
 export interface SkillInfo {

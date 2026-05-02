@@ -114,6 +114,7 @@ export default function EnterprisePortalPage() {
   const [creatingLocalCode, setCreatingLocalCode] = useState(false);
   const [busyItem, setBusyItem] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const notifiedCronRunsRef = useRef<Record<string, string>>({});
 
   const displayName = useMemo(() => {
     if (!session) return "";
@@ -199,6 +200,57 @@ export default function EnterprisePortalPage() {
       cancelled = true;
     };
   }, [session?.token, selectedAgent?.id, view]);
+
+  useEffect(() => {
+    if (!session?.token || !selectedAgent) return;
+    let cancelled = false;
+
+    async function refreshCronJobs(notify: boolean) {
+      if (!session?.token || !selectedAgent) return;
+      try {
+        const result = await api.getEnterprisePortalCronJobs(session.token, selectedAgent.id);
+        if (cancelled) return;
+        const jobs = result.jobs || [];
+        setCronJobs(jobs);
+        const seen = notifiedCronRunsRef.current;
+        for (const job of jobs) {
+          if (!job.last_run_at) continue;
+          const marker = `${job.id}:${job.last_run_at}`;
+          if (!notify) {
+            seen[job.id] = marker;
+            continue;
+          }
+          if (seen[job.id] === marker) continue;
+          seen[job.id] = marker;
+          if (job.last_status === "ok") {
+            setMessages((current) => [
+              ...current,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content:
+                  job.latest_output ||
+                  `Reminder completed: ${job.name || job.prompt.slice(0, 48)}`,
+              },
+            ]);
+          } else if (job.last_status === "error") {
+            setError(job.last_error || `Cron job failed: ${job.name || job.id}`);
+          }
+        }
+      } catch {
+        // Keep chat usable if polling fails; explicit panel loads still surface errors.
+      }
+    }
+
+    void refreshCronJobs(false);
+    const interval = window.setInterval(() => {
+      void refreshCronJobs(true);
+    }, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [session?.token, selectedAgent?.id]);
 
   async function redeemInvite(event: FormEvent) {
     event.preventDefault();
