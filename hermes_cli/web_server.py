@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,7 @@ from hermes_cli.config import (
 )
 from agent.access_context import AccessContext
 from gateway.status import get_running_pid, read_runtime_status
+from hermes_constants import get_default_hermes_root
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -1959,9 +1961,14 @@ def _enterprise_local_web_prompt(config: Dict[str, Any]) -> str:
     return (
         "You are a local Hermes agent running on the user's own computer. "
         "You can help with local tasks using the local Hermes tools and local profile state. "
-        "If the user asks about company policy, HR, customer support, business-specific "
-        "knowledge, or another assigned business agent, use enterprise_remote to consult "
-        "the remote business agent assigned to this user. Do not send private local files, "
+        "When the user asks about products, menus, inventory, prices, orders, delivery, "
+        "pickups, stores, customer support, company policy, HR, business-specific knowledge, "
+        "or anything owned by an assigned business agent, you MUST call enterprise_remote "
+        "before answering. Do not answer these business-scope questions from general model "
+        "knowledge, even if they sound simple. Use the default business agent unless the user "
+        "names another assigned agent. You may answer locally only for local-computer tasks "
+        "or general questions that are unrelated to the assigned business agents. "
+        "Do not send private local files, "
         "secrets, credentials, screenshots, account data, or internal documents to remote "
         "business agents unless the local user explicitly agrees. Prefer summaries and "
         "minimal necessary excerpts over raw data.\n\n"
@@ -1971,6 +1978,165 @@ def _enterprise_local_web_prompt(config: Dict[str, Any]) -> str:
         f"Default business agent: {agent.get('name') or agent.get('id') or 'none'}\n"
         "Assigned remote business agents:\n"
         + ("\n".join(remote_agent_lines) if remote_agent_lines else "- none")
+    )
+
+
+def _enterprise_local_web_agent_corpus(config: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    agents = config.get("agents") or []
+    if not isinstance(agents, list) or not agents:
+        agent = config.get("agent")
+        agents = [agent] if isinstance(agent, dict) and agent else []
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        for key in (
+            "name",
+            "description",
+            "role_prompt",
+            "task_prompt",
+            "tone_prompt",
+            "instructions",
+            "knowledge",
+            "escalation_prompt",
+        ):
+            value = agent.get(key)
+            if value:
+                parts.append(str(value))
+    return "\n".join(parts).lower()
+
+
+def _enterprise_local_web_should_prefer_remote(config: Dict[str, Any], message: str) -> bool:
+    if not (config.get("server") and config.get("device_token")):
+        return False
+    if not (config.get("agents") or config.get("agent")):
+        return False
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+
+    generic_business_terms = (
+        "产品",
+        "商品",
+        "菜单",
+        "价格",
+        "价钱",
+        "多少钱",
+        "库存",
+        "订单",
+        "下单",
+        "配送",
+        "自提",
+        "门店",
+        "营业",
+        "客服",
+        "客户",
+        "政策",
+        "流程",
+        "报销",
+        "请假",
+        "人事",
+        "薪资",
+        "员工",
+        "退款",
+        "退货",
+        "预约",
+        "product",
+        "products",
+        "menu",
+        "price",
+        "pricing",
+        "inventory",
+        "stock",
+        "order",
+        "orders",
+        "delivery",
+        "pickup",
+        "store",
+        "customer",
+        "support",
+        "policy",
+        "hr",
+        "refund",
+    )
+    if any(term in text for term in generic_business_terms):
+        return True
+
+    corpus = _enterprise_local_web_agent_corpus(config)
+    if not corpus:
+        return False
+    if any(term in text for term in ("有哪些", "有什么", "帮我看看", "查询", "看看", "介绍")):
+        business_corpus_terms = (
+            "产品",
+            "商品",
+            "菜单",
+            "价格",
+            "库存",
+            "订单",
+            "门店",
+            "客服",
+            "政策",
+            "人事",
+            "客户",
+            "product",
+            "menu",
+            "inventory",
+            "order",
+            "support",
+            "policy",
+            "customer",
+        )
+        if any(term in corpus for term in business_corpus_terms):
+            return True
+    return any(name and name in text for name in _enterprise_local_web_agent_names(config))
+
+
+def _enterprise_local_web_agent_names(config: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    agents = config.get("agents") or []
+    if not isinstance(agents, list) or not agents:
+        agent = config.get("agent")
+        agents = [agent] if isinstance(agent, dict) and agent else []
+    for agent in agents:
+        if isinstance(agent, dict):
+            for key in ("name", "id"):
+                value = str(agent.get(key) or "").strip().lower()
+                if value:
+                    names.append(value)
+    return names
+
+
+def _enterprise_local_web_used_enterprise_remote(
+    live_trace: List[Dict[str, Any]],
+    result_messages: List[Dict[str, Any]],
+) -> bool:
+    if any(item.get("tool") == "enterprise_remote" for item in live_trace):
+        return True
+    for message in result_messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("name") == "enterprise_remote":
+            return True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                function = call.get("function") if isinstance(call, dict) else None
+                if isinstance(function, dict) and function.get("name") == "enterprise_remote":
+                    return True
+    return False
+
+
+def _enterprise_local_web_remote_chat(config: Dict[str, Any], message: str, session_id: str) -> Dict[str, Any]:
+    return _enterprise_local_web_http_json(
+        str(config.get("server") or ""),
+        "/api/enterprise/local-agent/chat",
+        method="POST",
+        token=str(config.get("device_token") or ""),
+        payload={
+            "message": message,
+            "session_id": session_id,
+            "agent_id": config.get("default_agent_id") or (config.get("agent") or {}).get("id"),
+        },
     )
 
 
@@ -2017,6 +2183,94 @@ def _enterprise_local_web_has_local_inference_config() -> bool:
     except Exception:
         pass
     return False
+
+
+@contextmanager
+def _temporary_hermes_home(path: Path):
+    previous = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous
+
+
+@contextmanager
+def _temporary_env(values: Dict[str, str]):
+    previous: Dict[str, Optional[str]] = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            if value:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _enterprise_local_web_admin_inference_runtime() -> Optional[Dict[str, Any]]:
+    """Resolve default/admin profile inference credentials for local-web fallback."""
+    admin_home = get_default_hermes_root()
+    local_home = get_hermes_home()
+    try:
+        if admin_home.resolve() == local_home.resolve():
+            return None
+    except Exception:
+        if str(admin_home) == str(local_home):
+            return None
+    if not (admin_home / "config.yaml").exists():
+        return None
+
+    with _temporary_hermes_home(admin_home):
+        env_values = load_env()
+        env_strings = {
+            str(key): str(value)
+            for key, value in env_values.items()
+            if value is not None and str(value).strip()
+        }
+        with _temporary_env(env_strings):
+            from hermes_cli.runtime_provider import (
+                format_runtime_provider_error,
+                resolve_runtime_provider,
+            )
+
+            config = load_config()
+            model_cfg = config.get("model")
+            if isinstance(model_cfg, dict):
+                model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+            else:
+                model = str(model_cfg or "").strip()
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+                    target_model=model or None,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "Default/admin inference provider unavailable for local web fallback: %s",
+                    format_runtime_provider_error(exc),
+                )
+                return None
+            return {
+                "model": model,
+                "source_home": str(admin_home),
+                "runtime_kwargs": {
+                    "api_key": runtime.get("api_key"),
+                    "base_url": runtime.get("base_url"),
+                    "provider": runtime.get("provider"),
+                    "api_mode": runtime.get("api_mode"),
+                    "command": runtime.get("command"),
+                    "args": list(runtime.get("args") or []),
+                    "credential_pool": runtime.get("credential_pool"),
+                },
+                "provider": runtime.get("provider"),
+            }
 
 
 def _cleanup_local_web_connect_states() -> None:
@@ -2118,7 +2372,30 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
             _log.debug("Enterprise local web stream enqueue failed", exc_info=True)
 
     def _run_local_chat_stream() -> None:
-        direct_remote = bool(config.get("server") and config.get("device_token")) and not _enterprise_local_web_has_local_inference_config()
+        local_inference_configured = _enterprise_local_web_has_local_inference_config()
+        admin_inference: Optional[Dict[str, Any]] = None
+        if not local_inference_configured:
+            admin_inference = _enterprise_local_web_admin_inference_runtime()
+            if admin_inference:
+                _emit(
+                    {
+                        "type": "trace",
+                        "trace": _builder_event_trace_item(
+                            kind="status",
+                            title="Using default/admin inference provider",
+                            detail=(
+                                f"{admin_inference.get('provider') or 'provider'} "
+                                f"from {admin_inference.get('source_home')}"
+                            ),
+                            status="info",
+                        ),
+                    }
+                )
+        direct_remote = (
+            bool(config.get("server") and config.get("device_token"))
+            and not local_inference_configured
+            and not admin_inference
+        )
         if direct_remote:
             try:
                 trace = _builder_event_trace_item(
@@ -2129,17 +2406,7 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
                     tool="enterprise_remote",
                 )
                 _emit({"type": "trace", "trace": trace})
-                result = _enterprise_local_web_http_json(
-                    str(config.get("server") or ""),
-                    "/api/enterprise/local-agent/chat",
-                    method="POST",
-                    token=str(config.get("device_token") or ""),
-                    payload={
-                        "message": message,
-                        "session_id": session_id,
-                        "agent_id": config.get("default_agent_id") or (config.get("agent") or {}).get("id"),
-                    },
-                )
+                result = _enterprise_local_web_remote_chat(config, message, session_id)
                 final_trace = _builder_event_trace_item(
                     kind="tool_progress",
                     title="Completed remote business agent",
@@ -2173,8 +2440,12 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        if admin_inference:
+            runtime_kwargs = dict(admin_inference.get("runtime_kwargs") or {})
+            model = str(admin_inference.get("model") or "")
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            model = _resolve_gateway_model()
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(set(_get_platform_tools(user_config, "cli")) | {"enterprise_remote"})
         live_trace: List[Dict[str, Any]] = []
@@ -2261,12 +2532,35 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
                 )
             finally:
                 clear_session_vars(session_tokens)
+            result_messages = result.get("messages") or []
+            if (
+                _enterprise_local_web_should_prefer_remote(config, message)
+                and not _enterprise_local_web_used_enterprise_remote(live_trace, result_messages)
+            ):
+                fallback_trace = _builder_event_trace_item(
+                    kind="status",
+                    title="Routing to assigned remote business agent",
+                    detail="The local turn did not call enterprise_remote for a business-scope request.",
+                    status="info",
+                    tool="enterprise_remote",
+                )
+                _emit_trace(fallback_trace)
+                result = _enterprise_local_web_remote_chat(config, message, session_id)
+                final_trace = _builder_event_trace_item(
+                    kind="tool_progress",
+                    title="Completed remote business agent",
+                    status="success",
+                    tool="enterprise_remote",
+                )
+                _emit_trace(final_trace)
+                result_messages = []
+
             _emit(
                 {
                     "type": "final",
-                    "session_id": session_id,
+                    "session_id": result.get("session_id") or session_id,
                     "final_response": result.get("final_response", ""),
-                    "trace": (live_trace + _builder_trace_from_messages(result.get("messages") or []))[-40:],
+                    "trace": (live_trace + _builder_trace_from_messages(result_messages))[-40:],
                     "local": _enterprise_local_web_status(),
                 }
             )
