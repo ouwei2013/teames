@@ -678,6 +678,22 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  getEnterpriseLocalWebRequests: (limit = 20) =>
+    fetchJSON<{
+      device: EnterpriseLocalDevice;
+      user: EnterpriseUser;
+      agent: EnterpriseAgent;
+      requests: EnterpriseLocalRequest[];
+    }>(`/api/enterprise/local-web/requests?limit=${encodeURIComponent(String(limit))}`),
+  answerEnterpriseLocalWebRequest: (requestId: string, payload?: { response?: string; status?: string }) =>
+    fetchJSON<{ request: EnterpriseLocalRequest }>(
+      `/api/enterprise/local-web/requests/${encodeURIComponent(requestId)}/answer`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload || {}),
+      },
+    ),
 };
 
 export interface EnterpriseUser {

@@ -6,6 +6,7 @@ import {
   CircleAlert,
   Clock,
   ExternalLink,
+  Inbox,
   Laptop,
   Loader2,
   Package,
@@ -27,6 +28,7 @@ import {
   streamEnterpriseLocalWebChat,
   type CronJob,
   type EnterpriseBuilderTraceItem,
+  type EnterpriseLocalRequest,
   type EnterpriseLocalWebStatus,
   type SkillInfo,
   type ToolsetInfo,
@@ -40,11 +42,16 @@ type LocalMessage = {
   trace?: EnterpriseBuilderTraceItem[];
 };
 
-type LocalView = "chat" | "skills" | "tools" | "cron";
+type LocalView = "chat" | "requests" | "skills" | "tools" | "cron";
 
 function defaultRemoteServer(): string {
   const params = new URLSearchParams(window.location.search);
   return params.get("server") || "http://127.0.0.1:9121";
+}
+
+function formatLocalTime(value?: number | null): string {
+  if (!value) return "-";
+  return new Date(value * 1000).toLocaleString();
 }
 
 export default function EnterpriseLocalPage() {
@@ -61,6 +68,7 @@ export default function EnterpriseLocalPage() {
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [toolsets, setToolsets] = useState<ToolsetInfo[]>([]);
   const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
+  const [localRequests, setLocalRequests] = useState<EnterpriseLocalRequest[]>([]);
   const [panelLoading, setPanelLoading] = useState(false);
   const [busyItem, setBusyItem] = useState<string | null>(null);
   const [cronName, setCronName] = useState("");
@@ -79,6 +87,7 @@ export default function EnterpriseLocalPage() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const joined = Boolean(status?.joined);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -95,7 +104,7 @@ export default function EnterpriseLocalPage() {
   }, []);
 
   useEffect(() => {
-    if (view === "chat") return;
+    if (view === "chat" || view === "requests") return;
     let cancelled = false;
     setPanelLoading(true);
     const load =
@@ -121,6 +130,25 @@ export default function EnterpriseLocalPage() {
       cancelled = true;
     };
   }, [view]);
+
+  useEffect(() => {
+    if (view !== "requests" || !joined) return;
+    let cancelled = false;
+    async function load() {
+      try {
+        const result = await api.getEnterpriseLocalWebRequests(20);
+        if (!cancelled) setLocalRequests(result.requests || []);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      }
+    }
+    void load();
+    const timer = window.setInterval(load, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [view, joined]);
 
   async function loadStatus() {
     setLoading(true);
@@ -258,6 +286,26 @@ export default function EnterpriseLocalPage() {
     setCronJobs(jobs || []);
   }
 
+  async function refreshLocalRequests() {
+    const result = await api.getEnterpriseLocalWebRequests(20);
+    setLocalRequests(result.requests || []);
+  }
+
+  async function answerLocalRequest(request: EnterpriseLocalRequest) {
+    setBusyItem(`request:${request.id}`);
+    setError(null);
+    try {
+      const result = await api.answerEnterpriseLocalWebRequest(request.id);
+      setLocalRequests((current) =>
+        current.map((item) => (item.id === request.id ? result.request : item)),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyItem(null);
+    }
+  }
+
   async function createCronJob(event: FormEvent) {
     event.preventDefault();
     if (!cronPrompt.trim() || !cronSchedule.trim()) return;
@@ -296,8 +344,6 @@ export default function EnterpriseLocalPage() {
       setBusyItem(null);
     }
   }
-
-  const joined = Boolean(status?.joined);
 
   return (
     <main className="relative z-2 flex h-dvh min-h-0 w-full flex-col overflow-hidden px-4 py-4 text-midground sm:px-6 lg:px-8">
@@ -421,9 +467,10 @@ export default function EnterpriseLocalPage() {
             <p className="mt-1 font-courier text-xs normal-case text-muted-foreground">
               This workspace runs against the local Hermes profile.
             </p>
-            <nav className="mt-3 grid grid-cols-4 gap-2">
+            <nav className="mt-3 grid grid-cols-5 gap-2">
               {[
                 { key: "chat" as const, label: "Chat", icon: Send },
+                { key: "requests" as const, label: "Requests", icon: Inbox },
                 { key: "skills" as const, label: "Skills", icon: Package },
                 { key: "tools" as const, label: "Tools", icon: Wrench },
                 { key: "cron" as const, label: "Cron", icon: Clock },
@@ -502,6 +549,76 @@ export default function EnterpriseLocalPage() {
             </div>
           </form>
           </>
+          )}
+
+          {view === "requests" && (
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              <div className="mb-4 flex items-center justify-between gap-3 border-b border-border pb-3">
+                <div>
+                  <div className="font-mondwest text-sm uppercase text-midground">Incoming Requests</div>
+                  <p className="mt-1 font-courier text-xs normal-case text-muted-foreground">
+                    Requests from the remote admin are handled by this local agent.
+                  </p>
+                </div>
+                <Button type="button" variant="outline" onClick={refreshLocalRequests} disabled={!joined}>
+                  <PlugZap className="h-3.5 w-3.5" />
+                  Refresh
+                </Button>
+              </div>
+
+              {!joined && (
+                <div className="font-courier text-xs normal-case text-muted-foreground">
+                  Connect to a remote enterprise workspace first.
+                </div>
+              )}
+              {joined && localRequests.length === 0 && (
+                <div className="font-courier text-xs normal-case text-muted-foreground">
+                  No incoming local-agent requests.
+                </div>
+              )}
+              <div className="space-y-3">
+                {localRequests.map((request) => {
+                  const canAnswer =
+                    (request.status === "pending" || request.status === "delivered") &&
+                    !request.response;
+                  return (
+                    <div key={request.id} className="border border-border bg-background/40 p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate font-mondwest text-sm uppercase text-midground">
+                            {request.agent_name || request.device_name || request.id}
+                          </div>
+                          <div className="mt-1 font-courier text-xs normal-case text-muted-foreground">
+                            {request.status} · {formatLocalTime(request.created_at)}
+                          </div>
+                        </div>
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => answerLocalRequest(request)}
+                          disabled={!canAnswer || busyItem === `request:${request.id}`}
+                        >
+                          {busyItem === `request:${request.id}` ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Bot className="h-3.5 w-3.5" />
+                          )}
+                          Answer
+                        </Button>
+                      </div>
+                      <div className="mt-3 whitespace-pre-wrap font-courier text-sm normal-case text-midground">
+                        {request.request}
+                      </div>
+                      {request.response && (
+                        <div className="mt-3 border-t border-border/70 pt-3 font-courier text-sm normal-case text-muted-foreground">
+                          <Markdown content={request.response} />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           )}
 
           {view === "skills" && (

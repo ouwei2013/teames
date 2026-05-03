@@ -397,6 +397,17 @@ export default function EnterpriseAdminPage() {
     }
   }
 
+  async function refreshLocalRequests() {
+    setError(null);
+    try {
+      const requestResult = await api.getEnterpriseLocalRequests();
+      setLocalRequests(requestResult.requests || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("Local request refresh failed", "error");
+    }
+  }
+
   return (
     <main className="mx-auto flex w-full max-w-7xl flex-col gap-4 text-midground">
       <Toast toast={toast} />
@@ -642,8 +653,14 @@ export default function EnterpriseAdminPage() {
                   </div>
                 </div>
                 <div className="border border-border">
-                  <div className="border-b border-border px-3 py-2 font-courier text-xs normal-case text-muted-foreground">
-                    Recent Requests
+                  <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                    <span className="font-courier text-xs normal-case text-muted-foreground">
+                      Recent Requests
+                    </span>
+                    <Button type="button" variant="outline" size="sm" onClick={refreshLocalRequests}>
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Refresh
+                    </Button>
                   </div>
                   <div className="max-h-64 overflow-y-auto">
                     {localRequests.slice(0, 12).map((item) => (
