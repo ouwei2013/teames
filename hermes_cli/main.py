@@ -51,8 +51,9 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 def _add_accept_hooks_flag(parser) -> None:
     """Attach the ``--accept-hooks`` flag.  Shared across every agent
@@ -1369,6 +1370,87 @@ def _enterprise_local_respond(args) -> None:
     print(f"Response sent: {item.get('id')} ({item.get('status')})")
 
 
+@contextmanager
+def _temporary_hermes_home(path: Path):
+    previous = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(path)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous
+
+
+@contextmanager
+def _temporary_env(values: Dict[str, str]):
+    previous: Dict[str, Optional[str]] = {key: os.environ.get(key) for key in values}
+    try:
+        for key, value in values.items():
+            if value:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _enterprise_local_admin_inference_runtime() -> Optional[Dict[str, Any]]:
+    """Resolve default/admin profile inference credentials for local-agent CLI fallback."""
+    from hermes_constants import get_default_hermes_root
+    from hermes_cli.config import load_config, load_env
+
+    admin_home = get_default_hermes_root()
+    local_home = get_hermes_home()
+    try:
+        if admin_home.resolve() == local_home.resolve():
+            return None
+    except Exception:
+        if str(admin_home) == str(local_home):
+            return None
+    if not (admin_home / "config.yaml").exists():
+        return None
+
+    with _temporary_hermes_home(admin_home):
+        env_values = load_env()
+        env_strings = {
+            str(key): str(value)
+            for key, value in env_values.items()
+            if value is not None and str(value).strip()
+        }
+        with _temporary_env(env_strings):
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            config = load_config()
+            model_cfg = config.get("model")
+            if isinstance(model_cfg, dict):
+                model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+            else:
+                model = str(model_cfg or "").strip()
+            runtime = resolve_runtime_provider(
+                requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+                target_model=model or None,
+            )
+            return {
+                "model": model,
+                "source_home": str(admin_home),
+                "runtime_kwargs": {
+                    "api_key": runtime.get("api_key"),
+                    "base_url": runtime.get("base_url"),
+                    "provider": runtime.get("provider"),
+                    "api_mode": runtime.get("api_mode"),
+                    "command": runtime.get("command"),
+                    "args": list(runtime.get("args") or []),
+                    "credential_pool": runtime.get("credential_pool"),
+                },
+                "provider": runtime.get("provider"),
+            }
+
+
 def _enterprise_local_listen(args) -> None:
     import time as _sleep_time
 
@@ -1376,6 +1458,17 @@ def _enterprise_local_listen(args) -> None:
     if not config.get("server") or not config.get("device_token"):
         raise RuntimeError("Local agent is not joined. Run: hermes enterprise local join <code>")
     from run_agent import AIAgent
+
+    admin_inference: Optional[Dict[str, Any]] = None
+    try:
+        admin_inference = _enterprise_local_admin_inference_runtime()
+    except Exception as exc:
+        print(f"Default/admin inference provider unavailable for local listener: {exc}")
+    if admin_inference:
+        print(
+            "Using default/admin inference provider for local listener: "
+            f"{admin_inference.get('provider') or 'provider'} from {admin_inference.get('source_home')}"
+        )
 
     interval = max(1, int(getattr(args, "interval", 5) or 5))
     once = bool(getattr(args, "once", False))
@@ -1395,7 +1488,14 @@ def _enterprise_local_listen(args) -> None:
         ]
         for item in requests:
             print(f"Handling request {item['id']} from enterprise agent...")
+            runtime_kwargs: Dict[str, Any] = {}
+            model = ""
+            if admin_inference:
+                runtime_kwargs = dict(admin_inference.get("runtime_kwargs") or {})
+                model = str(admin_inference.get("model") or "")
             local_agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
                 quiet_mode=True,
                 platform="enterprise_local",
                 session_id=f"enterprise-local-{item['id']}",
