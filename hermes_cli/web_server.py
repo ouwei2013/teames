@@ -1974,6 +1974,51 @@ def _enterprise_local_web_prompt(config: Dict[str, Any]) -> str:
     )
 
 
+def _enterprise_local_web_has_local_inference_config() -> bool:
+    """Best-effort check for whether this local profile can run an agent turn."""
+    try:
+        config = load_config()
+    except Exception:
+        config = {}
+    if str(config.get("model") or "").strip():
+        return True
+    providers = config.get("providers")
+    if isinstance(providers, dict) and any(providers.values()):
+        return True
+    for key in (
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "XAI_API_KEY",
+        "ZAI_API_KEY",
+        "KIMI_API_KEY",
+        "MINIMAX_API_KEY",
+        "MISTRAL_API_KEY",
+    ):
+        if os.environ.get(key):
+            return True
+    try:
+        env_values = load_env()
+        if any(str(env_values.get(key) or "").strip() for key in (
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "XAI_API_KEY",
+            "ZAI_API_KEY",
+            "KIMI_API_KEY",
+            "MINIMAX_API_KEY",
+            "MISTRAL_API_KEY",
+        )):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _cleanup_local_web_connect_states() -> None:
     now = time.time()
     expired = [
@@ -2073,6 +2118,51 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
             _log.debug("Enterprise local web stream enqueue failed", exc_info=True)
 
     def _run_local_chat_stream() -> None:
+        direct_remote = bool(config.get("server") and config.get("device_token")) and not _enterprise_local_web_has_local_inference_config()
+        if direct_remote:
+            try:
+                trace = _builder_event_trace_item(
+                    kind="status",
+                    title="Routing to assigned remote business agent",
+                    detail="Local profile has no inference provider configured.",
+                    status="info",
+                    tool="enterprise_remote",
+                )
+                _emit({"type": "trace", "trace": trace})
+                result = _enterprise_local_web_http_json(
+                    str(config.get("server") or ""),
+                    "/api/enterprise/local-agent/chat",
+                    method="POST",
+                    token=str(config.get("device_token") or ""),
+                    payload={
+                        "message": message,
+                        "session_id": session_id,
+                        "agent_id": config.get("default_agent_id") or (config.get("agent") or {}).get("id"),
+                    },
+                )
+                final_trace = _builder_event_trace_item(
+                    kind="tool_progress",
+                    title="Completed remote business agent",
+                    status="success",
+                    tool="enterprise_remote",
+                )
+                _emit({"type": "trace", "trace": final_trace})
+                _emit(
+                    {
+                        "type": "final",
+                        "session_id": result.get("session_id") or session_id,
+                        "final_response": result.get("final_response", ""),
+                        "trace": [trace, final_trace],
+                        "local": _enterprise_local_web_status(),
+                    }
+                )
+            except Exception as exc:
+                _log.exception("Enterprise local web direct remote chat failed")
+                _emit({"type": "error", "detail": f"Remote business agent failed: {exc}"})
+            finally:
+                event_queue.put(done)
+            return
+
         from gateway.run import (
             _load_gateway_config,
             _resolve_gateway_model,
