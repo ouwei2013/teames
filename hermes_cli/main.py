@@ -1437,7 +1437,10 @@ def _enterprise_local_serve(args) -> None:
         sys.exit(1)
 
     if "HERMES_WEB_DIST" not in os.environ:
-        if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
+        bundled_dist = PROJECT_ROOT / "hermes_cli" / "web_dist"
+        if (bundled_dist / "index.html").exists():
+            os.environ["HERMES_WEB_DIST"] = str(bundled_dist)
+        elif not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
             sys.exit(1)
 
     from hermes_cli.web_server import start_server
