@@ -1,15 +1,22 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import {
   Bot,
   CheckCircle2,
   Circle,
   CircleAlert,
+  Clock,
   ExternalLink,
   Laptop,
   Loader2,
+  Package,
+  Pause,
+  Play,
+  Plus,
   PlugZap,
   Send,
   Server,
+  Trash2,
+  Wrench,
 } from "lucide-react";
 import { Typography } from "@nous-research/ui";
 import { Markdown } from "@/components/Markdown";
@@ -18,8 +25,11 @@ import { Input } from "@/components/ui/input";
 import {
   api,
   streamEnterpriseLocalWebChat,
+  type CronJob,
   type EnterpriseBuilderTraceItem,
   type EnterpriseLocalWebStatus,
+  type SkillInfo,
+  type ToolsetInfo,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -29,6 +39,8 @@ type LocalMessage = {
   content: string;
   trace?: EnterpriseBuilderTraceItem[];
 };
+
+type LocalView = "chat" | "skills" | "tools" | "cron";
 
 function defaultRemoteServer(): string {
   const params = new URLSearchParams(window.location.search);
@@ -45,6 +57,15 @@ export default function EnterpriseLocalPage() {
   const [manualCode, setManualCode] = useState("");
   const [input, setInput] = useState("");
   const [sessionId, setSessionId] = useState("");
+  const [view, setView] = useState<LocalView>("chat");
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [toolsets, setToolsets] = useState<ToolsetInfo[]>([]);
+  const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
+  const [panelLoading, setPanelLoading] = useState(false);
+  const [busyItem, setBusyItem] = useState<string | null>(null);
+  const [cronName, setCronName] = useState("");
+  const [cronPrompt, setCronPrompt] = useState("");
+  const [cronSchedule, setCronSchedule] = useState("");
   const [messages, setMessages] = useState<LocalMessage[]>([
     {
       id: "welcome",
@@ -72,6 +93,34 @@ export default function EnterpriseLocalPage() {
     if (callbackError) setError(callbackError);
     void loadStatus();
   }, []);
+
+  useEffect(() => {
+    if (view === "chat") return;
+    let cancelled = false;
+    setPanelLoading(true);
+    const load =
+      view === "skills"
+        ? api.getSkills().then((items) => {
+            if (!cancelled) setSkills(items || []);
+          })
+        : view === "tools"
+          ? api.getToolsets().then((items) => {
+              if (!cancelled) setToolsets(items || []);
+            })
+          : api.getCronJobs().then((items) => {
+              if (!cancelled) setCronJobs(items || []);
+            });
+    load
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setPanelLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [view]);
 
   async function loadStatus() {
     setLoading(true);
@@ -184,6 +233,67 @@ export default function EnterpriseLocalPage() {
       }));
     } finally {
       setSending(false);
+    }
+  }
+
+  async function toggleSkill(skill: SkillInfo) {
+    setBusyItem(`skill:${skill.name}`);
+    setError(null);
+    try {
+      await api.toggleSkill(skill.name, !skill.enabled);
+      setSkills((current) =>
+        current.map((item) =>
+          item.name === skill.name ? { ...item, enabled: !skill.enabled } : item,
+        ),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyItem(null);
+    }
+  }
+
+  async function refreshCronJobs() {
+    const jobs = await api.getCronJobs();
+    setCronJobs(jobs || []);
+  }
+
+  async function createCronJob(event: FormEvent) {
+    event.preventDefault();
+    if (!cronPrompt.trim() || !cronSchedule.trim()) return;
+    setBusyItem("cron:create");
+    setError(null);
+    try {
+      await api.createCronJob({
+        name: cronName.trim() || undefined,
+        prompt: cronPrompt.trim(),
+        schedule: cronSchedule.trim(),
+        deliver: "local",
+      });
+      setCronName("");
+      setCronPrompt("");
+      setCronSchedule("");
+      await refreshCronJobs();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyItem(null);
+    }
+  }
+
+  async function updateCronJob(job: CronJob, action: "pause" | "resume" | "trigger" | "delete") {
+    setBusyItem(`cron:${job.id}:${action}`);
+    setError(null);
+    try {
+      if (action === "pause") await api.pauseCronJob(job.id);
+      if (action === "resume") await api.resumeCronJob(job.id);
+      if (action === "trigger") await api.triggerCronJob(job.id);
+      if (action === "delete") await api.deleteCronJob(job.id);
+      await refreshCronJobs();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyItem(null);
     }
   }
 
@@ -306,13 +416,41 @@ export default function EnterpriseLocalPage() {
           <div className="shrink-0 border-b border-border px-4 py-3">
             <div className="flex items-center gap-2 font-mondwest text-sm uppercase text-midground">
               <Bot className="h-4 w-4" />
-              Local Chat
+              Local Workspace
             </div>
             <p className="mt-1 font-courier text-xs normal-case text-muted-foreground">
-              This chat runs against the local Hermes profile and can consult assigned remote business agents.
+              This workspace runs against the local Hermes profile.
             </p>
+            <nav className="mt-3 grid grid-cols-4 gap-2">
+              {[
+                { key: "chat" as const, label: "Chat", icon: Send },
+                { key: "skills" as const, label: "Skills", icon: Package },
+                { key: "tools" as const, label: "Tools", icon: Wrench },
+                { key: "cron" as const, label: "Cron", icon: Clock },
+              ].map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setView(item.key)}
+                    className={cn(
+                      "flex h-9 items-center justify-center gap-2 border px-2 font-courier text-xs normal-case transition-colors",
+                      view === item.key
+                        ? "border-midground bg-foreground/10 text-midground"
+                        : "border-border bg-background/40 text-muted-foreground hover:text-midground",
+                    )}
+                  >
+                    <Icon className="h-3.5 w-3.5" />
+                    {item.label}
+                  </button>
+                );
+              })}
+            </nav>
           </div>
 
+          {view === "chat" && (
+          <>
           <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-4">
             <div className="space-y-3">
               {messages.map((item, index) => (
@@ -363,9 +501,204 @@ export default function EnterpriseLocalPage() {
               </Button>
             </div>
           </form>
+          </>
+          )}
+
+          {view === "skills" && (
+            <PanelFrame loading={panelLoading} empty={!panelLoading && skills.length === 0} emptyText="No local skills found.">
+              {skills.map((skill) => (
+                <div key={skill.name} className="border border-border bg-background/40 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate font-mondwest text-sm uppercase text-midground">
+                        {skill.name}
+                      </div>
+                      <p className="mt-1 line-clamp-3 font-courier text-xs normal-case text-muted-foreground">
+                        {skill.description || skill.category || "Local skill"}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant={skill.enabled ? "outline" : "default"}
+                      size="sm"
+                      onClick={() => toggleSkill(skill)}
+                      disabled={busyItem === `skill:${skill.name}`}
+                    >
+                      {busyItem === `skill:${skill.name}` && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                      {skill.enabled ? "Disable" : "Enable"}
+                    </Button>
+                  </div>
+                  <div className="mt-2 font-courier text-xs normal-case text-muted-foreground">
+                    {skill.category || "uncategorized"} · {skill.source || "local"}
+                  </div>
+                </div>
+              ))}
+            </PanelFrame>
+          )}
+
+          {view === "tools" && (
+            <PanelFrame loading={panelLoading} empty={!panelLoading && toolsets.length === 0} emptyText="No local toolsets found.">
+              {toolsets.map((toolset) => (
+                <div key={toolset.name} className="border border-border bg-background/40 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate font-mondwest text-sm uppercase text-midground">
+                        {toolset.label || toolset.name}
+                      </div>
+                      <p className="mt-1 line-clamp-3 font-courier text-xs normal-case text-muted-foreground">
+                        {toolset.description || toolset.name}
+                      </p>
+                    </div>
+                    <span
+                      className={cn(
+                        "shrink-0 border px-2 py-1 font-courier text-xs normal-case",
+                        toolset.enabled
+                          ? "border-success/50 text-success"
+                          : "border-border text-muted-foreground",
+                      )}
+                    >
+                      {toolset.enabled ? "Enabled" : "Disabled"}
+                    </span>
+                  </div>
+                  <div className="mt-2 break-words font-courier text-xs normal-case text-muted-foreground">
+                    {(toolset.tools || []).slice(0, 16).join(", ") || "No tools"}
+                  </div>
+                </div>
+              ))}
+            </PanelFrame>
+          )}
+
+          {view === "cron" && (
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              <form onSubmit={createCronJob} className="grid gap-3 border-b border-border pb-4">
+                <Input
+                  value={cronName}
+                  onChange={(event) => setCronName(event.target.value)}
+                  placeholder="Job name"
+                  className="normal-case"
+                />
+                <textarea
+                  value={cronPrompt}
+                  onChange={(event) => setCronPrompt(event.target.value)}
+                  placeholder="What should the local agent do?"
+                  rows={3}
+                  className="w-full resize-none border border-border bg-background/40 px-3 py-2 font-courier text-sm normal-case placeholder:text-muted-foreground focus-visible:border-foreground/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30"
+                />
+                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                  <Input
+                    value={cronSchedule}
+                    onChange={(event) => setCronSchedule(event.target.value)}
+                    placeholder="Schedule, e.g. every day at 9am"
+                    className="normal-case"
+                  />
+                  <Button type="submit" disabled={busyItem === "cron:create" || !cronPrompt.trim() || !cronSchedule.trim()}>
+                    {busyItem === "cron:create" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+                    Create
+                  </Button>
+                </div>
+              </form>
+
+              {panelLoading && <PanelLoading />}
+              {!panelLoading && cronJobs.length === 0 && (
+                <div className="mt-4 font-courier text-xs normal-case text-muted-foreground">
+                  No local cron jobs.
+                </div>
+              )}
+              <div className="mt-4 space-y-3">
+                {cronJobs.map((job) => {
+                  const isPaused = job.state === "paused";
+                  return (
+                    <div key={job.id} className="border border-border bg-background/40 p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate font-mondwest text-sm uppercase text-midground">
+                            {job.name || job.prompt.slice(0, 64)}
+                          </div>
+                          <p className="mt-1 line-clamp-2 font-courier text-xs normal-case text-muted-foreground">
+                            {job.prompt}
+                          </p>
+                        </div>
+                        <span className="shrink-0 border border-border px-2 py-1 font-courier text-xs normal-case text-muted-foreground">
+                          {job.state}
+                        </span>
+                      </div>
+                      <div className="mt-2 font-courier text-xs normal-case text-muted-foreground">
+                        {job.schedule_display || job.schedule?.display || "No schedule"} · Next {job.next_run_at || "-"}
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => updateCronJob(job, isPaused ? "resume" : "pause")}
+                          disabled={busyItem?.startsWith(`cron:${job.id}:`)}
+                        >
+                          {isPaused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
+                          {isPaused ? "Resume" : "Pause"}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => updateCronJob(job, "trigger")}
+                          disabled={busyItem?.startsWith(`cron:${job.id}:`)}
+                        >
+                          <Play className="h-3.5 w-3.5" />
+                          Run
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => updateCronJob(job, "delete")}
+                          disabled={busyItem?.startsWith(`cron:${job.id}:`)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          Delete
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </section>
       </section>
     </main>
+  );
+}
+
+function PanelFrame({
+  loading,
+  empty,
+  emptyText,
+  children,
+}: {
+  loading: boolean;
+  empty: boolean;
+  emptyText: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto p-4">
+      {loading && <PanelLoading />}
+      {empty && (
+        <div className="font-courier text-xs normal-case text-muted-foreground">
+          {emptyText}
+        </div>
+      )}
+      <div className="space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function PanelLoading() {
+  return (
+    <div className="flex items-center gap-2 font-courier text-xs normal-case text-muted-foreground">
+      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      Loading
+    </div>
   );
 }
 
