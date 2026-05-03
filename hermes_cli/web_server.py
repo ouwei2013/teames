@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
 import subprocess
 import sys
@@ -1284,6 +1285,10 @@ def _enterprise_admin_builder_prompt(tenant: Dict[str, Any], admin_user: Dict[st
         "You have access to native default skills through skills_list and skill_view, "
         "the enterprise_builder tool for controlled enterprise mutations, and the "
         "enterprise_local_bridge tool for requesting help from user-owned local agents. "
+        "For scheduled reports from local agents, use enterprise_local_bridge "
+        "create_report_plan/list_report_plans/trigger_report_plan instead of the "
+        "generic cronjob tool so the plan is tied to the local device and appears "
+        "in the admin Reports module. "
         "Use these controlled tools instead of editing the enterprise database directly.\n\n"
         f"Tenant: {tenant.get('name') or tenant.get('id')} ({tenant.get('id')})\n"
         f"Admin user: {admin_user.get('email') or admin_user.get('name') or admin_user.get('id')} ({admin_user.get('id')})\n\n"
@@ -1294,9 +1299,12 @@ def _enterprise_admin_builder_prompt(tenant: Dict[str, Any], admin_user: Dict[st
         "and send local-agent collaboration requests only after the admin explicitly "
         "approves the specific draft. When you call a mutating enterprise_builder or "
         "enterprise_local_bridge action after approval, set confirmed_by_admin=true. "
+        "If the admin explicitly asks to set a recurring local-agent report, treat "
+        "the requested target, schedule, and report text as approval once you have "
+        "resolved the correct device. "
         "When credentials, schema details, or safety boundaries are missing, ask focused "
         "follow-up questions before creating executable data-fetch scripts. Never say a "
-        "change was applied unless enterprise_builder returned success."
+        "change was applied unless the controlled enterprise tool returned success."
     )
     return "\n\n".join(part for part in (base, playbook) if part)
 
@@ -1823,6 +1831,24 @@ def _enterprise_local_report_script_path(plan_id: str) -> Path:
     return get_hermes_home() / "scripts" / "enterprise_local_reports" / f"{plan_id}.py"
 
 
+def _normalize_enterprise_local_report_schedule(schedule: str) -> str:
+    text = str(schedule or "").strip()
+    if not text:
+        raise ValueError("schedule is required")
+    normalized = text.replace("：", ":")
+    daily_match = re.search(r"(?:(?:每天|每日|daily|every day)\s*)?(\d{1,2})\s*:\s*(\d{2})", normalized, re.I)
+    if daily_match and (
+        any(token in normalized.lower() for token in ("每天", "每日", "daily", "every day"))
+        or normalized == daily_match.group(0)
+    ):
+        hour = int(daily_match.group(1))
+        minute = int(daily_match.group(2))
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError("daily report time must be a valid HH:MM time")
+        return f"{minute} {hour} * * *"
+    return text
+
+
 def _write_enterprise_local_report_script(plan_id: str, device_id: str, request_text: str) -> str:
     script_path = _enterprise_local_report_script_path(plan_id)
     script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1885,7 +1911,7 @@ async def enterprise_create_local_report_plan(body: EnterpriseLocalReportPlanCre
             )
             job = create_job(
                 prompt="[SILENT]",
-                schedule=body.schedule.strip(),
+                schedule=_normalize_enterprise_local_report_schedule(body.schedule),
                 name=(body.name or "").strip() or f"Local report: {device.get('name') or body.device_id}",
                 deliver="local",
                 script=script,
