@@ -1,20 +1,23 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import {
   Bot,
+  CalendarClock,
   Check,
   Copy,
-	  KeyRound,
-	  Laptop,
-	  Loader2,
-	  MessageSquare,
+  KeyRound,
+  Laptop,
+  Loader2,
+  MessageSquare,
   Package,
-	  RefreshCw,
+  RefreshCw,
+  Send,
   ShieldCheck,
   Ticket,
   UserPlus,
   UsersRound,
 } from "lucide-react";
 import { Typography } from "@nous-research/ui";
+import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,19 +33,29 @@ import { Toast } from "@/components/Toast";
 import { useToast } from "@/hooks/useToast";
 import {
   api,
+  streamEnterpriseBuilderChat,
   type EnterpriseAgent,
   type EnterpriseAgentPayload,
-	  type EnterpriseInvite,
-	  type EnterpriseInviteCreated,
-	  type EnterpriseLocalDevice,
-	  type EnterpriseLocalRequest,
-	  type EnterpriseStatusResponse,
+  type EnterpriseBuilderTraceItem,
+  type EnterpriseInvite,
+  type EnterpriseInviteCreated,
+  type EnterpriseLocalDevice,
+  type EnterpriseLocalReportPlan,
+  type EnterpriseLocalRequest,
+  type EnterpriseStatusResponse,
   type EnterpriseUser,
   type SkillInfo,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type InviteRole = "member" | "admin";
+
+type AdminChatMessage = {
+  id: string;
+  role: "admin" | "assistant";
+  content: string;
+  trace?: EnterpriseBuilderTraceItem[];
+};
 
 function formatDate(value?: number | null): string {
   if (!value) return "Never";
@@ -80,6 +93,7 @@ export default function EnterpriseAdminPage() {
   const [invites, setInvites] = useState<EnterpriseInvite[]>([]);
   const [localDevices, setLocalDevices] = useState<EnterpriseLocalDevice[]>([]);
   const [localRequests, setLocalRequests] = useState<EnterpriseLocalRequest[]>([]);
+  const [localReportPlans, setLocalReportPlans] = useState<EnterpriseLocalReportPlan[]>([]);
   const [skillCatalog, setSkillCatalog] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingInit, setSavingInit] = useState(false);
@@ -103,6 +117,23 @@ export default function EnterpriseAdminPage() {
   const [selectedLocalDeviceId, setSelectedLocalDeviceId] = useState("");
   const [localRequestText, setLocalRequestText] = useState("");
   const [sendingLocalRequest, setSendingLocalRequest] = useState(false);
+  const [reportPlanName, setReportPlanName] = useState("");
+  const [reportPlanSchedule, setReportPlanSchedule] = useState("");
+  const [reportPlanRequest, setReportPlanRequest] = useState("");
+  const [creatingReportPlan, setCreatingReportPlan] = useState(false);
+  const [selectedRequestId, setSelectedRequestId] = useState("");
+  const [adminChatInput, setAdminChatInput] = useState("");
+  const [adminChatSessionId, setAdminChatSessionId] = useState("");
+  const [adminChatSending, setAdminChatSending] = useState(false);
+  const [adminChatMessages, setAdminChatMessages] = useState<AdminChatMessage[]>([
+    {
+      id: "welcome",
+      role: "assistant",
+      content:
+        "I can help manage enterprise agents and communicate with connected local agents through controlled bridge requests.",
+      trace: [],
+    },
+  ]);
   const [catalogAgentId, setCatalogAgentId] = useState("");
   const [loadingCatalog, setLoadingCatalog] = useState(false);
   const [busyCatalogSkill, setBusyCatalogSkill] = useState("");
@@ -124,6 +155,10 @@ export default function EnterpriseAdminPage() {
     if (!latestInvite?.code) return "";
     return `${window.location.origin}/accept-invite?code=${encodeURIComponent(latestInvite.code)}`;
   }, [latestInvite]);
+  const selectedLocalRequest = useMemo(
+    () => localRequests.find((item) => item.id === selectedRequestId) || localRequests[0],
+    [localRequests, selectedRequestId],
+  );
 
   async function loadEnterprise() {
     setLoading(true);
@@ -134,12 +169,13 @@ export default function EnterpriseAdminPage() {
       setUsers(nextStatus.users || []);
       setAgents(nextStatus.agents || []);
       if (nextStatus.initialized) {
-        const [userResult, agentResult, inviteResult, deviceResult, requestResult] = await Promise.all([
+        const [userResult, agentResult, inviteResult, deviceResult, requestResult, reportPlanResult] = await Promise.all([
           api.getEnterpriseUsers(),
           api.getEnterpriseAgents(),
           api.getEnterpriseInvites(),
           api.getEnterpriseLocalDevices(),
           api.getEnterpriseLocalRequests(),
+          api.getEnterpriseLocalReportPlans(),
         ]);
         setUsers(userResult.users || []);
         setAgents(agentResult.agents || []);
@@ -157,6 +193,7 @@ export default function EnterpriseAdminPage() {
         setInvites(inviteResult.invites || []);
         setLocalDevices(deviceResult.devices || []);
         setLocalRequests(requestResult.requests || []);
+        setLocalReportPlans(reportPlanResult.plans || []);
         setSelectedLocalDeviceId((current) => {
           if (current && (deviceResult.devices || []).some((device) => device.id === current)) {
             return current;
@@ -170,6 +207,7 @@ export default function EnterpriseAdminPage() {
         setInvites([]);
         setLocalDevices([]);
         setLocalRequests([]);
+        setLocalReportPlans([]);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -408,6 +446,120 @@ export default function EnterpriseAdminPage() {
     }
   }
 
+  async function refreshReportPlans() {
+    setError(null);
+    try {
+      const result = await api.getEnterpriseLocalReportPlans();
+      setLocalReportPlans(result.plans || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("Report plan refresh failed", "error");
+    }
+  }
+
+  function updateAdminChatMessage(id: string, updater: (message: AdminChatMessage) => AdminChatMessage) {
+    setAdminChatMessages((current) => current.map((item) => (item.id === id ? updater(item) : item)));
+  }
+
+  async function sendAdminChat(event: FormEvent) {
+    event.preventDefault();
+    const message = adminChatInput.trim();
+    if (!message || adminChatSending) return;
+    const adminId = `admin-${Date.now()}`;
+    const assistantId = `assistant-${Date.now()}`;
+    setAdminChatInput("");
+    setAdminChatSending(true);
+    setError(null);
+    setAdminChatMessages((current) => [
+      ...current,
+      { id: adminId, role: "admin", content: message },
+      { id: assistantId, role: "assistant", content: "", trace: [] },
+    ]);
+    try {
+      await streamEnterpriseBuilderChat(
+        { message, session_id: adminChatSessionId || undefined },
+        {
+          onDelta: (delta) => {
+            updateAdminChatMessage(assistantId, (item) => ({
+              ...item,
+              content: `${item.content}${delta}`,
+            }));
+          },
+          onTrace: (trace) => {
+            updateAdminChatMessage(assistantId, (item) => ({
+              ...item,
+              trace: [...(item.trace || []), trace],
+            }));
+          },
+          onFinal: (result) => {
+            setAdminChatSessionId(result.session_id);
+            updateAdminChatMessage(assistantId, (item) => ({
+              ...item,
+              content: result.final_response || item.content || "Done.",
+              trace: result.trace || item.trace || [],
+            }));
+            void refreshLocalRequests();
+            void refreshReportPlans();
+          },
+          onError: (detail) => {
+            setError(detail);
+            updateAdminChatMessage(assistantId, (item) => ({
+              ...item,
+              content: item.content || `Admin agent failed: ${detail}`,
+            }));
+          },
+        },
+      );
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      setError(detail);
+      updateAdminChatMessage(assistantId, (item) => ({
+        ...item,
+        content: item.content || `Admin agent failed: ${detail}`,
+      }));
+    } finally {
+      setAdminChatSending(false);
+    }
+  }
+
+  async function createReportPlan(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedLocalDeviceId || !reportPlanRequest.trim() || !reportPlanSchedule.trim()) return;
+    setCreatingReportPlan(true);
+    setError(null);
+    try {
+      const result = await api.createEnterpriseLocalReportPlan({
+        device_id: selectedLocalDeviceId,
+        request: reportPlanRequest.trim(),
+        schedule: reportPlanSchedule.trim(),
+        name: reportPlanName.trim() || undefined,
+      });
+      setLocalReportPlans((current) => [result.plan, ...current]);
+      setReportPlanName("");
+      setReportPlanSchedule("");
+      setReportPlanRequest("");
+      showToast("Report plan created", "success");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("Report plan failed", "error");
+    } finally {
+      setCreatingReportPlan(false);
+    }
+  }
+
+  async function triggerReportPlan(plan: EnterpriseLocalReportPlan) {
+    setError(null);
+    try {
+      const result = await api.triggerEnterpriseLocalReportPlan(plan.id);
+      setLocalRequests((current) => [result.request, ...current]);
+      setSelectedRequestId(result.request.id);
+      showToast("Report request sent", "success");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("Report trigger failed", "error");
+    }
+  }
+
   return (
     <main className="mx-auto flex w-full max-w-7xl flex-col gap-4 text-midground">
       <Toast toast={toast} />
@@ -576,6 +728,179 @@ export default function EnterpriseAdminPage() {
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
+                <CalendarClock className="h-4 w-4" />
+                Reports
+              </CardTitle>
+              <CardDescription className="normal-case">
+                Chat with the admin agent, send ad-hoc local-agent requests, and schedule recurring local reports.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]">
+              <section className="flex min-h-[460px] flex-col border border-border bg-background/30">
+                <div className="border-b border-border px-3 py-2 font-courier text-xs normal-case text-muted-foreground">
+                  Admin Agent Chat
+                </div>
+                <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+                  {adminChatMessages.map((item) => (
+                    <div
+                      key={item.id}
+                      className={cn(
+                        "max-w-[92%] border border-border px-3 py-2 font-courier text-sm normal-case",
+                        item.role === "admin"
+                          ? "ml-auto bg-foreground/10 text-midground"
+                          : "bg-card/60 text-muted-foreground",
+                      )}
+                    >
+                      <div className="mb-1 text-[11px] uppercase tracking-normal text-muted-foreground">
+                        {item.role === "admin" ? "Admin" : "Admin Agent"}
+                      </div>
+                      {item.trace && item.trace.length > 0 && <AdminTraceList trace={item.trace} />}
+                      {item.content && (
+                        <div className={cn("break-words", item.trace?.length ? "mt-3" : "")}>
+                          <Markdown content={item.content} streaming={adminChatSending && item.role === "assistant"} />
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {adminChatSending && (
+                    <div className="flex items-center gap-2 font-courier text-xs normal-case text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Admin agent is working
+                    </div>
+                  )}
+                </div>
+                <form onSubmit={sendAdminChat} className="grid gap-2 border-t border-border p-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                  <textarea
+                    value={adminChatInput}
+                    onChange={(event) => setAdminChatInput(event.target.value)}
+                    rows={3}
+                    placeholder="Ask the admin agent to contact a local agent or inspect report results..."
+                    className="w-full resize-none border border-border bg-background/40 px-3 py-2 font-courier text-sm normal-case placeholder:text-muted-foreground focus-visible:border-foreground/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30"
+                  />
+                  <div className="flex items-end">
+                    <Button type="submit" disabled={adminChatSending || !adminChatInput.trim()}>
+                      {adminChatSending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                      Send
+                    </Button>
+                  </div>
+                </form>
+              </section>
+
+              <section className="space-y-4">
+                <form onSubmit={sendLocalRequest} className="space-y-3 border border-border bg-background/30 p-3">
+                  <div className="flex items-center gap-2 font-mondwest text-sm uppercase text-midground">
+                    <MessageSquare className="h-4 w-4" />
+                    Ad-hoc Local Request
+                  </div>
+                  <label className="block">
+                    <span className="mb-1 block font-courier text-xs normal-case text-muted-foreground">Device</span>
+                    <Select value={selectedLocalDeviceId} onValueChange={setSelectedLocalDeviceId}>
+                      {localDevices.map((device) => (
+                        <SelectOption key={device.id} value={device.id}>
+                          {(device.user_name || device.user_email || device.id) + " / " + (device.name || "Local Agent")}
+                        </SelectOption>
+                      ))}
+                    </Select>
+                  </label>
+                  <textarea
+                    value={localRequestText}
+                    onChange={(event) => setLocalRequestText(event.target.value)}
+                    rows={3}
+                    placeholder="Ask the local agent to summarize or verify something locally."
+                    className="w-full resize-none border border-border bg-background/40 px-3 py-2 font-courier text-sm normal-case placeholder:text-muted-foreground focus-visible:border-foreground/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30"
+                  />
+                  <Button
+                    type="submit"
+                    disabled={sendingLocalRequest || !selectedLocalDeviceId || !localRequestText.trim()}
+                  >
+                    {sendingLocalRequest ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                    Send Request
+                  </Button>
+                </form>
+
+                <form onSubmit={createReportPlan} className="space-y-3 border border-border bg-background/30 p-3">
+                  <div className="flex items-center gap-2 font-mondwest text-sm uppercase text-midground">
+                    <CalendarClock className="h-4 w-4" />
+                    Schedule Local Report
+                  </div>
+                  <label className="block">
+                    <span className="mb-1 block font-courier text-xs normal-case text-muted-foreground">Device</span>
+                    <Select value={selectedLocalDeviceId} onValueChange={setSelectedLocalDeviceId}>
+                      {localDevices.map((device) => (
+                        <SelectOption key={device.id} value={device.id}>
+                          {(device.user_name || device.user_email || device.id) + " / " + (device.name || "Local Agent")}
+                        </SelectOption>
+                      ))}
+                    </Select>
+                  </label>
+                  <Input
+                    value={reportPlanName}
+                    onChange={(event) => setReportPlanName(event.target.value)}
+                    placeholder="Plan name"
+                    className="normal-case"
+                  />
+                  <Input
+                    value={reportPlanSchedule}
+                    onChange={(event) => setReportPlanSchedule(event.target.value)}
+                    placeholder="Schedule, e.g. every 1d or 0 18 * * *"
+                    className="normal-case"
+                  />
+                  <textarea
+                    value={reportPlanRequest}
+                    onChange={(event) => setReportPlanRequest(event.target.value)}
+                    rows={3}
+                    placeholder="What should the local agent report?"
+                    className="w-full resize-none border border-border bg-background/40 px-3 py-2 font-courier text-sm normal-case placeholder:text-muted-foreground focus-visible:border-foreground/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30"
+                  />
+                  <Button
+                    type="submit"
+                    disabled={creatingReportPlan || !selectedLocalDeviceId || !reportPlanSchedule.trim() || !reportPlanRequest.trim()}
+                  >
+                    {creatingReportPlan ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CalendarClock className="h-3.5 w-3.5" />}
+                    Create Plan
+                  </Button>
+                </form>
+
+                <div className="border border-border bg-background/30">
+                  <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+                    <span className="font-courier text-xs normal-case text-muted-foreground">Communication Plans</span>
+                    <Button type="button" variant="outline" size="sm" onClick={refreshReportPlans}>
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Refresh
+                    </Button>
+                  </div>
+                  <div className="max-h-56 overflow-y-auto">
+                    {localReportPlans.map((plan) => (
+                      <div key={plan.id} className="border-b border-border/60 px-3 py-3 font-courier text-xs normal-case">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="truncate text-midground">{plan.name || plan.id}</div>
+                            <div className="mt-1 text-muted-foreground">
+                              {plan.device_name || plan.device_id || "Local agent"} · {plan.schedule_display || plan.schedule?.display || "-"}
+                            </div>
+                          </div>
+                          <Button type="button" variant="outline" size="sm" onClick={() => triggerReportPlan(plan)}>
+                            <Send className="h-3.5 w-3.5" />
+                            Run
+                          </Button>
+                        </div>
+                        <p className="mt-2 line-clamp-2 text-muted-foreground">{plan.request}</p>
+                      </div>
+                    ))}
+                    {localReportPlans.length === 0 && (
+                      <div className="px-3 py-6 font-courier text-xs normal-case text-muted-foreground">
+                        No report plans yet.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </section>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
                 <Laptop className="h-4 w-4" />
                 Local Agent Bridge
               </CardTitle>
@@ -664,7 +989,15 @@ export default function EnterpriseAdminPage() {
                   </div>
                   <div className="max-h-64 overflow-y-auto">
                     {localRequests.slice(0, 12).map((item) => (
-                      <div key={item.id} className="border-b border-border/60 px-3 py-3 font-courier text-xs normal-case">
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setSelectedRequestId(item.id)}
+                        className={cn(
+                          "block w-full border-b border-border/60 px-3 py-3 text-left font-courier text-xs normal-case",
+                          selectedLocalRequest?.id === item.id ? "bg-foreground/10" : "hover:bg-foreground/5",
+                        )}
+                      >
                         <div className="flex items-center justify-between gap-2">
                           <span className="truncate text-midground">{item.device_name || item.device_id}</span>
                           <Badge variant={item.status === "responded" ? "success" : item.status === "rejected" ? "warning" : "outline"}>{item.status}</Badge>
@@ -673,7 +1006,7 @@ export default function EnterpriseAdminPage() {
                         {item.response && (
                           <p className="mt-2 line-clamp-3 whitespace-pre-wrap text-midground">{item.response}</p>
                         )}
-                      </div>
+                      </button>
                     ))}
                     {localRequests.length === 0 && (
                       <div className="px-3 py-6 font-courier text-xs normal-case text-muted-foreground">
@@ -683,6 +1016,29 @@ export default function EnterpriseAdminPage() {
                   </div>
                 </div>
               </div>
+              {selectedLocalRequest && (
+                <div className="mt-4 border border-border bg-background/30 p-3 font-courier text-xs normal-case">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="truncate text-midground">
+                        {selectedLocalRequest.device_name || selectedLocalRequest.device_id}
+                      </div>
+                      <div className="mt-1 text-muted-foreground">
+                        {formatDate(selectedLocalRequest.created_at)} · {selectedLocalRequest.agent_name || selectedLocalRequest.agent_id}
+                      </div>
+                    </div>
+                    <Badge variant={selectedLocalRequest.status === "responded" ? "success" : selectedLocalRequest.status === "rejected" ? "warning" : "outline"}>
+                      {selectedLocalRequest.status}
+                    </Badge>
+                  </div>
+                  <div className="mt-3 whitespace-pre-wrap text-midground">{selectedLocalRequest.request}</div>
+                  {selectedLocalRequest.response && (
+                    <div className="mt-3 border-t border-border/70 pt-3 text-muted-foreground">
+                      <Markdown content={selectedLocalRequest.response} />
+                    </div>
+                  )}
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -1208,6 +1564,24 @@ function OneTimeSecret({
       <code className="block overflow-x-auto whitespace-nowrap border border-border bg-black/30 px-2 py-2 font-courier text-xs normal-case text-midground">
         {value}
       </code>
+    </div>
+  );
+}
+
+function AdminTraceList({ trace }: { trace: EnterpriseBuilderTraceItem[] }) {
+  return (
+    <div className="mt-2 border-t border-border/70 pt-2">
+      <div className="mb-1 font-courier text-[11px] uppercase tracking-normal text-muted-foreground">
+        Activity
+      </div>
+      <div className="space-y-1">
+        {trace.slice(-8).map((item, index) => (
+          <div key={`${item.title}-${index}`} className="font-courier text-xs normal-case">
+            <span className="text-midground">{item.title}</span>
+            {item.detail && <span className="text-muted-foreground"> · {item.detail}</span>}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

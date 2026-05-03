@@ -664,6 +664,24 @@ export const api = {
     const qs = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : "";
     return fetchJSON<{ requests: EnterpriseLocalRequest[] }>(`/api/enterprise/local-requests${qs}`);
   },
+  getEnterpriseLocalReportPlans: () =>
+    fetchJSON<{ plans: EnterpriseLocalReportPlan[] }>("/api/enterprise/local-report-plans"),
+  createEnterpriseLocalReportPlan: (payload: {
+    device_id: string;
+    request: string;
+    schedule: string;
+    name?: string;
+  }) =>
+    fetchJSON<{ plan: EnterpriseLocalReportPlan }>("/api/enterprise/local-report-plans", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  triggerEnterpriseLocalReportPlan: (jobId: string) =>
+    fetchJSON<{ request: EnterpriseLocalRequest; plan: EnterpriseLocalReportPlan }>(
+      `/api/enterprise/local-report-plans/${encodeURIComponent(jobId)}/trigger`,
+      { method: "POST" },
+    ),
   getEnterpriseLocalWebStatus: () =>
     fetchJSON<EnterpriseLocalWebStatus>("/api/enterprise/local-web/status"),
   createEnterpriseLocalWebConnectUrl: (payload: { server: string; name?: string }) =>
@@ -870,6 +888,25 @@ export interface EnterpriseLocalRequest {
   user_email?: string | null;
   user_name?: string | null;
   agent_name?: string | null;
+}
+
+export interface EnterpriseLocalReportPlan extends CronJob {
+  device_id?: string | null;
+  request?: string | null;
+  device_name?: string | null;
+  user_email?: string | null;
+  user_name?: string | null;
+  agent_name?: string | null;
+  latest_output?: string | null;
+  enterprise_local_report?: {
+    plan_id?: string;
+    device_id?: string;
+    request?: string;
+    device_name?: string | null;
+    user_email?: string | null;
+    user_name?: string | null;
+    agent_name?: string | null;
+  };
 }
 
 export interface EnterpriseLocalWebStatus {

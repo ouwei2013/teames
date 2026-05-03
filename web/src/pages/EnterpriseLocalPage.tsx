@@ -87,6 +87,7 @@ export default function EnterpriseLocalPage() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const autoAnsweringRef = useRef<Set<string>>(new Set());
   const joined = Boolean(status?.joined);
 
   useEffect(() => {
@@ -149,6 +150,49 @@ export default function EnterpriseLocalPage() {
       window.clearInterval(timer);
     };
   }, [view, joined]);
+
+  useEffect(() => {
+    if (!joined) return;
+    let cancelled = false;
+
+    async function pollAndAnswer() {
+      try {
+        const result = await api.getEnterpriseLocalWebRequests(20);
+        const requests = result.requests || [];
+        if (!cancelled) setLocalRequests(requests);
+        for (const request of requests) {
+          const canAnswer =
+            (request.status === "pending" || request.status === "delivered") &&
+            !request.response;
+          if (!canAnswer || autoAnsweringRef.current.has(request.id)) continue;
+          autoAnsweringRef.current.add(request.id);
+          api
+            .answerEnterpriseLocalWebRequest(request.id)
+            .then((answered) => {
+              if (cancelled) return;
+              setLocalRequests((current) =>
+                current.map((item) => (item.id === request.id ? answered.request : item)),
+              );
+            })
+            .catch((err) => {
+              if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+            })
+            .finally(() => {
+              autoAnsweringRef.current.delete(request.id);
+            });
+        }
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    void pollAndAnswer();
+    const timer = window.setInterval(pollAndAnswer, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [joined]);
 
   async function loadStatus() {
     setLoading(true);

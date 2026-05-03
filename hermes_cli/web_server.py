@@ -556,6 +556,13 @@ class EnterpriseLocalRequestCreate(BaseModel):
     request: str
 
 
+class EnterpriseLocalReportPlanCreate(BaseModel):
+    device_id: str
+    request: str
+    schedule: str
+    name: Optional[str] = None
+
+
 class EnterpriseLocalRequestResponse(BaseModel):
     response: str
     status: str = "responded"
@@ -1794,6 +1801,146 @@ async def enterprise_local_requests(device_id: Optional[str] = None):
     except Exception:
         _log.exception("GET /api/enterprise/local-requests failed")
         raise HTTPException(status_code=500, detail="Enterprise local requests failed")
+
+
+def _enterprise_local_report_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(job)
+    meta = payload.get("enterprise_local_report")
+    if isinstance(meta, dict):
+        payload["device_id"] = meta.get("device_id")
+        payload["request"] = meta.get("request")
+        payload["device_name"] = meta.get("device_name")
+        payload["user_email"] = meta.get("user_email")
+        payload["user_name"] = meta.get("user_name")
+        payload["agent_name"] = meta.get("agent_name")
+    latest_output = _latest_cron_output(str(payload.get("id") or ""))
+    if latest_output:
+        payload["latest_output"] = latest_output
+    return payload
+
+
+def _enterprise_local_report_script_path(plan_id: str) -> Path:
+    return get_hermes_home() / "scripts" / "enterprise_local_reports" / f"{plan_id}.py"
+
+
+def _write_enterprise_local_report_script(plan_id: str, device_id: str, request_text: str) -> str:
+    script_path = _enterprise_local_report_script_path(plan_id)
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        "import json\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(PROJECT_ROOT)!r})\n"
+        "from enterprise import EnterpriseStore\n\n"
+        "store = EnterpriseStore()\n"
+        "try:\n"
+        f"    item = store.create_local_agent_request(device_id={device_id!r}, request={request_text!r})\n"
+        "    print(json.dumps({'created_request_id': item.get('id'), 'wakeAgent': False}, ensure_ascii=False))\n"
+        "finally:\n"
+        "    store.close()\n"
+    )
+    script_path.write_text(content, encoding="utf-8")
+    try:
+        script_path.chmod(0o700)
+    except OSError:
+        pass
+    return str(script_path.relative_to(get_hermes_home() / "scripts"))
+
+
+def _is_enterprise_local_report_job(job: Dict[str, Any]) -> bool:
+    return isinstance(job.get("enterprise_local_report"), dict)
+
+
+@app.get("/api/enterprise/local-report-plans")
+async def enterprise_local_report_plans():
+    try:
+        from cron.jobs import list_jobs
+
+        plans = [
+            _enterprise_local_report_job_payload(job)
+            for job in list_jobs(include_disabled=True)
+            if _is_enterprise_local_report_job(job)
+        ]
+        return {"plans": plans}
+    except Exception:
+        _log.exception("GET /api/enterprise/local-report-plans failed")
+        raise HTTPException(status_code=500, detail="Enterprise local report plans failed")
+
+
+@app.post("/api/enterprise/local-report-plans")
+async def enterprise_create_local_report_plan(body: EnterpriseLocalReportPlanCreate):
+    try:
+        from cron.jobs import create_job, update_job
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            device = store.get_local_device(body.device_id)
+            if not device or device.get("revoked_at") is not None or device.get("status") != "active":
+                raise ValueError("local device not found or inactive")
+            plan_id = "lrpt_" + secrets.token_hex(6)
+            script = _write_enterprise_local_report_script(
+                plan_id,
+                body.device_id,
+                body.request.strip(),
+            )
+            job = create_job(
+                prompt="[SILENT]",
+                schedule=body.schedule.strip(),
+                name=(body.name or "").strip() or f"Local report: {device.get('name') or body.device_id}",
+                deliver="local",
+                script=script,
+                origin={"platform": "enterprise_local_report", "chat_id": body.device_id},
+            )
+            updated = update_job(
+                job["id"],
+                {
+                    "enterprise_local_report": {
+                        "plan_id": plan_id,
+                        "device_id": body.device_id,
+                        "request": body.request.strip(),
+                        "device_name": device.get("name"),
+                        "user_email": device.get("user_email"),
+                        "user_name": device.get("user_name"),
+                        "agent_name": device.get("agent_name"),
+                    }
+                },
+            )
+            return {"plan": _enterprise_local_report_job_payload(updated or job)}
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _log.exception("POST /api/enterprise/local-report-plans failed")
+        raise HTTPException(status_code=500, detail=f"Enterprise local report plan failed: {exc}")
+
+
+@app.post("/api/enterprise/local-report-plans/{job_id}/trigger")
+async def enterprise_trigger_local_report_plan(job_id: str):
+    try:
+        from cron.jobs import get_job
+        from enterprise import EnterpriseStore
+
+        job = get_job(job_id)
+        if not job or not _is_enterprise_local_report_job(job):
+            raise HTTPException(status_code=404, detail="Plan not found")
+        meta = job.get("enterprise_local_report") or {}
+        store = EnterpriseStore()
+        try:
+            item = store.create_local_agent_request(
+                device_id=str(meta.get("device_id") or ""),
+                request=str(meta.get("request") or ""),
+            )
+            return {"request": item, "plan": _enterprise_local_report_job_payload(job)}
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _log.exception("POST /api/enterprise/local-report-plans/%s/trigger failed", job_id)
+        raise HTTPException(status_code=500, detail=f"Enterprise local report trigger failed: {exc}")
 
 
 @app.post("/api/enterprise/local-agent/register")
