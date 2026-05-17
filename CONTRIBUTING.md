@@ -175,6 +175,7 @@ hermes-agent/
 ├── optional-skills/          # Official optional skills (discoverable via hub, not activated by default)
 ├── environments/             # RL training environments (Atropos integration)
 ├── tests/                    # Test suite
+├── docs/                     # Archived release notes, design plans, project notes
 ├── website/                  # Documentation site (hermes-agent.nousresearch.com)
 │
 ├── cli-config.yaml.example   # Example configuration (copied to ~/.hermes/config.yaml)
