@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/teames-logo-wide.png" alt="Teames" width="720">
+  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/teames-logo-wide.png" alt="Teames" width="720">
 </p>
 
 <h1 align="center">Teames</h1>
