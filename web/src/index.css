@@ -36,7 +36,7 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Hermes Agent — Nous DS with the LENS_0 (Hermes teal) lens applied   */
+/* Teames — Nous DS compatibility tokens with the business shell  */
 /* statically. Mirrors nousnet-web/(hermes-agent)/layout.tsx so the    */
 /* canonical Hermes palette is the default — teal canvas + cream      */
 /* accent — without relying on leva/gsap at runtime.                  */
@@ -44,7 +44,8 @@
 
 :root {
   /* LENS_0 — from design-language/src/ui/components/overlays/index.tsx.
-     These are the defaults for the `default` (Hermes Teal) dashboard theme;
+     These are compatibility defaults; the business shell overrides them
+     for the default Teames Light dashboard theme;
      ThemeProvider rewrites them as inline styles when a user switches themes. */
   --foreground: color-mix(in srgb, #ffffff 0%, transparent);
   --foreground-base: #ffffff;
@@ -202,6 +203,143 @@ code { font-size: 0.875rem; }
   font-family: var(--theme-font-mono);
 }
 
+/* Business-facing enterprise pages use a quieter SaaS surface than the
+   local-agent dashboard chrome. Scope these tokens so the terminal/TUI and
+   personal dashboard can keep their original theme. */
+.enterprise-shell {
+  --background-base: #f8f8f4;
+  --background: #f8f8f4;
+  --midground-base: #1f2937;
+  --midground: #1f2937;
+  --foreground-base: #1f2937;
+  --foreground: #1f2937;
+  --warm-glow: rgba(245, 185, 49, 0.16);
+  --noise-opacity-mul: 0;
+  --color-foreground: #1f2937;
+  --color-card: #ffffff;
+  --color-card-foreground: #1f2937;
+  --color-primary: #1f2937;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #f1f3ed;
+  --color-secondary-foreground: #1f2937;
+  --color-muted: #f1f3ed;
+  --color-muted-foreground: #667085;
+  --color-accent: #fff7df;
+  --color-accent-foreground: #1f2937;
+  --color-border: #e0e4dc;
+  --color-input: #e0e4dc;
+  --color-ring: #1f2937;
+  --color-popover: #ffffff;
+  --color-popover-foreground: #1f2937;
+  --theme-radius: 0.5rem;
+  --component-card-background: rgba(255, 255, 255, 0.72);
+  --component-card-box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03), 0 16px 44px rgba(16, 24, 40, 0.05);
+  --component-sidebar-background: rgba(255, 255, 255, 0.64);
+  --component-header-background: rgba(255, 255, 255, 0.62);
+  --component-sidebar-border-image: none;
+  --component-header-border-image: none;
+  --component-sidebar-clip-path: none;
+  --component-header-clip-path: none;
+  --component-tab-clip-path: none;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(245, 185, 49, 0.14), transparent 26rem),
+    linear-gradient(180deg, #fbfbf8 0%, #f6f7f2 54%, #f3f5ef 100%);
+  color: #1f2937;
+  font-family: var(--theme-font-sans);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.enterprise-shell,
+.enterprise-shell *:not(svg):not(path) {
+  font-family: var(--theme-font-sans) !important;
+  letter-spacing: 0 !important;
+}
+
+.enterprise-shell .font-mondwest,
+.enterprise-shell .font-courier,
+.enterprise-shell .font-expanded,
+.enterprise-shell .font-compressed {
+  font-family: var(--theme-font-sans);
+  letter-spacing: 0;
+}
+
+.enterprise-shell .uppercase {
+  text-transform: none;
+}
+
+.enterprise-shell .enterprise-card,
+.enterprise-shell .border.border-border.bg-card,
+.enterprise-shell .border.border-border.bg-card\/50,
+.enterprise-shell .border.border-border.bg-card\/70,
+.enterprise-shell .border.border-border.bg-card\/80 {
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.74);
+  border-color: #e0e4dc;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03), 0 16px 44px rgba(16, 24, 40, 0.05);
+}
+
+.enterprise-shell input,
+.enterprise-shell textarea,
+.enterprise-shell select {
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+  color: #1f2937;
+}
+
+.enterprise-shell button {
+  border-radius: 8px;
+  letter-spacing: 0;
+}
+
+.enterprise-shell table th {
+  color: #667085;
+  font-weight: 500;
+}
+
+.enterprise-shell code {
+  background: #f4f6ef;
+  color: #1f2937;
+}
+
+.enterprise-shell .blend-lighter {
+  mix-blend-mode: normal;
+}
+
+.enterprise-shell aside,
+.enterprise-shell header {
+  border-color: #e0e4dc;
+}
+
+.enterprise-shell [class*="border-current"] {
+  border-color: #e0e4dc;
+}
+
+.enterprise-shell .bg-background\/40,
+.enterprise-shell .bg-background\/50,
+.enterprise-shell .bg-background\/60,
+.enterprise-shell .bg-muted\/20,
+.enterprise-shell .bg-card\/50,
+.enterprise-shell .bg-card\/70,
+.enterprise-shell .bg-card\/80,
+.enterprise-shell .bg-card\/85,
+.enterprise-shell .bg-card\/90,
+.enterprise-shell .bg-card\/95 {
+  background-color: rgba(255, 255, 255, 0.68);
+}
+
+.enterprise-shell [class*="shadow-"] {
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03), 0 14px 40px rgba(16, 24, 40, 0.045);
+}
+
+.enterprise-shell [aria-hidden][class*="fixed inset-0 z-[1]"],
+.enterprise-shell .theme-default-filler,
+.enterprise-shell [aria-hidden][class*="fixed inset-0 z-[2]"],
+.enterprise-shell [aria-hidden][class*="fixed inset-0 z-[99]"],
+.enterprise-shell [aria-hidden][class*="fixed inset-0 z-[101]"] {
+  display: none;
+}
+
 /* Subtle grain overlay for badges. */
 .grain {
   position: relative;
@@ -226,4 +364,3 @@ code { font-size: 0.875rem; }
 :root[style*="--theme-asset-bg:"] .theme-default-filler {
   display: none;
 }
-

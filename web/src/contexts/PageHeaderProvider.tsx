@@ -69,8 +69,7 @@ export function PageHeaderProvider({
           >
             <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
               <h1
-                className="font-expanded min-w-0 truncate text-sm font-bold tracking-[0.08em] text-midground"
-                style={{ mixBlendMode: "plus-lighter" }}
+                className="min-w-0 truncate text-sm font-semibold tracking-[-0.01em] text-midground"
               >
                 {displayTitle}
               </h1>

@@ -1257,6 +1257,28 @@ def _write_enterprise_local_config(config: dict) -> None:
         pass
 
 
+def _save_enterprise_local_registration(server: str, result: dict) -> dict:
+    config = {
+        "server": server.rstrip("/"),
+        "device_token": result["device_token"],
+        "device": result.get("device"),
+        "user": result.get("user"),
+        "agent": result.get("agent"),
+    }
+    try:
+        refreshed = _enterprise_http_json(
+            config["server"],
+            "/api/enterprise/local-agent/agents",
+            token=config["device_token"],
+        )
+        if isinstance(refreshed.get("agents"), list):
+            config["agents"] = refreshed["agents"]
+    except Exception:
+        pass
+    _write_enterprise_local_config(config)
+    return config
+
+
 def _enterprise_http_json(
     server: str,
     path: str,
@@ -1284,7 +1306,7 @@ def _enterprise_http_json(
 
 
 def _local_agent_system_prompt(agent: dict, user: dict, device: dict) -> str:
-    return (
+    base = (
         "You are a local Hermes Agent installed on the user's own machine. "
         "You represent the local user, not the admin. An enterprise admin or "
         "business agent may send collaboration requests, but they cannot remote "
@@ -1302,31 +1324,348 @@ def _local_agent_system_prompt(agent: dict, user: dict, device: dict) -> str:
         "unless the local user explicitly agrees. Explain what you did and what "
         "you did not access."
     )
+    skill_path = PROJECT_ROOT / "skills" / "enterprise" / "local-report-collaboration" / "SKILL.md"
+    try:
+        playbook = skill_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        playbook = ""
+    if not playbook:
+        return base
+    return (
+        base
+        + "\n\n"
+        + '[SYSTEM: The "enterprise-local-report-collaboration" skill is preloaded '
+        + "for this local-agent request. Follow it when answering admin report "
+        + "or follow-up requests.]\n\n"
+        + f"[Skill directory: {skill_path.parent}]\n\n"
+        + playbook
+    )
 
 
 def _enterprise_local_join(args) -> None:
     code = getattr(args, "code", "")
     server = (getattr(args, "server", None) or "http://127.0.0.1:9120").rstrip("/")
     name = getattr(args, "name", None)
-    result = _enterprise_http_json(
-        server,
-        "/api/enterprise/local-agent/register",
-        method="POST",
-        payload={"code": code, "name": name},
-    )
-    config = {
-        "server": server,
-        "device_token": result["device_token"],
-        "device": result.get("device"),
-        "user": result.get("user"),
-        "agent": result.get("agent"),
-    }
-    _write_enterprise_local_config(config)
+    password = (getattr(args, "password", None) or "").strip()
+    email = (getattr(args, "email", None) or "").strip()
+    user_name = getattr(args, "user_name", None)
+    agent_id = getattr(args, "agent_id", None)
+    if password and code:
+        result = _enterprise_http_json(
+            server,
+            "/api/enterprise/local-agent/register-invite",
+            method="POST",
+            payload={
+                "code": code,
+                "password": password,
+                "device_name": name,
+                "email": email or None,
+                "name": user_name,
+            },
+        )
+    elif email and password:
+        result = _enterprise_http_json(
+            server,
+            "/api/enterprise/local-agent/register-login",
+            method="POST",
+            payload={
+                "email": email,
+                "password": password,
+                "device_name": name,
+                "agent_id": agent_id,
+            },
+        )
+    elif password:
+        raise RuntimeError("Invite-code registration requires a code, or pass --email for email/password login")
+    else:
+        result = _enterprise_http_json(
+            server,
+            "/api/enterprise/local-agent/register",
+            method="POST",
+            payload={"code": code, "name": name},
+        )
+    config = _save_enterprise_local_registration(server, result)
     device = result.get("device") or {}
     agent = result.get("agent") or {}
     print(f"Local agent connected: {device.get('name')} ({device.get('id')})")
     print(f"Enterprise agent: {agent.get('name') or agent.get('id')}")
+    if config.get("agents"):
+        print(f"Assigned remote agents: {len(config['agents'])}")
     print(f"Config saved to {_enterprise_local_config_path()}")
+
+
+def _enterprise_local_refresh_config(config: dict) -> dict:
+    if not config.get("server") or not config.get("device_token"):
+        return config
+    result = _enterprise_http_json(
+        config["server"],
+        "/api/enterprise/local-agent/agents",
+        token=config["device_token"],
+    )
+    updated = dict(config)
+    if isinstance(result.get("agents"), list):
+        updated["agents"] = result["agents"]
+    if isinstance(result.get("user"), dict):
+        updated["user"] = result["user"]
+    if isinstance(result.get("device"), dict):
+        updated["device"] = result["device"]
+    if isinstance(result.get("agent"), dict):
+        updated["agent"] = result["agent"]
+    if updated != config:
+        _write_enterprise_local_config(updated)
+    return updated
+
+
+def _enterprise_local_cli_prompt(config: dict) -> str:
+    user = config.get("user") or {}
+    device = config.get("device") or {}
+    agent = config.get("agent") or {}
+    agents = config.get("agents") or []
+    if not isinstance(agents, list) or not agents:
+        agents = [agent] if isinstance(agent, dict) and agent else []
+    remote_agent_lines = [
+        f"- {item.get('name') or item.get('id')} ({item.get('id')})"
+        for item in agents
+        if isinstance(item, dict)
+    ]
+    return (
+        "You are a local Hermes agent running in the CLI on the user's own computer. "
+        "You can help with local tasks using normal Hermes CLI tools and local profile state. "
+        "When the user asks about products, menus, inventory, prices, orders, delivery, "
+        "pickups, stores, customer support, company policy, HR, business-specific knowledge, "
+        "or anything owned by an assigned business agent, call enterprise_remote before "
+        "answering. Do not answer business-scope questions from general model knowledge. "
+        "Do not send private local files, secrets, credentials, screenshots, account data, "
+        "or internal documents to remote business agents unless the local user explicitly agrees. "
+        "Prefer summaries and minimal necessary excerpts over raw data.\n\n"
+        f"Remote server: {config.get('server') or 'not connected'}\n"
+        f"Local device: {device.get('name') or device.get('id') or 'unknown'}\n"
+        f"Enterprise user: {user.get('email') or user.get('name') or user.get('id') or 'unknown'}\n"
+        f"Default business agent: {agent.get('name') or agent.get('id') or 'none'}\n"
+        "Assigned remote business agents:\n"
+        + ("\n".join(remote_agent_lines) if remote_agent_lines else "- none")
+    )
+
+
+def _run_enterprise_agent_cli(
+    *,
+    args,
+    system_message: str,
+    session_id: str,
+    platform: str,
+    access_context: Any = None,
+    extra_toolsets: Optional[set[str]] = None,
+    task_id: str,
+) -> None:
+    from gateway.run import (
+        _load_gateway_config,
+        _resolve_gateway_model,
+        _resolve_runtime_agent_kwargs,
+    )
+    from hermes_cli.tools_config import _get_platform_tools
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    runtime_kwargs = _resolve_runtime_agent_kwargs()
+    model = _resolve_gateway_model()
+    user_config = _load_gateway_config()
+    enabled_toolsets = sorted(set(_get_platform_tools(user_config, "cli")) | set(extra_toolsets or set()))
+    db = SessionDB()
+    try:
+        def _run_once(message: str) -> str:
+            history = db.get_messages_as_conversation(
+                session_id,
+                access_context=access_context,
+            )
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                session_id=session_id,
+                platform=platform,
+                session_db=db,
+                access_context=access_context,
+            )
+            result = agent.run_conversation(
+                user_message=message,
+                system_message=system_message,
+                conversation_history=history,
+                task_id=task_id,
+            )
+            return result.get("final_response", "") if isinstance(result, dict) else str(result)
+
+        message = getattr(args, "message", None)
+        if message == "-":
+            message = sys.stdin.read()
+        if message:
+            response = _run_once(str(message))
+            if getattr(args, "json", False):
+                print(json.dumps({"session_id": session_id, "response": response}, ensure_ascii=False, indent=2))
+            else:
+                print(response)
+                print(f"\nsession_id: {session_id}", file=sys.stderr)
+            return
+
+        print(f"Enterprise CLI session: {session_id}")
+        print("Type /exit to quit.")
+        while True:
+            try:
+                message = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if not message:
+                continue
+            if message in {"/exit", "/quit"}:
+                return
+            print(_run_once(message))
+    finally:
+        db.close()
+
+
+def _enterprise_local_chat(args) -> None:
+    config = _read_enterprise_local_config()
+    if not config.get("server") or not config.get("device_token"):
+        raise RuntimeError("Local agent is not joined. Run: hermes enterprise local join <code>")
+    try:
+        config = _enterprise_local_refresh_config(config)
+    except Exception as exc:
+        print(f"Warning: could not refresh assigned agents: {exc}", file=sys.stderr)
+    session_id = getattr(args, "session_id", None) or "enterprise-local-cli"
+    _run_enterprise_agent_cli(
+        args=args,
+        system_message=_enterprise_local_cli_prompt(config),
+        session_id=session_id,
+        platform="enterprise_local_cli",
+        extra_toolsets={"enterprise_remote"},
+        task_id="enterprise-local-cli",
+    )
+
+
+def _load_enterprise_skill_playbook(name: str) -> str:
+    skill_path = PROJECT_ROOT / "skills" / "enterprise" / name / "SKILL.md"
+    try:
+        return skill_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _enterprise_admin_builder_prompt(tenant: dict, admin_user: dict) -> str:
+    base = (
+        "# Enterprise Agent Builder Mode\n"
+        "You are a native Hermes Agent running in the CLI as an admin-only Enterprise Agent Builder. "
+        "Use normal Hermes CLI tool-calling and skill-loading behavior, plus controlled enterprise tools, "
+        "to help the administrator create and configure business agents.\n\n"
+        "Use enterprise_builder for controlled enterprise mutations and enterprise_local_bridge for "
+        "requesting help from user-owned local agents. Use these controlled tools instead of editing "
+        "the enterprise database directly. Mutating enterprise_builder and enterprise_local_bridge "
+        "actions require explicit admin approval of the specific draft before setting "
+        "confirmed_by_admin=true. Never say a change was applied unless the controlled tool returned success.\n\n"
+        f"Tenant: {tenant.get('name') or tenant.get('id')} ({tenant.get('id')})\n"
+        f"Admin user: {admin_user.get('email') or admin_user.get('name') or admin_user.get('id')} ({admin_user.get('id')})"
+    )
+    return "\n\n".join(
+        part
+        for part in (
+            base,
+            _load_enterprise_skill_playbook("agent-builder"),
+            _load_enterprise_skill_playbook("local-report-collaboration"),
+        )
+        if part
+    )
+
+
+def _enterprise_admin_prompt(tenant: dict, admin_user: dict) -> str:
+    base = (
+        "You are the default Hermes admin agent for this enterprise workspace, running in the CLI. "
+        "Help the admin operate the workspace and coordinate with local agents when appropriate. "
+        "Use enterprise_local_bridge for admin-to-local-agent report requests and follow the "
+        "enterprise-local-report-collaboration playbook. Do not create or modify business agents "
+        "unless the admin explicitly asks to use the Builder.\n\n"
+        f"Tenant: {tenant.get('name') or tenant.get('id')} ({tenant.get('id')})\n"
+        f"Admin user: {admin_user.get('email') or admin_user.get('name') or admin_user.get('id')} ({admin_user.get('id')})"
+    )
+    playbook = _load_enterprise_skill_playbook("local-report-collaboration")
+    return "\n\n".join(part for part in (base, playbook) if part)
+
+
+def _load_enterprise_admin_cli_setup(builder: bool) -> tuple[dict, dict, str]:
+    from enterprise import EnterpriseStore
+
+    store = EnterpriseStore()
+    try:
+        tenant = store.get_default_tenant()
+        if not tenant:
+            raise RuntimeError("Enterprise tenant is not initialized. Run: hermes enterprise init --name \"Your Company\"")
+        users = store.list_users()
+        admin_user = next(
+            (user for user in users if user.get("role") == "admin" and not user.get("disabled_at")),
+            None,
+        ) or next((user for user in users if not user.get("disabled_at")), None)
+        if not admin_user:
+            raise RuntimeError("Enterprise admin user is not available")
+        system_message = (
+            _enterprise_admin_builder_prompt(tenant, admin_user)
+            if builder
+            else _enterprise_admin_prompt(tenant, admin_user)
+        )
+        return tenant, admin_user, system_message
+    finally:
+        store.close()
+
+
+def _enterprise_admin_chat(args, *, builder: bool) -> None:
+    import uuid as _uuid
+
+    from agent.access_context import AccessContext
+    from gateway.session_context import clear_enterprise_vars, clear_session_vars
+    from gateway.session_context import set_enterprise_vars, set_session_vars
+
+    tenant, admin_user, system_message = _load_enterprise_admin_cli_setup(builder)
+    agent_id = "enterprise_builder" if builder else "enterprise_admin_default"
+    default_prefix = "enterprise-builder" if builder else "enterprise-admin"
+    session_id = getattr(args, "session_id", None) or f"{default_prefix}-{_uuid.uuid4().hex[:16]}"
+    access_context = AccessContext(
+        tenant_id=tenant["id"],
+        workspace_id="enterprise_admin",
+        user_id=admin_user["id"],
+        agent_id=agent_id,
+    )
+    session_tokens = None
+    enterprise_tokens = None
+    try:
+        session_tokens = set_session_vars(
+            platform="enterprise_admin_builder" if builder else "enterprise_admin",
+            chat_id=session_id,
+            chat_name="Enterprise Agent Builder" if builder else "Enterprise Admin Chat",
+            user_id=admin_user["id"],
+            user_name=admin_user.get("email") or admin_user.get("name") or "",
+            session_key=session_id,
+        )
+        enterprise_tokens = set_enterprise_vars(
+            tenant_id=tenant["id"],
+            user_id=admin_user["id"],
+            agent_id=agent_id,
+            agent_name="Enterprise Agent Builder" if builder else "Enterprise Admin",
+            system_message=system_message,
+        )
+        _run_enterprise_agent_cli(
+            args=args,
+            system_message=system_message,
+            session_id=session_id,
+            platform="enterprise_admin_builder" if builder else "enterprise_admin",
+            access_context=access_context,
+            extra_toolsets={"enterprise_builder", "enterprise_local_bridge"} if builder else {"enterprise_local_bridge"},
+            task_id="enterprise-admin-builder-cli" if builder else "enterprise-admin-cli",
+        )
+    finally:
+        if enterprise_tokens is not None:
+            clear_enterprise_vars(enterprise_tokens)
+        if session_tokens is not None:
+            clear_session_vars(session_tokens)
 
 
 def _enterprise_local_poll(args) -> list[dict]:
@@ -1551,7 +1890,7 @@ def _enterprise_local_serve(args) -> None:
         open_browser=not bool(getattr(args, "no_open", False)),
         allow_public=bool(getattr(args, "insecure", False)),
         embedded_chat=False,
-        initial_path="/local",
+        initial_path="/enterprise",
     )
 
 
@@ -1565,10 +1904,12 @@ def _enterprise_local_command(args) -> None:
         _enterprise_local_respond(args)
     elif action == "listen":
         _enterprise_local_listen(args)
+    elif action == "chat":
+        _enterprise_local_chat(args)
     elif action == "serve":
         _enterprise_local_serve(args)
     else:
-        print("Local agent commands: join, poll, respond, listen, serve")
+        print("Local agent commands: join, poll, respond, listen, chat, serve")
 
 
 def cmd_enterprise(args):
@@ -1577,6 +1918,14 @@ def cmd_enterprise(args):
 
     if getattr(args, "enterprise_action", None) == "local":
         _enterprise_local_command(args)
+        return
+
+    if getattr(args, "enterprise_action", None) == "admin":
+        _enterprise_admin_chat(args, builder=False)
+        return
+
+    if getattr(args, "enterprise_action", None) == "builder":
+        _enterprise_admin_chat(args, builder=True)
         return
 
     store = EnterpriseStore()
@@ -8119,11 +8468,19 @@ For more help on a command:
 
     enterprise_local_join = enterprise_local_subparsers.add_parser(
         "join",
-        help="Bind this local Hermes Agent to an enterprise workspace with a device code",
+        help="Bind this local Hermes Agent to an enterprise workspace",
     )
-    enterprise_local_join.add_argument("code", help="Device code from the user portal")
+    enterprise_local_join.add_argument(
+        "code",
+        nargs="?",
+        help="Device code from the user portal, or invite code when --password is provided",
+    )
     enterprise_local_join.add_argument("--server", default="http://127.0.0.1:9120", help="Enterprise dashboard base URL")
     enterprise_local_join.add_argument("--name", help="Display name for this local device")
+    enterprise_local_join.add_argument("--password", help="Invite/login password for CLI local-agent registration")
+    enterprise_local_join.add_argument("--email", help="Login email; with --password, joins by email/password")
+    enterprise_local_join.add_argument("--user-name", help="Display name when redeeming an invite code")
+    enterprise_local_join.add_argument("--agent-id", help="Agent id to bind when joining by email/password")
     enterprise_local_join.set_defaults(func=cmd_enterprise)
 
     enterprise_local_poll = enterprise_local_subparsers.add_parser(
@@ -8150,6 +8507,15 @@ For more help on a command:
     enterprise_local_listen.add_argument("--once", action="store_true", help="Handle current requests and exit")
     enterprise_local_listen.set_defaults(func=cmd_enterprise)
 
+    enterprise_local_chat = enterprise_local_subparsers.add_parser(
+        "chat",
+        help="Chat in the CLI as the local enterprise agent with assigned remote business agents",
+    )
+    enterprise_local_chat.add_argument("message", nargs="?", help="Message to send; omit for an interactive loop, or '-' for stdin")
+    enterprise_local_chat.add_argument("--session-id", help="Resume/use a local enterprise CLI session id")
+    enterprise_local_chat.add_argument("--json", action="store_true", help="Print one-shot result as JSON")
+    enterprise_local_chat.set_defaults(func=cmd_enterprise)
+
     enterprise_local_serve = enterprise_local_subparsers.add_parser(
         "serve",
         help="Start the browser UI for this local enterprise agent",
@@ -8163,6 +8529,24 @@ For more help on a command:
         help="Allow binding to non-localhost (DANGEROUS: exposes local tools on the network)",
     )
     enterprise_local_serve.set_defaults(func=cmd_enterprise)
+
+    enterprise_admin = enterprise_subparsers.add_parser(
+        "admin",
+        help="Chat in the CLI with the enterprise admin agent",
+    )
+    enterprise_admin.add_argument("message", nargs="?", help="Message to send; omit for an interactive loop, or '-' for stdin")
+    enterprise_admin.add_argument("--session-id", help="Resume/use an enterprise admin CLI session id")
+    enterprise_admin.add_argument("--json", action="store_true", help="Print one-shot result as JSON")
+    enterprise_admin.set_defaults(func=cmd_enterprise)
+
+    enterprise_builder = enterprise_subparsers.add_parser(
+        "builder",
+        help="Chat in the CLI with the enterprise agent builder",
+    )
+    enterprise_builder.add_argument("message", nargs="?", help="Message to send; omit for an interactive loop, or '-' for stdin")
+    enterprise_builder.add_argument("--session-id", help="Resume/use an enterprise builder CLI session id")
+    enterprise_builder.add_argument("--json", action="store_true", help="Print one-shot result as JSON")
+    enterprise_builder.set_defaults(func=cmd_enterprise)
 
     # gateway restart
     gateway_restart = gateway_subparsers.add_parser(

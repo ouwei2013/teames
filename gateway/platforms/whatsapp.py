@@ -21,6 +21,7 @@ import logging
 import os
 import platform
 import re
+import socket
 import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -96,6 +97,36 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
 
     sig = signal.SIGTERM if not force else signal.SIGKILL
     os.killpg(os.getpgid(proc.pid), sig)
+
+
+def _detect_local_proxy_url() -> str:
+    for host, port in (("127.0.0.1", 7890), ("127.0.0.1", 7891), ("127.0.0.1", 1080), ("127.0.0.1", 10808)):
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return f"http://{host}:{port}"
+        except OSError:
+            continue
+    return ""
+
+
+def _apply_bridge_proxy_env(env: Dict[str, str]) -> None:
+    proxy_url = (
+        env.get("WHATSAPP_PROXY_URL")
+        or env.get("HTTPS_PROXY")
+        or env.get("https_proxy")
+        or env.get("HTTP_PROXY")
+        or env.get("http_proxy")
+        or _detect_local_proxy_url()
+    )
+    if not proxy_url:
+        return
+    env["WHATSAPP_PROXY_URL"] = proxy_url
+    env.setdefault("HTTPS_PROXY", proxy_url)
+    env.setdefault("https_proxy", proxy_url)
+    env.setdefault("HTTP_PROXY", proxy_url)
+    env.setdefault("http_proxy", proxy_url)
+    env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+    env.setdefault("no_proxy", "localhost,127.0.0.1,::1")
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -438,6 +469,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             bridge_env = os.environ.copy()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            _apply_bridge_proxy_env(bridge_env)
 
             self._bridge_process = subprocess.Popen(
                 [

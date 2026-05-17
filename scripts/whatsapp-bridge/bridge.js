@@ -21,6 +21,7 @@
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import pino from 'pino';
 import path from 'path';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
@@ -40,6 +41,10 @@ const WHATSAPP_DEBUG =
   process.env &&
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
+const QR_JSON =
+  typeof process !== 'undefined' &&
+  process.env &&
+  ['1', 'true', 'yes', 'on'].includes(String(process.env.HERMES_WHATSAPP_QR_JSON || '').toLowerCase());
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
@@ -109,6 +114,31 @@ let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
 
+function firstEnv(...names) {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value && String(value).trim()) return String(value).trim();
+  }
+  return '';
+}
+
+function makeProxyAgent() {
+  const proxyUrl = firstEnv('WHATSAPP_PROXY_URL', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy');
+  if (!proxyUrl) return null;
+  try {
+    const agent = new HttpsProxyAgent(proxyUrl);
+    if (WHATSAPP_DEBUG) {
+      console.log(JSON.stringify({ event: 'proxy_enabled', proxy: proxyUrl.replace(/\/\/([^:@]+):([^@]+)@/, '//***:***@') }));
+    }
+    return agent;
+  } catch (err) {
+    console.log(`⚠️  Ignoring invalid WhatsApp proxy URL: ${err?.message || err}`);
+    return null;
+  }
+}
+
+const proxyAgent = makeProxyAgent();
+
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
@@ -128,6 +158,8 @@ async function startSocket() {
     version,
     auth: state,
     logger,
+    ...(proxyAgent ? { agent: proxyAgent, fetchAgent: proxyAgent } : {}),
+    connectTimeoutMs: 60000,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
@@ -147,6 +179,9 @@ async function startSocket() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      if (QR_JSON) {
+        try { console.log(JSON.stringify({ event: 'qr', qr })); } catch {}
+      }
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');
@@ -170,6 +205,15 @@ async function startSocket() {
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      if (QR_JSON) {
+        try {
+          console.log(JSON.stringify({
+            event: 'connected',
+            userId: normalizeWhatsAppId(sock.user?.id),
+            lid: normalizeWhatsAppId(sock.user?.lid),
+          }));
+        } catch {}
+      }
       console.log('✅ WhatsApp connected!');
       if (PAIR_ONLY) {
         console.log('✅ Pairing complete. Credentials saved.');
@@ -582,6 +626,8 @@ app.get('/chat/:id', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: connectionState,
+    userId: normalizeWhatsAppId(sock?.user?.id),
+    lid: normalizeWhatsAppId(sock?.user?.lid),
     queueLength: messageQueue.length,
     uptime: process.uptime(),
   });

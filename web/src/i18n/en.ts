@@ -50,12 +50,12 @@ export const en: Translations = {
   },
 
   app: {
-    brand: "Hermes Agent",
-    brandShort: "HA",
+    brand: "Teames",
+    brandShort: "tm",
     closeNavigation: "Close navigation",
     closeModelTools: "Close model and tools",
     footer: {
-      org: "Nous Research",
+      org: "Teames",
     },
     activeSessionsLabel: "Active Sessions:",
     gatewayStatusLabel: "Gateway Status:",
@@ -116,8 +116,8 @@ export const en: Translations = {
     starting: "Starting",
     startedInBackground: "Started in background — check logs for progress",
     stopped: "Stopped",
-    updateHermes: "Update Hermes",
-    updatingHermes: "Updating Hermes…",
+    updateHermes: "Update Teames",
+    updatingHermes: "Updating Teames…",
     waitingForOutput: "Waiting for output…",
   },
 

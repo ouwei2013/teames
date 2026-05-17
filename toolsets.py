@@ -176,6 +176,24 @@ TOOLSETS = {
         "tools": ["session_search"],
         "includes": []
     },
+
+    "enterprise_remote": {
+        "description": "Call remote business agents assigned through a joined workspace",
+        "tools": ["enterprise_remote"],
+        "includes": []
+    },
+
+    "enterprise_builder": {
+        "description": "Build and manage workspace business agents, skills, and invites",
+        "tools": ["enterprise_builder"],
+        "includes": []
+    },
+
+    "enterprise_local_bridge": {
+        "description": "Request reports from connected local agents and manage recurring local report plans",
+        "tools": ["enterprise_local_bridge"],
+        "includes": []
+    },
     
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",

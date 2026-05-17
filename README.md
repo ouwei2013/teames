@@ -1,180 +1,342 @@
 <p align="center">
-  <img src="assets/banner.png" alt="Hermes Agent" width="100%">
+  <img src="assets/teames-logo-wide.png" alt="Teames" width="720">
 </p>
 
-# Hermes Agent ☤
+<h1 align="center">Teames</h1>
 
 <p align="center">
-  <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
-  <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
-  <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
+  <strong>Team + Hermes: a business agent workspace with social QR access.</strong>
 </p>
 
-**The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
+<p align="center">
+  <a href="#quick-start"><img src="https://img.shields.io/badge/Quickstart-5_minutes-blue?style=for-the-badge" alt="Quickstart"></a>
+  <a href="#social-qr-gateways"><img src="https://img.shields.io/badge/Social_QR-WeChat%20%7C%20WhatsApp%20%7C%20Telegram-0ea5e9?style=for-the-badge" alt="Social QR gateways"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT license"></a>
+</p>
 
-Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [NVIDIA NIM](https://build.nvidia.com) (Nemotron), [Xiaomi MiMo](https://platform.xiaomimimo.com), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), [Hugging Face](https://huggingface.co), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
+Teames is a fork of Hermes Agent focused on businesses, teams, and organizations.
+It keeps Hermes' tool-calling agent runtime, memory, skills, terminal tools, cron,
+and messaging gateway, then adds a workspace layer where an administrator can build
+business agents and invite users through email or social QR codes.
 
-<table>
-<tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
-<tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
-<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
-<tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
-<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
-<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six terminal backends — local, Docker, SSH, Daytona, Singularity, and Modal. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
-<tr><td><b>Research-ready</b></td><td>Batch trajectory generation, Atropos RL environments, trajectory compression for training the next generation of tool-calling models.</td></tr>
-</table>
+The main idea is simple:
 
----
+- admins create workspace agents such as support, sales, fitness coaching, or internal operations agents;
+- users can join from a browser, a local installed agent, or a social app;
+- social QR invites bind WeChat, WhatsApp, or Telegram accounts to a remote business agent;
+- the same runtime can route local-agent questions to remote workspace agents when needed.
 
-## Quick Install
+## Highlights
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+| Capability | What it means |
+| --- | --- |
+| Workspace agents | Create multiple business agents with role, task, tone, instructions, knowledge, skills, and users. |
+| Builder chat | Describe the agent you want, review a draft, then let the controlled builder tool create agents, skills, and invites. |
+| Remote portal | Run Teames on a server so users do not need to install a local agent before chatting. |
+| Social QR access | Invite users through WeChat, WhatsApp, Telegram, or generic bind links. |
+| Local mode | A user's installed local agent can join a remote workspace and consult assigned remote agents. |
+| Social gateway routing | Messages from social platforms are mapped to tenant, user, and agent access context before the agent runs. |
+| Skills and tools | Reuses Hermes tools, toolsets, skills, cron, memory, session search, and gateway infrastructure. |
+
+## Architecture
+
+```text
+Browser Admin UI
+        |
+        | create agents / invites / social QR
+        v
+Teames remote portal
+        |
+        | enterprise store + access context
+        v
+Hermes AIAgent runtime
+        |
+        +-- enterprise_builder tool
+        +-- enterprise_remote tool
+        +-- enterprise skills
+        +-- cron + sessions + memory
+
+Social apps
+  WeChat / WhatsApp / Telegram
+        |
+        v
+Gateway adapters
+        |
+        | platform user id + bot account id
+        v
+Social gateway binding
+        |
+        v
+Remote business agent
 ```
 
-Works on Linux, macOS, WSL2, and Android via Termux. The installer handles the platform-specific setup for you.
+Teames does not replace the Hermes runtime. A business agent prompt is appended
+as a scoped system message on top of the base Hermes agent prompt. This gives each
+workspace agent a business role while preserving the underlying tool, memory, and
+gateway behavior.
 
-> **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
->
-> **Windows:** Native Windows is not supported. Please install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run the command above.
+## Quick Start
 
-After installation:
-
-```bash
-source ~/.bashrc    # reload shell (or: source ~/.zshrc)
-hermes              # start chatting!
-```
-
----
-
-## Getting Started
+### 1. Clone and install
 
 ```bash
-hermes              # Interactive CLI — start a conversation
-hermes model        # Choose your LLM provider and model
-hermes tools        # Configure which tools are enabled
-hermes config set   # Set individual config values
-hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
-hermes setup        # Run the full setup wizard (configures everything at once)
-hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
-hermes update       # Update to the latest version
-hermes doctor       # Diagnose any issues
+git clone https://github.com/<your-org>/teames.git
+cd teames
+
+# Prefer the repo virtual environment.
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[all,dev]"
+
+# Frontend dependencies for the dashboard.
+cd web
+npm install
+npm run build
+cd ..
 ```
 
-📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
+The command-line entry point is still `hermes` for compatibility with the
+upstream Hermes Agent runtime.
 
-## CLI vs Messaging Quick Reference
-
-Hermes has two entry points: start the terminal UI with `hermes`, or run the gateway and talk to it from Telegram, Discord, Slack, WhatsApp, Signal, or Email. Once you're in a conversation, many slash commands are shared across both interfaces.
-
-| Action | CLI | Messaging platforms |
-|---------|-----|---------------------|
-| Start chatting | `hermes` | Run `hermes gateway setup` + `hermes gateway start`, then send the bot a message |
-| Start fresh conversation | `/new` or `/reset` | `/new` or `/reset` |
-| Change model | `/model [provider:model]` | `/model [provider:model]` |
-| Set a personality | `/personality [name]` | `/personality [name]` |
-| Retry or undo the last turn | `/retry`, `/undo` | `/retry`, `/undo` |
-| Compress context / check usage | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]` |
-| Browse skills | `/skills` or `/<skill-name>` | `/<skill-name>` |
-| Interrupt current work | `Ctrl+C` or send a new message | `/stop` or send a new message |
-| Platform-specific status | `/platforms` | `/status`, `/sethome` |
-
-For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
-
----
-
-## Documentation
-
-All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
-
-| Section | What's Covered |
-|---------|---------------|
-| [Quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart) | Install → setup → first conversation in 2 minutes |
-| [CLI Usage](https://hermes-agent.nousresearch.com/docs/user-guide/cli) | Commands, keybindings, personalities, sessions |
-| [Configuration](https://hermes-agent.nousresearch.com/docs/user-guide/configuration) | Config file, providers, models, all options |
-| [Messaging Gateway](https://hermes-agent.nousresearch.com/docs/user-guide/messaging) | Telegram, Discord, Slack, WhatsApp, Signal, Home Assistant |
-| [Security](https://hermes-agent.nousresearch.com/docs/user-guide/security) | Command approval, DM pairing, container isolation |
-| [Tools & Toolsets](https://hermes-agent.nousresearch.com/docs/user-guide/features/tools) | 40+ tools, toolset system, terminal backends |
-| [Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills) | Procedural memory, Skills Hub, creating skills |
-| [Memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory) | Persistent memory, user profiles, best practices |
-| [MCP Integration](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp) | Connect any MCP server for extended capabilities |
-| [Cron Scheduling](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron) | Scheduled tasks with platform delivery |
-| [Context Files](https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files) | Project context that shapes every conversation |
-| [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture) | Project structure, agent loop, key classes |
-| [Contributing](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) | Development setup, PR process, code style |
-| [CLI Reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands) | All commands and flags |
-| [Environment Variables](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Complete env var reference |
-
----
-
-## Migrating from OpenClaw
-
-If you're coming from OpenClaw, Hermes can automatically import your settings, memories, skills, and API keys.
-
-**During first-time setup:** The setup wizard (`hermes setup`) automatically detects `~/.openclaw` and offers to migrate before configuration begins.
-
-**Anytime after install:**
+### 2. Configure a model provider
 
 ```bash
-hermes claw migrate              # Interactive migration (full preset)
-hermes claw migrate --dry-run    # Preview what would be migrated
-hermes claw migrate --preset user-data   # Migrate without secrets
-hermes claw migrate --overwrite  # Overwrite existing conflicts
+hermes auth
+hermes model
 ```
 
-What gets imported:
-- **SOUL.md** — persona file
-- **Memories** — MEMORY.md and USER.md entries
-- **Skills** — user-created skills → `~/.hermes/skills/openclaw-imports/`
-- **Command allowlist** — approval patterns
-- **Messaging settings** — platform configs, allowed users, working directory
-- **API keys** — allowlisted secrets (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
-- **TTS assets** — workspace audio files
-- **Workspace instructions** — AGENTS.md (with `--workspace-target`)
+You can use OpenAI-compatible endpoints, OpenRouter, Nous Portal, local models,
+or other Hermes-supported providers. Secrets are stored in `~/.hermes/.env`.
 
-See `hermes claw migrate --help` for all options, or use the `openclaw-migration` skill for an interactive agent-guided migration with dry-run previews.
-
----
-
-## Contributing
-
-We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
-
-Quick start for contributors — clone and go with `setup-hermes.sh`:
+### 3. Start the remote portal
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
-cd hermes-agent
-./setup-hermes.sh     # installs uv, creates venv, installs .[all], symlinks ~/.local/bin/hermes
-./hermes              # auto-detects the venv, no need to `source` first
+python3 -m hermes_cli.main dashboard \
+  --host 0.0.0.0 \
+  --port 9119 \
+  --insecure \
+  --no-open
 ```
 
-Manual path (equivalent to the above):
+Open:
+
+```text
+http://<server-ip>:9119/enterprise
+```
+
+For SSH tunneling:
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv venv --python 3.11
-source venv/bin/activate
-uv pip install -e ".[all,dev]"
-scripts/run_tests.sh
+ssh -p 6000 \
+  -L 19119:127.0.0.1:9119 \
+  user@server
 ```
 
-> **RL Training (optional):** The RL/Atropos integration (`environments/`) ships via the `atroposlib` and `tinker` dependencies pulled in by `.[all,dev]` — no submodule setup required.
+Then open:
 
----
+```text
+http://127.0.0.1:19119/enterprise
+```
 
-## Community
+### 4. Start the remote social gateway
 
-- 💬 [Discord](https://discord.gg/NousResearch)
-- 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
+```bash
+python3 -m hermes_cli.main gateway run --replace --accept-hooks -v
+```
 
----
+The gateway can run multiple platforms at the same time. A single process can
+connect WeChat, WhatsApp, Telegram, and other enabled Hermes adapters, then route
+each inbound message through its platform-specific binding.
+
+## Workspace Flow
+
+1. Open `Workspace`.
+2. Go to `Agents`.
+3. Use `Build Agents` to create agents with the configuration form or builder chat.
+4. Go to `People & Invites`.
+5. Create email invites, social QR invites, or inspect connected users.
+6. Users chat from the browser, local agent, WeChat, WhatsApp, Telegram, or another gateway.
+
+## Builder Chat
+
+Builder chat is a normal Hermes agent running in a special admin-only mode.
+It uses:
+
+- an Enterprise Agent Builder playbook;
+- the `enterprise_builder` tool for controlled workspace mutations;
+- the `enterprise_local_bridge` tool when local devices need to provide reports.
+
+The builder follows a draft-first workflow. It should ask clarifying questions or
+present a draft first. Mutating actions such as `create_agent`, `update_agent`,
+`create_agent_skill`, and `create_invite` require explicit admin confirmation and
+`confirmed_by_admin=true`.
+
+## Social QR Gateways
+
+Social QR is designed for remote portal onboarding. Users should not need to
+install a local agent just to talk to a business agent from a social app.
+
+### Telegram
+
+1. In Telegram, open `@BotFather`.
+2. Run `/newbot` and copy the bot token.
+3. In Teames, open `Workspace -> People & Invites -> Social QR`.
+4. Select `Telegram`.
+5. Paste the bot token into `Server Telegram Bot` and save.
+6. Restart or start the Teames gateway.
+7. Click `Create QR Invite`.
+8. The user scans the QR with the phone camera, opens Telegram, taps `Start`, and then chats with the assigned agent.
+
+Useful environment variables:
+
+```bash
+TELEGRAM_BOT_TOKEN=<botfather-token>
+SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME=<bot-username>
+TELEGRAM_PROXY=http://127.0.0.1:7890   # optional, if Telegram needs a proxy
+```
+
+### WhatsApp
+
+Teames supports a server-side WhatsApp bot through the bundled WhatsApp bridge.
+The server bot is paired once. After pairing, admins can create WhatsApp QR
+invites for users.
+
+1. Open `Workspace -> People & Invites -> Social QR`.
+2. Select `WhatsApp`.
+3. In `Server WhatsApp Bot`, click `Pair WhatsApp Bot`.
+4. On the bot phone, open WhatsApp `Settings -> Linked Devices -> Link a Device`.
+5. Scan the pairing QR shown by Teames.
+6. After the status is connected, click `Create QR Invite`.
+7. The user scans the invite QR. WhatsApp opens with a bind message. The user taps Send, then chats with the remote agent.
+
+Useful environment variables:
+
+```bash
+WHATSAPP_ENABLED=true
+WHATSAPP_MODE=bot
+WHATSAPP_ALLOWED_USERS=*
+SOCIAL_GATEWAY_WHATSAPP_NUMBER=<paired-number>
+WHATSAPP_PROXY_URL=http://127.0.0.1:7890   # optional
+```
+
+### WeChat / Weixin
+
+WeChat uses an iLink / ClawBot style authorization flow rather than a normal
+contact QR. The admin creates a QR in the portal; the user scans and confirms;
+the backend stores bot credentials; the Weixin gateway loads the saved accounts
+and long-polls messages.
+
+Typical flow:
+
+1. Configure the Weixin iLink credentials required by your deployment.
+2. Start the Teames gateway with Weixin enabled.
+3. Open `Workspace -> People & Invites -> Social QR`.
+4. Select `WeChat`.
+5. Click `Create QR Invite`.
+6. The invitee scans and confirms in WeChat.
+7. Teames records the binding and routes inbound WeChat messages to the selected business agent.
+
+Useful environment variables depend on your iLink / ClawBot deployment, but the
+gateway expects saved account credentials under the Hermes home directory and
+loads all available Weixin accounts at startup.
+
+### Generic Bind Links
+
+For platforms without a native QR flow, Teames can generate a generic bind code
+or link. The gateway extracts bind codes from messages like:
+
+```text
+/bind hms_xxx
+/start hms_xxx
+hms_xxx
+```
+
+## Local Agent Mode
+
+Remote portal is the simplest path for invited users, but Teames also supports
+local agents.
+
+A user can install Teames locally, join a remote workspace with an invite code,
+and keep using one interface:
+
+- local chat for private computer tasks;
+- remote workspace agents for business-scope questions;
+- social gateway bindings that can route through the local agent when needed.
+
+Example local test server:
+
+```bash
+export HERMES_HOME=/tmp/teames-local-test
+python -m hermes_cli.main enterprise local serve \
+  --host 127.0.0.1 \
+  --port 9130 \
+  --no-open
+```
+
+Then open:
+
+```text
+http://127.0.0.1:9130/
+```
+
+## Development
+
+### Backend checks
+
+Use the repository test wrapper rather than calling `pytest` directly:
+
+```bash
+scripts/run_tests.sh tests/test_enterprise.py
+scripts/run_tests.sh tests/hermes_cli/test_web_server.py
+```
+
+### Frontend checks
+
+```bash
+cd web
+node node_modules/typescript/bin/tsc -b
+npm run build
+```
+
+### Useful runtime commands
+
+```bash
+# Portal
+python3 -m hermes_cli.main dashboard --host 0.0.0.0 --port 9119 --insecure --no-open
+
+# Gateway
+python3 -m hermes_cli.main gateway run --replace --accept-hooks -v
+
+# Logs
+tail -f ~/.hermes/logs/agent.log
+```
+
+## Configuration Files
+
+| Path | Purpose |
+| --- | --- |
+| `~/.hermes/config.yaml` | Non-secret settings, toolsets, gateway config, terminal settings. |
+| `~/.hermes/.env` | Secrets and provider tokens. Do not commit this file. |
+| `~/.hermes/sessions/` | Session history. |
+| `~/.hermes/enterprise_skills/` | Tenant and agent scoped enterprise skills. |
+| `~/.hermes/weixin/` | Saved Weixin/iLink account state, depending on deployment. |
+| `~/.hermes/whatsapp/` | WhatsApp bridge session state. |
+
+## Security Notes
+
+- Run `--insecure` only on trusted networks or behind an SSH tunnel.
+- Keep provider keys, Telegram tokens, WhatsApp sessions, and iLink credentials out of git.
+- Generated business skills should read credentials from environment variables.
+- Social gateway bindings are tenant/user/agent scoped; do not bypass the binding layer with ad hoc allowlists for production.
+- Business agents should say what is missing instead of inventing business policies or account-specific facts.
+
+## Project Status
+
+Teames is an active business-oriented fork of Hermes Agent. The remote portal,
+workspace builder, local-agent bridge, and social QR gateway are evolving quickly.
+Expect APIs and UI surfaces to change while the project is prepared for broader
+open-source use.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-Built by [Nous Research](https://nousresearch.com).
+MIT. See [LICENSE](LICENSE).

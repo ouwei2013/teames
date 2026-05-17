@@ -151,6 +151,79 @@ export async function streamEnterpriseBuilderChat(
   await handleLine(buffer);
 }
 
+export async function streamEnterpriseAdminChat(
+  payload: { message: string; session_id?: string },
+  handlers: {
+    onTrace?: (trace: EnterpriseBuilderTraceItem) => void;
+    onDelta?: (delta: string) => void;
+    onFinal?: (result: EnterpriseBuilderChatResponse) => void;
+    onError?: (detail: string) => void;
+  },
+): Promise<void> {
+  const token = await getSessionToken();
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    [SESSION_HEADER]: token,
+  });
+  const url = "/api/enterprise/admin-chat/stream";
+  const res = await fetch(`${BASE}${url}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      message: payload.message,
+      session_id: payload.session_id,
+    }),
+  });
+
+  if (res.ok) {
+    window.sessionStorage.removeItem(TOKEN_RELOAD_FLAG);
+  }
+  if (shouldReloadForStaleDashboardToken(url, res.status)) {
+    const alreadyReloaded = window.sessionStorage.getItem(TOKEN_RELOAD_FLAG) === "1";
+    if (!alreadyReloaded) {
+      window.sessionStorage.setItem(TOKEN_RELOAD_FLAG, "1");
+      window.location.reload();
+      throw new Error("Dashboard session expired; reloading");
+    }
+  }
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${text || res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  async function handleLine(line: string) {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as EnterpriseBuilderStreamEvent;
+    if (event.type === "trace") {
+      handlers.onTrace?.(event.trace);
+    } else if (event.type === "delta") {
+      handlers.onDelta?.(event.delta);
+    } else if (event.type === "final") {
+      handlers.onFinal?.(event);
+    } else if (event.type === "error") {
+      handlers.onError?.(event.detail);
+      throw new Error(event.detail);
+    }
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      await handleLine(line);
+    }
+  }
+  buffer += decoder.decode();
+  await handleLine(buffer);
+}
+
 export async function streamEnterpriseChat(
   payload: { token: string; message: string; session_id?: string; agent_id?: string },
   handlers: {
@@ -485,6 +558,22 @@ export const api = {
     fetchJSON<{ agent: EnterpriseAgent; skills: SkillInfo[]; allowed: string[] }>(
       `/api/enterprise/agents/${encodeURIComponent(agentId)}/skill-catalog`,
     ),
+  getEnterpriseAgentSkillDetail: (agentId: string, name: string) =>
+    fetchJSON<SkillDetail>(
+      `/api/enterprise/agents/${encodeURIComponent(agentId)}/skill-catalog/${encodeURIComponent(name)}`,
+    ),
+  getEnterpriseAgentUsers: (agentId: string) =>
+    fetchJSON<{ agent: EnterpriseAgent; users: EnterpriseAgentUser[] }>(
+      `/api/enterprise/agents/${encodeURIComponent(agentId)}/users`,
+    ),
+  getEnterpriseAgentUserDetail: (agentId: string, userId: string) =>
+    fetchJSON<EnterpriseAgentUserDetail>(
+      `/api/enterprise/agents/${encodeURIComponent(agentId)}/users/${encodeURIComponent(userId)}`,
+    ),
+  getEnterpriseAgentUserSessionMessages: (agentId: string, userId: string, sessionId: string) =>
+    fetchJSON<SessionMessagesResponse>(
+      `/api/enterprise/agents/${encodeURIComponent(agentId)}/users/${encodeURIComponent(userId)}/sessions/${encodeURIComponent(sessionId)}/messages`,
+    ),
   toggleEnterpriseAgentSkillCatalog: (payload: {
     agent_id: string;
     name: string;
@@ -521,9 +610,55 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  getEnterpriseSocialInvites: () =>
+    fetchJSON<{ invites: EnterpriseSocialInvite[] }>("/api/enterprise/social-invites"),
+  createEnterpriseSocialInvite: (payload: {
+    agent_id: string;
+    platform?: string;
+    label?: string;
+    max_uses?: number;
+    expires_days?: number | null;
+  }) =>
+    fetchJSON<EnterpriseSocialInviteCreated>("/api/enterprise/social-invites", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  getEnterpriseSocialBindings: () =>
+    fetchJSON<{ bindings: EnterpriseSocialBinding[] }>("/api/enterprise/social-bindings"),
+  getEnterpriseWeixinSocialQrStatus: (qrId: string) =>
+    fetchJSON<EnterpriseWeixinSocialQrStatus>(
+      `/api/enterprise/social-invites/weixin/qr/${encodeURIComponent(qrId)}/status`,
+    ),
+  getEnterpriseTelegramGatewayStatus: (refresh = false) =>
+    fetchJSON<EnterpriseTelegramGatewayStatus>(
+      `/api/enterprise/social-gateways/telegram/status${refresh ? "?refresh=true" : ""}`,
+    ),
+  configureEnterpriseTelegramGateway: (payload: { token: string }) =>
+    fetchJSON<EnterpriseTelegramGatewayStatus>("/api/enterprise/social-gateways/telegram/configure", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  createEnterpriseWhatsAppPair: () =>
+    fetchJSON<EnterpriseWhatsAppPairStatus>("/api/enterprise/social-gateways/whatsapp/pair", {
+      method: "POST",
+    }),
+  getEnterpriseWhatsAppPairCurrentStatus: () =>
+    fetchJSON<EnterpriseWhatsAppPairStatus>("/api/enterprise/social-gateways/whatsapp/pair/status"),
+  getEnterpriseWhatsAppPairStatus: (pairId: string) =>
+    fetchJSON<EnterpriseWhatsAppPairStatus>(
+      `/api/enterprise/social-gateways/whatsapp/pair/${encodeURIComponent(pairId)}/status`,
+    ),
 
-  redeemEnterpriseInvite: (payload: { code: string; email?: string; name?: string }) =>
+  redeemEnterpriseInvite: (payload: { code: string; email?: string; name?: string; password?: string }) =>
     fetchJSON<EnterpriseRedeemResponse>("/api/enterprise/invites/redeem", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  loginEnterprisePortal: (payload: { email: string; password: string }) =>
+    fetchJSON<EnterpriseRedeemResponse>("/api/enterprise/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -557,6 +692,13 @@ export const api = {
       { headers: { Authorization: `Bearer ${token}` } },
     );
   },
+  getEnterprisePortalSkillDetail: (token: string, name: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+    return fetchJSON<SkillDetail>(
+      `/api/enterprise/portal/skills/${encodeURIComponent(name)}${qs}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  },
   toggleEnterprisePortalSkill: (payload: {
     token: string;
     agent_id: string;
@@ -585,6 +727,30 @@ export const api = {
       { headers: { Authorization: `Bearer ${token}` } },
     );
   },
+  getEnterprisePortalChatSessions: (token: string, agentId?: string, limit = 20) => {
+    const params = new URLSearchParams();
+    if (agentId) params.set("agent_id", agentId);
+    params.set("limit", String(limit));
+    return fetchJSON<{ agent: EnterpriseAgent; sessions: SessionInfo[] }>(
+      `/api/enterprise/portal/chat/sessions?${params.toString()}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  },
+  getEnterprisePortalChatMessages: (token: string, sessionId: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
+    return fetchJSON<{ agent: EnterpriseAgent; session_id: string; messages: SessionMessage[] }>(
+      `/api/enterprise/portal/chat/sessions/${encodeURIComponent(sessionId)}/messages${qs}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+  },
+  getEnterpriseAdminChatSessions: (limit = 20) =>
+    fetchJSON<{ sessions: SessionInfo[] }>(
+      `/api/enterprise/admin-chat/sessions?limit=${encodeURIComponent(String(limit))}`,
+    ),
+  getEnterpriseAdminChatMessages: (sessionId: string) =>
+    fetchJSON<{ session_id: string; messages: SessionMessage[] }>(
+      `/api/enterprise/admin-chat/sessions/${encodeURIComponent(sessionId)}/messages`,
+    ),
   getEnterprisePortalCronJobs: (token: string, agentId?: string) => {
     const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : "";
     return fetchJSON<{ agent: EnterpriseAgent; jobs: CronJob[] }>(
@@ -690,11 +856,15 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
-  joinEnterpriseLocalWeb: (payload: { server: string; code: string; name?: string }) =>
+  joinEnterpriseLocalWeb: (payload: { server: string; code?: string; email?: string; name?: string; password?: string }) =>
     fetchJSON<EnterpriseLocalWebStatus>("/api/enterprise/local-web/join", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+    }),
+  disconnectEnterpriseLocalWeb: () =>
+    fetchJSON<EnterpriseLocalWebStatus>("/api/enterprise/local-web/disconnect", {
+      method: "POST",
     }),
   getEnterpriseLocalWebRequests: (limit = 20) =>
     fetchJSON<{
@@ -712,6 +882,14 @@ export const api = {
         body: JSON.stringify(payload || {}),
       },
     ),
+  getEnterpriseLocalWebChatSessions: (limit = 20) =>
+    fetchJSON<{ sessions: SessionInfo[] }>(
+      `/api/enterprise/local-web/chat/sessions?limit=${encodeURIComponent(String(limit))}`,
+    ),
+  getEnterpriseLocalWebChatMessages: (sessionId: string) =>
+    fetchJSON<{ session_id: string; messages: SessionMessage[] }>(
+      `/api/enterprise/local-web/chat/sessions/${encodeURIComponent(sessionId)}/messages`,
+    ),
 };
 
 export interface EnterpriseUser {
@@ -722,6 +900,45 @@ export interface EnterpriseUser {
   role: string;
   created_at?: number;
   disabled_at?: number | null;
+}
+
+export interface EnterpriseAgentUser extends EnterpriseUser {
+  access_role?: string | null;
+  access_created_at?: number | null;
+  skill_count?: number;
+  custom_skill_count?: number;
+  social_binding_count?: number;
+  local_device_count?: number;
+  cron_job_count?: number;
+  session_count?: number;
+  social_last_seen_at?: number | null;
+  device_last_seen_at?: number | null;
+  last_seen_at?: number | null;
+}
+
+export interface EnterpriseAgentUserCustomSkill {
+  tenant_id: string;
+  user_id: string;
+  agent_id: string;
+  name: string;
+  description?: string | null;
+  content?: string | null;
+  category?: string | null;
+  enabled: boolean | number;
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface EnterpriseAgentUserDetail {
+  agent: EnterpriseAgent;
+  user: EnterpriseAgentUser;
+  skills: string[];
+  custom_skills: EnterpriseAgentUserCustomSkill[];
+  social_bindings: EnterpriseSocialBinding[];
+  local_devices: EnterpriseLocalDevice[];
+  cron_jobs: CronJob[];
+  sessions: SessionInfo[];
+  session_total: number;
 }
 
 export interface EnterpriseTenant {
@@ -791,6 +1008,92 @@ export interface EnterpriseInvite {
 
 export interface EnterpriseInviteCreated extends EnterpriseInvite {
   code: string;
+}
+
+export interface EnterpriseSocialLink {
+  platform: string;
+  platform_label: string;
+  bind_text?: string;
+  qr_data?: string;
+  qr_image?: string | null;
+  landing_url: string;
+  setup_required: boolean;
+  setup_hint?: string;
+  qr_id?: string;
+  qr_status_url?: string;
+}
+
+export interface EnterpriseSocialInvite {
+  tenant_id: string;
+  agent_id: string;
+  agent_name?: string | null;
+  platform?: string | null;
+  label?: string | null;
+  max_uses: number;
+  uses: number;
+  expires_at?: number | null;
+  created_by_user_id?: string | null;
+  created_at: number;
+  revoked_at?: number | null;
+  link?: EnterpriseSocialLink;
+}
+
+export interface EnterpriseSocialInviteCreated extends EnterpriseSocialInvite {
+  code: string;
+  link: EnterpriseSocialLink;
+}
+
+export interface EnterpriseSocialBinding {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  agent_id: string;
+  binding_type?: "social_gateway" | "local_device_gateway" | string;
+  device_id?: string;
+  local_device_name?: string | null;
+  platform: string;
+  bot_account_id?: string;
+  external_user_id: string;
+  external_chat_id?: string | null;
+  user_name?: string | null;
+  user_name_saved?: string | null;
+  user_email?: string | null;
+  agent_name?: string | null;
+  source_session_id?: string | null;
+  status: string;
+  created_at: number;
+  last_seen_at?: number | null;
+  revoked_at?: number | null;
+}
+
+export interface EnterpriseWeixinSocialQrStatus {
+  status: string;
+  confirmed: boolean;
+  account_id?: string;
+  user_id?: string;
+  agent?: EnterpriseAgent;
+  user?: EnterpriseUser;
+  restart_required?: boolean;
+  message?: string;
+}
+
+export interface EnterpriseWhatsAppPairStatus {
+  id: string;
+  status: string;
+  qr_data?: string | null;
+  qr_image?: string | null;
+  phone_number?: string | null;
+  message?: string | null;
+}
+
+export interface EnterpriseTelegramGatewayStatus {
+  status: string;
+  token_present?: boolean;
+  username?: string | null;
+  bot_id?: number | string | null;
+  first_name?: string | null;
+  message?: string | null;
+  restart_required?: boolean;
 }
 
 export interface EnterpriseRedeemResponse {
@@ -891,6 +1194,7 @@ export interface EnterpriseLocalRequest {
 }
 
 export interface EnterpriseLocalReportPlan extends CronJob {
+  agent_id?: string | null;
   device_id?: string | null;
   request?: string | null;
   device_name?: string | null;
@@ -1116,6 +1420,17 @@ export interface SkillInfo {
   source?: string;
   skill_dir?: string | null;
   files?: Array<{ path?: string; bytes?: number } | string>;
+}
+
+export interface SkillDetail extends SkillInfo {
+  success?: boolean;
+  content?: string;
+  path?: string;
+  linked_files?: Record<string, string[]> | null;
+  tags?: string[];
+  setup_needed?: boolean;
+  readiness_status?: string;
+  updated_at?: number | string | null;
 }
 
 export interface ToolsetInfo {

@@ -6,21 +6,12 @@ import {
   CircleAlert,
   Loader2,
   MessageSquare,
-  Package,
   Send,
-  ShieldCheck,
   Ticket,
 } from "lucide-react";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import {
   api,
   streamEnterpriseBuilderChat,
@@ -36,6 +27,12 @@ type BuilderMessage = {
   role: "admin" | "builder";
   content: string;
   trace?: EnterpriseBuilderTraceItem[];
+};
+
+type BuilderView = "chat" | "agents" | "invites";
+
+type EnterpriseBuilderPageProps = {
+  embedded?: boolean;
 };
 
 function formatDate(value?: number | null): string {
@@ -56,7 +53,7 @@ function inviteState(invite: EnterpriseInvite): string {
   return "Active";
 }
 
-export default function EnterpriseBuilderPage() {
+export default function EnterpriseBuilderPage({ embedded = false }: EnterpriseBuilderPageProps) {
   const [status, setStatus] = useState<EnterpriseStatusResponse | null>(null);
   const [agents, setAgents] = useState<EnterpriseAgent[]>([]);
   const [invites, setInvites] = useState<EnterpriseInvite[]>([]);
@@ -65,6 +62,7 @@ export default function EnterpriseBuilderPage() {
   const [sending, setSending] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<BuilderView>("chat");
   const [messages, setMessages] = useState<BuilderMessage[]>([
     {
       id: "builder-welcome",
@@ -178,27 +176,74 @@ export default function EnterpriseBuilderPage() {
   const activeInvites = invites.filter((invite) => inviteState(invite) === "Active");
 
   return (
-    <main className="flex h-[calc(100dvh-5.5rem)] min-h-[560px] min-w-0 flex-col gap-4 overflow-hidden">
-      <section className="grid shrink-0 gap-3 md:grid-cols-4">
-        <Metric icon={ShieldCheck} label="Tenant" value={status?.tenant?.name || "Enterprise"} />
-        <Metric icon={Bot} label="Agents" value={String(agents.filter((agent) => agent.status === "active").length)} />
-        <Metric icon={Ticket} label="Invites" value={String(activeInvites.length)} />
-        <Metric icon={Package} label="Mode" value="Builder" />
-      </section>
+    <main
+      className={cn(
+        "grid min-w-0 gap-4 overflow-hidden lg:grid-cols-[240px_minmax(0,1fr)]",
+        embedded ? "h-[720px] min-h-[560px]" : "h-[calc(100dvh-5.5rem)] min-h-[560px]",
+      )}
+    >
+      <aside className="min-h-0 overflow-y-auto rounded-lg border border-border bg-card/75 p-3 shadow-sm">
+        <div className="mb-3 px-1">
+          <div className="text-sm font-semibold normal-case text-midground">
+            Builder
+          </div>
+          <div className="mt-1 truncate font-courier text-xs normal-case text-muted-foreground">
+            {status?.tenant?.name || "Workspace"}
+          </div>
+        </div>
+        <nav className="grid gap-1" aria-label="Builder modules">
+          {[
+            { key: "chat" as const, label: "Builder chat", icon: MessageSquare, count: "" },
+            { key: "agents" as const, label: "Agents", icon: Bot, count: String(agents.length) },
+            { key: "invites" as const, label: "Invites", icon: Ticket, count: String(activeInvites.length) },
+          ].map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => setView(item.key)}
+                className={cn(
+                  "flex h-10 items-center justify-between gap-2 rounded-md border px-3 text-left text-xs font-medium normal-case transition-colors",
+                  view === item.key
+                    ? "border-midground bg-white text-midground shadow-sm"
+                    : "border-transparent bg-transparent text-muted-foreground hover:text-midground",
+                )}
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <Icon className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate">{item.label}</span>
+                </span>
+                {item.count && <span className="text-muted-foreground">{item.count}</span>}
+              </button>
+            );
+          })}
+        </nav>
+        {error && (
+          <div className="mt-4 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-2 font-courier text-xs normal-case text-amber-900">
+            Sync issue: {error.startsWith("500:") ? "Builder data is unavailable." : error}
+          </div>
+        )}
+      </aside>
 
-      <section className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-        <Card className="flex min-h-0 flex-col overflow-hidden">
-          <CardHeader className="shrink-0">
-            <CardTitle className="flex items-center gap-2">
-              <MessageSquare className="h-4 w-4" />
-              Agent Builder Chat
-            </CardTitle>
-            <CardDescription className="normal-case">
-              Native Hermes builder session with default skills and admin-only enterprise tools.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex min-h-0 flex-1 flex-col gap-3">
-            <div className="min-h-0 flex-1 overflow-y-auto border border-border bg-background/40 p-3">
+      <section className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-card/75 shadow-sm">
+        <div className="shrink-0 border-b border-border px-4 py-3">
+          <div className="flex items-center gap-2 text-sm font-semibold normal-case text-midground">
+            {view === "chat" ? <MessageSquare className="h-4 w-4" /> : view === "agents" ? <Bot className="h-4 w-4" /> : <Ticket className="h-4 w-4" />}
+            {view === "chat" ? "Builder chat" : view === "agents" ? "Agents" : "Invites"}
+          </div>
+          <p className="mt-1 font-courier text-xs normal-case text-muted-foreground">
+            {view === "chat"
+              ? "Create business agents, prompts, knowledge, skills, scripts, and invite links."
+              : view === "agents"
+                ? "Business agents created for this workspace."
+                : "Recent workspace invitations."}
+          </p>
+        </div>
+
+        {view === "chat" && (
+          <>
+            <div className="min-h-0 flex-1 overflow-y-auto p-3">
               {loading && (
                 <div className="flex items-center gap-2 font-courier text-xs normal-case text-muted-foreground">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -242,11 +287,7 @@ export default function EnterpriseBuilderPage() {
               </div>
             </div>
 
-            {error && (
-              <p className="font-courier text-xs normal-case text-destructive">{error}</p>
-            )}
-
-            <form onSubmit={sendMessage} className="grid shrink-0 gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+            <form onSubmit={sendMessage} className="grid shrink-0 gap-3 border-t border-border p-3 md:grid-cols-[minmax(0,1fr)_auto]">
               <textarea
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
@@ -261,19 +302,13 @@ export default function EnterpriseBuilderPage() {
                 </Button>
               </div>
             </form>
-          </CardContent>
-        </Card>
+          </>
+        )}
 
-        <aside className="min-h-0 space-y-4 overflow-y-auto">
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Bot className="h-4 w-4" />
-                Agents
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {agents.slice(0, 8).map((agent) => (
+        {view === "agents" && (
+          <div className="min-h-0 flex-1 overflow-y-auto p-4">
+            <div className="grid gap-3 md:grid-cols-2">
+              {agents.map((agent) => (
                 <div key={agent.id} className="border border-border bg-background/40 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <div className="min-w-0 truncate font-mondwest text-sm uppercase text-midground">
@@ -293,18 +328,14 @@ export default function EnterpriseBuilderPage() {
                   No agents yet.
                 </div>
               )}
-            </CardContent>
-          </Card>
+            </div>
+          </div>
+        )}
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Ticket className="h-4 w-4" />
-                Recent Invites
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {invites.slice(0, 6).map((invite, index) => (
+        {view === "invites" && (
+          <div className="min-h-0 flex-1 overflow-y-auto p-4">
+            <div className="grid gap-3 md:grid-cols-2">
+              {invites.map((invite, index) => (
                 <div key={`${invite.created_at}-${index}`} className="border border-border bg-background/40 p-3 font-courier text-xs normal-case">
                   <div className="flex items-center justify-between gap-2">
                     <span className="truncate text-midground">{invite.email || "Any email"}</span>
@@ -325,9 +356,9 @@ export default function EnterpriseBuilderPage() {
                   No invites yet.
                 </div>
               )}
-            </CardContent>
-          </Card>
-        </aside>
+            </div>
+          </div>
+        )}
       </section>
     </main>
   );
@@ -373,28 +404,6 @@ function TraceList({ trace }: { trace: EnterpriseBuilderTraceItem[] }) {
             </div>
           );
         })}
-      </div>
-    </div>
-  );
-}
-
-function Metric({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon: typeof ShieldCheck;
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="flex items-center gap-3 border border-border bg-card/50 px-4 py-3">
-      <span className="flex h-9 w-9 shrink-0 items-center justify-center border border-border bg-background/50">
-        <Icon className="h-4 w-4 text-muted-foreground" />
-      </span>
-      <div className="min-w-0">
-        <div className="font-courier text-xs normal-case text-muted-foreground">{label}</div>
-        <div className="truncate font-mondwest text-lg uppercase text-midground">{value}</div>
       </div>
     </div>
   );

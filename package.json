@@ -1,20 +1,20 @@
 {
-  "name": "hermes-agent",
+  "name": "teames",
   "version": "1.0.0",
-  "description": "An AI agent with advanced tool-calling capabilities, featuring a flexible toolsets system for organizing and managing tools.",
+  "description": "A business agent workspace with remote portal and social QR gateways.",
   "private": true,
   "scripts": {
     "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NousResearch/Hermes-Agent.git"
+    "url": "git+https://github.com/your-org/teames.git"
   },
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/NousResearch/Hermes-Agent/issues"
+    "url": "https://github.com/your-org/teames/issues"
   },
-  "homepage": "https://github.com/NousResearch/Hermes-Agent#readme",
+  "homepage": "https://github.com/your-org/teames#readme",
   "dependencies": {
     "@askjo/camofox-browser": "^1.5.2",
     "agent-browser": "^0.26.0"

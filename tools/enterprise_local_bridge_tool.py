@@ -24,8 +24,8 @@ def _require_admin_builder_context() -> tuple[str, str]:
     platform = get_session_env("HERMES_SESSION_PLATFORM")
     tenant_id = get_session_env("HERMES_ENTERPRISE_TENANT_ID")
     admin_user_id = get_session_env("HERMES_ENTERPRISE_USER_ID")
-    if platform != "enterprise_admin_builder" or not tenant_id or not admin_user_id:
-        raise PermissionError("enterprise_local_bridge is only available in admin builder sessions")
+    if platform not in {"enterprise_admin_builder", "enterprise_admin"} or not tenant_id or not admin_user_id:
+        raise PermissionError("enterprise_local_bridge is only available in enterprise admin sessions")
     return tenant_id, admin_user_id
 
 
@@ -276,6 +276,8 @@ ENTERPRISE_LOCAL_BRIDGE_SCHEMA: Dict[str, Any] = {
         "Admin-only tool for communicating with user-owned local Hermes agents. "
         "It lists connected local devices, sends collaboration requests, checks "
         "responses, and creates recurring local report plans backed by Hermes cron. "
+        "For multi-turn collaboration, list prior requests and send a follow-up "
+        "request to the same device that references the previous request id or summary. "
         "It does not grant direct access to local files or tools; the local agent "
         "decides what to share."
     ),
@@ -303,7 +305,7 @@ ENTERPRISE_LOCAL_BRIDGE_SCHEMA: Dict[str, Any] = {
             },
             "request": {
                 "type": "string",
-                "description": "Exact collaboration request to send to the local agent or schedule as a recurring report.",
+                "description": "Exact collaboration request to send to the local agent or schedule as a recurring report. For report requests, state that the answer is for the enterprise admin, specify target scope, and ask the local agent to summarize scoped local transcript rather than keyword-searching snippets.",
             },
             "schedule": {
                 "type": "string",

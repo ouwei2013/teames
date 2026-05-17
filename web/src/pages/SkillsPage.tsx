@@ -150,6 +150,18 @@ export default function SkillsPage() {
     );
   }, [skills, isSearching, lowerSearch]);
 
+  const matchesToolsetSearch = (ts: ToolsetInfo) =>
+    !search ||
+    ts.name.toLowerCase().includes(lowerSearch) ||
+    ts.label.toLowerCase().includes(lowerSearch) ||
+    ts.description.toLowerCase().includes(lowerSearch) ||
+    (ts.tools || []).some((tool) => tool.toLowerCase().includes(lowerSearch));
+
+  const searchMatchedToolsets = useMemo(() => {
+    if (!isSearching) return [];
+    return toolsets.filter(matchesToolsetSearch);
+  }, [toolsets, isSearching, lowerSearch, search]);
+
   const activeSkills = useMemo(() => {
     if (isSearching) return [];
     if (!activeCategory)
@@ -232,13 +244,7 @@ export default function SkillsPage() {
   ]);
 
   const filteredToolsets = useMemo(() => {
-    return toolsets.filter(
-      (ts) =>
-        !search ||
-        ts.name.toLowerCase().includes(lowerSearch) ||
-        ts.label.toLowerCase().includes(lowerSearch) ||
-        ts.description.toLowerCase().includes(lowerSearch),
-    );
+    return toolsets.filter(matchesToolsetSearch);
   }, [toolsets, search, lowerSearch]);
 
   /* ---- Loading ---- */
@@ -256,7 +262,7 @@ export default function SkillsPage() {
       <Toast toast={toast} />
 
       {/* ═══════════════ Filter panel + Content ═══════════════ */}
-      <div className="flex flex-col sm:flex-row sm:items-start gap-4">
+      <div className="flex flex-col gap-5 sm:flex-row sm:items-start">
         {/* ---- Filter panel ---- */}
         <aside
           aria-label={t.skills.title}
@@ -266,13 +272,13 @@ export default function SkillsPage() {
             <div
               className={`
                 flex flex-col
-                border border-border bg-muted/20
+                rounded-lg border border-transparent bg-transparent
               `}
             >
               {/* Filter heading */}
-              <div className="hidden sm:flex items-center gap-2 px-3 py-2 border-b border-border">
+              <div className="hidden sm:flex items-center gap-2 px-2 py-2">
                 <Filter className="h-3 w-3 text-muted-foreground" />
-                <span className="font-mondwest text-[0.65rem] tracking-[0.12em] uppercase text-muted-foreground">
+                <span className="text-xs font-medium text-muted-foreground">
                   {t.skills.filters}
                 </span>
               </div>
@@ -302,8 +308,8 @@ export default function SkillsPage() {
 
               {/* Category sub-filters (only for Skills view) */}
               {view === "skills" && !isSearching && allCategories.length > 0 && (
-                <div className="hidden sm:flex flex-col border-t border-border">
-                  <div className="px-3 pt-2 pb-1 font-mondwest text-[0.6rem] tracking-[0.12em] uppercase text-muted-foreground/70">
+                <div className="hidden sm:flex flex-col border-t border-border/50">
+                  <div className="px-2 pt-2 pb-1 text-[0.7rem] font-medium text-muted-foreground/70">
                     {t.skills.categories}
                   </div>
                   <div className="flex flex-col p-2 pt-1 gap-px max-h-[calc(100vh-340px)] overflow-y-auto">
@@ -352,46 +358,64 @@ export default function SkillsPage() {
         <div className="flex-1 min-w-0">
           {isSearching ? (
             /* Search results */
-            <Card>
-              <CardHeader className="py-3 px-4">
-                <div className="flex items-center justify-between">
-                  <CardTitle className="text-sm flex items-center gap-2">
-                    <Search className="h-4 w-4" />
-                    {t.skills.title}
-                  </CardTitle>
-                  <Badge variant="secondary" className="text-[10px]">
-                    {t.skills.resultCount
-                      .replace("{count}", String(searchMatchedSkills.length))
-                      .replace(
-                        "{s}",
-                        searchMatchedSkills.length !== 1 ? "s" : "",
-                      )}
-                  </Badge>
-                </div>
-              </CardHeader>
-              <CardContent className="px-4 pb-4">
-                {searchMatchedSkills.length === 0 ? (
-                  <p className="text-sm text-muted-foreground text-center py-8">
-                    {t.skills.noSkillsMatch}
-                  </p>
-                ) : (
-                  <div className="grid gap-1">
-                    {searchMatchedSkills.map((skill) => (
-                      <SkillRow
-                        key={skill.name}
-                        skill={skill}
-                        toggling={togglingSkills.has(skill.name)}
-                        onToggle={() => handleToggleSkill(skill)}
-                        noDescriptionLabel={t.skills.noDescription}
-                      />
-                    ))}
+            <div className="space-y-3">
+              <Card className="border-transparent bg-white/60 shadow-none">
+                <CardHeader className="py-3 px-4">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-sm flex items-center gap-2">
+                      <Search className="h-4 w-4" />
+                      {t.skills.title}
+                    </CardTitle>
+                    <Badge variant="secondary" className="text-[10px]">
+                      {searchMatchedSkills.length + searchMatchedToolsets.length} results
+                    </Badge>
                   </div>
-                )}
-              </CardContent>
-            </Card>
+                </CardHeader>
+                <CardContent className="px-4 pb-4">
+                  {searchMatchedSkills.length === 0 && searchMatchedToolsets.length === 0 ? (
+                    <p className="text-sm text-muted-foreground text-center py-8">
+                      {t.skills.noSkillsMatch}
+                    </p>
+                  ) : (
+                    <div className="space-y-4">
+                      {searchMatchedSkills.length > 0 && (
+                        <section>
+                          <div className="mb-2 text-xs font-medium text-muted-foreground">
+                            Skills
+                          </div>
+                          <div className="grid gap-1">
+                            {searchMatchedSkills.map((skill) => (
+                              <SkillRow
+                                key={skill.name}
+                                skill={skill}
+                                toggling={togglingSkills.has(skill.name)}
+                                onToggle={() => handleToggleSkill(skill)}
+                                noDescriptionLabel={t.skills.noDescription}
+                              />
+                            ))}
+                          </div>
+                        </section>
+                      )}
+                      {searchMatchedToolsets.length > 0 && (
+                        <section>
+                          <div className="mb-2 text-xs font-medium text-muted-foreground">
+                            Toolsets
+                          </div>
+                          <div className="grid gap-2">
+                            {searchMatchedToolsets.map((ts) => (
+                              <ToolsetRow key={ts.name} toolset={ts} />
+                            ))}
+                          </div>
+                        </section>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
           ) : view === "skills" ? (
             /* Skills list */
-            <Card>
+            <Card className="border-transparent bg-white/60 shadow-none">
               <CardHeader className="py-3 px-4">
                 <div className="flex items-center justify-between">
                   <CardTitle className="text-sm flex items-center gap-2">
@@ -436,7 +460,7 @@ export default function SkillsPage() {
             /* Toolsets grid */
             <>
               {filteredToolsets.length === 0 ? (
-                <Card>
+                <Card className="border-transparent bg-white/60 shadow-none">
                   <CardContent className="py-8 text-center text-sm text-muted-foreground">
                     {t.skills.noToolsetsMatch}
                   </CardContent>
@@ -450,7 +474,7 @@ export default function SkillsPage() {
                       ts.name;
 
                     return (
-                      <Card key={ts.name} className="relative">
+                      <Card key={ts.name} className="relative border-transparent bg-white/60 shadow-none">
                         <CardContent className="py-4">
                           <div className="flex items-start gap-3">
                             <TsIcon className="h-5 w-5 text-muted-foreground shrink-0 mt-0.5" />
@@ -472,7 +496,7 @@ export default function SkillsPage() {
                                 {ts.description}
                               </p>
                               {ts.enabled && !ts.configured && (
-                                <p className="text-[10px] text-amber-300/80 mb-2">
+                                <p className="text-[10px] text-amber-700/80 mb-2">
                                   {t.skills.setupNeeded}
                                 </p>
                               )}
@@ -549,6 +573,52 @@ function SkillRow({
   );
 }
 
+function ToolsetRow({ toolset }: { toolset: ToolsetInfo }) {
+  const TsIcon = toolsetIcon(toolset.name);
+  const labelText =
+    toolset.label.replace(/^[\p{Emoji}\s]+/u, "").trim() || toolset.name;
+
+  return (
+    <div className="rounded-md border border-border bg-background/50 px-3 py-2">
+      <div className="flex items-start gap-3">
+        <TsIcon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="truncate text-sm font-medium">{labelText}</span>
+            <Badge
+              variant={toolset.enabled ? "success" : "outline"}
+              className="text-[10px]"
+            >
+              {toolset.enabled ? "Active" : "Inactive"}
+            </Badge>
+            {toolset.enabled && !toolset.configured && (
+              <Badge variant="outline" className="text-[10px]">
+                Setup needed
+              </Badge>
+            )}
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {toolset.description}
+          </p>
+          {toolset.tools.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {toolset.tools.map((tool) => (
+                <Badge
+                  key={tool}
+                  variant="secondary"
+                  className="font-mono text-[10px]"
+                >
+                  {tool}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PanelItem({ active, icon: Icon, label, onClick }: PanelItemProps) {
   return (
     <button
@@ -556,13 +626,13 @@ function PanelItem({ active, icon: Icon, label, onClick }: PanelItemProps) {
       onClick={onClick}
       className={`
         group flex items-center gap-2 px-2.5 py-1.5
-        font-mondwest text-[0.7rem] tracking-[0.08em] uppercase
-        rounded-sm text-left cursor-pointer whitespace-nowrap
+        text-xs font-medium
+        rounded-lg text-left cursor-pointer whitespace-nowrap
         transition-colors
         ${
           active
-            ? "bg-foreground/90 text-background"
-            : "text-muted-foreground hover:text-foreground hover:bg-foreground/10"
+            ? "bg-foreground/90 text-background shadow-sm"
+            : "text-muted-foreground hover:text-foreground hover:bg-white/70"
         }
       `}
     >

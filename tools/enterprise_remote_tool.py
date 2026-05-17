@@ -46,6 +46,27 @@ def _tool_error(message: str) -> str:
     return json.dumps({"success": False, "error": message}, ensure_ascii=False)
 
 
+def _gateway_origin() -> Dict[str, Any]:
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return {}
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    user_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
+    if not platform or not user_id:
+        return {}
+    origin: Dict[str, Any] = {
+        "platform": platform,
+        "external_user_id": user_id,
+        "external_chat_id": chat_id,
+        "user_name": get_session_env("HERMES_SESSION_USER_NAME", "").strip(),
+    }
+    if platform == "weixin" and "|" in chat_id:
+        origin["bot_account_id"] = chat_id.split("|", 1)[0]
+    return {key: value for key, value in origin.items() if value}
+
+
 def _http_json(
     config: Dict[str, Any],
     path: str,
@@ -80,6 +101,8 @@ def enterprise_remote(
     agent_id: Optional[str] = None,
     message: Optional[str] = None,
     session_id: Optional[str] = None,
+    query: Optional[str] = None,
+    limit: Optional[int] = None,
     task_id: str | None = None,
 ) -> str:
     del task_id
@@ -104,6 +127,9 @@ def enterprise_remote(
                 payload["agent_id"] = chosen_agent_id
             if existing_session_id:
                 payload["session_id"] = existing_session_id
+            origin = _gateway_origin()
+            if origin:
+                payload["gateway_origin"] = origin
             result = _http_json(
                 config,
                 "/api/enterprise/local-agent/chat",
@@ -118,6 +144,25 @@ def enterprise_remote(
                 _write_config(config)
             return json.dumps({"success": True, **result}, ensure_ascii=False, indent=2)
 
+        if normalized_action == "search_history":
+            text = (query or message or "").strip()
+            if not text:
+                raise ValueError("query is required")
+            payload = {
+                "query": text,
+                "limit": max(1, min(int(limit or 10), 25)),
+            }
+            chosen_agent_id = (agent_id or "").strip()
+            if chosen_agent_id:
+                payload["agent_id"] = chosen_agent_id
+            result = _http_json(
+                config,
+                "/api/enterprise/local-agent/history/search",
+                method="POST",
+                payload=payload,
+            )
+            return json.dumps({"success": True, **result}, ensure_ascii=False, indent=2)
+
         return _tool_error(f"unknown action '{action}'")
     except Exception as exc:
         return _tool_error(str(exc))
@@ -128,12 +173,13 @@ ENTERPRISE_REMOTE_SCHEMA: Dict[str, Any] = {
     "description": (
         "For a local Hermes agent joined to an enterprise workspace. List and chat "
         "with remote business agents assigned to the local user, such as HR, support, "
-        "or policy agents. Do not send private local data unless the user explicitly agrees."
+        "or policy agents. Can also search this local user's own remote business-agent "
+        "chat history. Do not send private local data unless the user explicitly agrees."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["list_agents", "chat"]},
+            "action": {"type": "string", "enum": ["list_agents", "chat", "search_history"]},
             "agent_id": {
                 "type": "string",
                 "description": "Remote business agent id returned by list_agents.",
@@ -145,6 +191,14 @@ ENTERPRISE_REMOTE_SCHEMA: Dict[str, Any] = {
             "session_id": {
                 "type": "string",
                 "description": "Optional explicit remote conversation session id.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Search query for search_history. Results are scoped to the local user and selected business agent.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of search_history matches to return, capped at 25.",
             },
         },
         "required": ["action"],
@@ -161,6 +215,8 @@ registry.register(
         agent_id=args.get("agent_id"),
         message=args.get("message"),
         session_id=args.get("session_id"),
+        query=args.get("query"),
+        limit=args.get("limit"),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_requirements,

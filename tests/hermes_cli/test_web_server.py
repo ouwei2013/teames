@@ -109,10 +109,12 @@ class TestWebServerEndpoints:
             pytest.skip("fastapi/starlette not installed")
 
         import hermes_state
+        import enterprise
         from hermes_constants import get_hermes_home
         from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
+        monkeypatch.setattr(enterprise, "DEFAULT_ENTERPRISE_DB_PATH", get_hermes_home() / "enterprise.db")
 
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
@@ -556,10 +558,12 @@ class TestNewEndpoints:
             pytest.skip("fastapi/starlette not installed")
 
         import hermes_state
+        import enterprise
         from hermes_constants import get_hermes_home
         from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
+        monkeypatch.setattr(enterprise, "DEFAULT_ENTERPRISE_DB_PATH", get_hermes_home() / "enterprise.db")
 
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
@@ -584,6 +588,237 @@ class TestNewEndpoints:
     def test_cron_job_not_found(self):
         resp = self.client.get("/api/cron/jobs/nonexistent-id")
         assert resp.status_code == 404
+
+    def test_dashboard_sessions_hide_invited_enterprise_users(self):
+        from hermes_constants import get_hermes_home
+        from enterprise import EnterpriseStore
+        from hermes_state import SessionDB
+
+        (get_hermes_home() / "enterprise.db").unlink(missing_ok=True)
+        (get_hermes_home() / "state.db").unlink(missing_ok=True)
+        store = EnterpriseStore()
+        try:
+            init = store.initialize_tenant(
+                name="Acme",
+                tenant_id="acme",
+                admin_email="admin@example.com",
+                admin_name="Admin",
+            )
+            admin = init["admin_user"]
+            agent = store.list_agents()[0]
+            invite = store.create_invite(email="user@example.com", role="member")
+            redeemed = store.redeem_invite(invite["code"], email="user@example.com", name="User")
+            user = redeemed["user"]
+            social_invite = store.create_social_gateway_invite(
+                agent_id=agent["id"],
+                platform="weixin",
+                label="Customer QR",
+            )
+            store.bind_social_gateway_user(
+                code=social_invite["code"],
+                platform="weixin",
+                bot_account_id="bot_123",
+                external_user_id="wx_user_1",
+                external_chat_id="wx_chat_1",
+                user_name="Customer One",
+            )
+        finally:
+            store.close()
+
+        db = SessionDB()
+        try:
+            db.create_session("local-admin", source="cli", model="test")
+            db.append_message("local-admin", "user", "local admin session")
+            db.create_session(
+                "enterprise-admin",
+                source="web",
+                model="test",
+                tenant_id="acme",
+                workspace_id="enterprise_admin",
+                user_id=admin["id"],
+                agent_id="enterprise_admin_default",
+            )
+            db.append_message("enterprise-admin", "user", "admin enterprise session")
+            db.create_session(
+                "enterprise-user",
+                source="web",
+                model="test",
+                tenant_id="acme",
+                workspace_id="default",
+                user_id=user["id"],
+                agent_id=agent["id"],
+            )
+            db.append_message("enterprise-user", "user", "invited user secret")
+            db.create_session(
+                "enterprise-social-legacy",
+                source="weixin",
+                model="test",
+                user_id="wx_user_1",
+            )
+            db.append_message("enterprise-social-legacy", "user", "social invited user secret")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=50")
+        assert resp.status_code == 200
+        session_ids = {item["id"] for item in resp.json()["sessions"]}
+        assert "local-admin" in session_ids
+        assert "enterprise-admin" in session_ids
+        assert "enterprise-user" not in session_ids
+        assert "enterprise-social-legacy" not in session_ids
+
+        hidden_messages = self.client.get("/api/sessions/enterprise-user/messages")
+        assert hidden_messages.status_code == 404
+        hidden_social_messages = self.client.get("/api/sessions/enterprise-social-legacy/messages")
+        assert hidden_social_messages.status_code == 404
+        search = self.client.get("/api/sessions/search?q=secret")
+        assert search.status_code == 200
+        assert search.json()["results"] == []
+
+    def test_dashboard_cron_hides_invited_enterprise_users(self):
+        from hermes_constants import get_hermes_home
+        from enterprise import EnterpriseStore
+        from cron.jobs import save_jobs
+
+        (get_hermes_home() / "enterprise.db").unlink(missing_ok=True)
+        store = EnterpriseStore()
+        try:
+            init = store.initialize_tenant(
+                name="Acme",
+                tenant_id="acme",
+                admin_email="admin@example.com",
+                admin_name="Admin",
+            )
+            admin = init["admin_user"]
+            agent = store.list_agents()[0]
+            invite = store.create_invite(email="user@example.com", role="member")
+            redeemed = store.redeem_invite(invite["code"], email="user@example.com", name="User")
+            user = redeemed["user"]
+        finally:
+            store.close()
+
+        def job(job_id, owner_id=None):
+            item = {
+                "id": job_id,
+                "name": job_id,
+                "prompt": "ping",
+                "schedule": {"kind": "once", "display": "once"},
+                "schedule_display": "once",
+                "enabled": True,
+                "state": "scheduled",
+            }
+            if owner_id:
+                item["enterprise"] = {
+                    "tenant_id": "acme",
+                    "user_id": owner_id,
+                    "agent_id": agent["id"],
+                }
+            return item
+
+        save_jobs([
+            job("local-job"),
+            job("admin-job", admin["id"]),
+            job("user-job", user["id"]),
+        ])
+
+        resp = self.client.get("/api/cron/jobs")
+        assert resp.status_code == 200
+        job_ids = {item["id"] for item in resp.json()}
+        assert job_ids == {"local-job", "admin-job"}
+        assert self.client.get("/api/cron/jobs/user-job").status_code == 404
+
+    def test_enterprise_agent_user_detail_includes_sessions_and_messages(self):
+        from hermes_constants import get_hermes_home
+        from enterprise import EnterpriseStore
+        from hermes_state import SessionDB
+
+        (get_hermes_home() / "enterprise.db").unlink(missing_ok=True)
+        (get_hermes_home() / "state.db").unlink(missing_ok=True)
+        store = EnterpriseStore()
+        try:
+            store.initialize_tenant(name="Acme", tenant_id="acme")
+            agent = store.list_agents()[0]
+            invite = store.create_invite(email="user@example.com", role="member")
+            redeemed = store.redeem_invite(invite["code"], email="user@example.com", name="User")
+            user = redeemed["user"]
+            store.set_agent_skill_catalog_item(agent["id"], "calendar", True)
+            store.set_user_agent_skill(user, agent["id"], "calendar", True)
+            store.upsert_user_agent_custom_skill(
+                user,
+                agent["id"],
+                name="private-skill",
+                content="Private instructions",
+            )
+            social_invite = store.create_social_gateway_invite(
+                agent_id=agent["id"],
+                platform="weixin",
+                label="Customer QR",
+            )
+            bound = store.bind_social_gateway_user(
+                code=social_invite["code"],
+                platform="weixin",
+                bot_account_id="bot_123",
+                external_user_id="wx_user_1",
+                external_chat_id="wx_chat_1",
+                user_name="Customer One",
+            )
+            social_user = bound["user"]
+        finally:
+            store.close()
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                "enterprise-user-session",
+                source="web",
+                model="test-model",
+                tenant_id="acme",
+                workspace_id="default",
+                user_id=user["id"],
+                agent_id=agent["id"],
+            )
+            db.append_message("enterprise-user-session", "user", "hello agent")
+            db.append_message("enterprise-user-session", "assistant", "hello user")
+            db.create_session(
+                "enterprise-social-legacy-session",
+                source="weixin",
+                model="test-model",
+                user_id="wx_user_1",
+            )
+            db.append_message("enterprise-social-legacy-session", "user", "wechat hello agent")
+            db.append_message("enterprise-social-legacy-session", "assistant", "wechat hello user")
+        finally:
+            db.close()
+
+        detail = self.client.get(f"/api/enterprise/agents/{agent['id']}/users/{user['id']}")
+        assert detail.status_code == 200
+        payload = detail.json()
+        assert payload["user"]["id"] == user["id"]
+        assert payload["skills"] == ["calendar"]
+        assert payload["custom_skills"][0]["name"] == "private-skill"
+        assert payload["session_total"] == 1
+        assert payload["sessions"][0]["id"] == "enterprise-user-session"
+
+        messages = self.client.get(
+            f"/api/enterprise/agents/{agent['id']}/users/{user['id']}/sessions/enterprise-user-session/messages"
+        )
+        assert messages.status_code == 200
+        assert [item["content"] for item in messages.json()["messages"]] == ["hello agent", "hello user"]
+
+        social_detail = self.client.get(f"/api/enterprise/agents/{agent['id']}/users/{social_user['id']}")
+        assert social_detail.status_code == 200
+        social_payload = social_detail.json()
+        assert social_payload["session_total"] == 1
+        assert social_payload["sessions"][0]["id"] == "enterprise-social-legacy-session"
+
+        social_messages = self.client.get(
+            f"/api/enterprise/agents/{agent['id']}/users/{social_user['id']}/sessions/enterprise-social-legacy-session/messages"
+        )
+        assert social_messages.status_code == 200
+        assert [item["content"] for item in social_messages.json()["messages"]] == [
+            "wechat hello agent",
+            "wechat hello user",
+        ]
 
     def test_skills_list(self):
         resp = self.client.get("/api/skills")

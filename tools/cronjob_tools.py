@@ -300,12 +300,15 @@ def cronjob(
 
             enterprise_context = _enterprise_context_from_env()
             origin = _origin_from_env()
+            delivery = deliver
+            if delivery is None and enterprise_context and not origin:
+                delivery = "local"
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
                 name=name,
                 repeat=repeat,
-                deliver=(deliver if deliver is not None else ("local" if enterprise_context else None)),
+                deliver=delivery,
                 origin=origin,
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
@@ -330,12 +333,15 @@ def cronjob(
                         "user_id": enterprise_context["user_id"],
                         "agent_id": enterprise_context["agent_id"],
                     },
-                    "origin": {
-                        "platform": "enterprise_portal",
-                        "chat_id": origin.get("chat_id") if origin else None,
-                        "agent_id": enterprise_context["agent_id"],
-                    },
                 }
+                if origin:
+                    updates["origin"] = {**origin, "agent_id": enterprise_context["agent_id"]}
+                else:
+                    updates["origin"] = {
+                        "platform": "enterprise_portal",
+                        "chat_id": None,
+                        "agent_id": enterprise_context["agent_id"],
+                    }
                 system_message = (enterprise_context.get("system_message") or "").strip()
                 if system_message:
                     updates["enterprise_system_message"] = system_message

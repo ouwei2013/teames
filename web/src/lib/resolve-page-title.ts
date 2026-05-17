@@ -12,6 +12,19 @@ const BUILTIN: Record<string, keyof Translations["app"]["nav"]> = {
   "/docs": "documentation",
 };
 
+const CUSTOM_TITLES: Record<string, string> = {
+  "/admin-chat": "Chat",
+  "/enterprise": "Enterprise",
+  "/enterprise-builder": "Builder",
+  "/local": "Local",
+  "/local/chat": "Chat",
+  "/local/requests": "Requests",
+  "/local/skills": "Skills",
+  "/local/tools": "Tools",
+  "/local/cron": "Cron",
+  "/local/connection": "Remote",
+};
+
 export function resolvePageTitle(
   pathname: string,
   t: Translations,
@@ -24,6 +37,9 @@ export function resolvePageTitle(
   const plugin = pluginTabs.find((p) => p.path === normalized);
   if (plugin) {
     return plugin.label;
+  }
+  if (CUSTOM_TITLES[normalized]) {
+    return CUSTOM_TITLES[normalized];
   }
   const key = BUILTIN[normalized];
   if (key) {

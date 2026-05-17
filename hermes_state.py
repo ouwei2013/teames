@@ -1526,6 +1526,10 @@ class SessionDB:
                 m.tool_name,
                 s.source,
                 s.model,
+                s.tenant_id,
+                s.workspace_id,
+                s.user_id,
+                s.agent_id,
                 s.started_at AS session_started
             FROM messages_fts
             JOIN messages m ON m.id = messages_fts.rowid
@@ -1571,7 +1575,8 @@ class SessionDB:
                               max(1, instr(m.content, ?) - 40),
                               120) AS snippet,
                        m.content, m.timestamp, m.tool_name,
-                       s.source, s.model, s.started_at AS session_started
+                       s.source, s.model, s.tenant_id, s.workspace_id,
+                       s.user_id, s.agent_id, s.started_at AS session_started
                 FROM messages m
                 JOIN sessions s ON s.id = m.session_id
                 WHERE {' AND '.join(like_where)}

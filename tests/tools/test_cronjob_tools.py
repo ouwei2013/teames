@@ -204,6 +204,51 @@ class TestUnifiedCronjobTool:
         listing = json.loads(cronjob(action="list"))
         assert listing["jobs"][0]["skills"] == ["blogwatcher", "maps"]
 
+    def test_enterprise_gateway_origin_delivers_back_to_origin(self):
+        from cron.jobs import get_job
+        from gateway.session_context import (
+            clear_enterprise_vars,
+            clear_session_vars,
+            set_enterprise_vars,
+            set_session_vars,
+        )
+
+        session_tokens = set_session_vars(
+            platform="weixin",
+            chat_id="bot-1|user-1",
+            chat_name="user-1",
+            user_id="user-1",
+            user_name="User One",
+            session_key="session-1",
+        )
+        enterprise_tokens = set_enterprise_vars(
+            tenant_id="tenant-1",
+            user_id="enterprise-user-1",
+            agent_id="agent-1",
+            agent_name="Default Agent",
+            system_message="Business agent instructions",
+        )
+        try:
+            result = json.loads(
+                cronjob(
+                    action="create",
+                    prompt="提醒用户喝水。",
+                    schedule="1m",
+                    name="提醒喝水",
+                )
+            )
+        finally:
+            clear_enterprise_vars(enterprise_tokens)
+            clear_session_vars(session_tokens)
+
+        assert result["success"] is True
+        assert result["deliver"] == "origin"
+        job = get_job(result["job_id"])
+        assert job["origin"]["platform"] == "weixin"
+        assert job["origin"]["chat_id"] == "bot-1|user-1"
+        assert job["origin"]["agent_id"] == "agent-1"
+        assert job["enterprise"]["tenant_id"] == "tenant-1"
+
     def test_multi_skill_default_name_prefers_prompt_when_present(self):
         result = json.loads(
             cronjob(

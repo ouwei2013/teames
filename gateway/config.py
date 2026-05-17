@@ -1178,13 +1178,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # Weixin (personal WeChat via iLink Bot API)
     weixin_token = os.getenv("WEIXIN_TOKEN")
     weixin_account_id = os.getenv("WEIXIN_ACCOUNT_ID")
-    if weixin_token or weixin_account_id:
+    weixin_multi_account = os.getenv("WEIXIN_MULTI_ACCOUNT", "").lower() in ("true", "1", "yes")
+    if weixin_token or weixin_account_id or weixin_multi_account:
         if Platform.WEIXIN not in config.platforms:
             config.platforms[Platform.WEIXIN] = PlatformConfig()
         config.platforms[Platform.WEIXIN].enabled = True
         if weixin_token:
             config.platforms[Platform.WEIXIN].token = weixin_token
         extra = config.platforms[Platform.WEIXIN].extra
+        if weixin_multi_account:
+            extra["multi_account"] = True
         if weixin_account_id:
             extra["account_id"] = weixin_account_id
         weixin_base_url = os.getenv("WEIXIN_BASE_URL", "").strip()

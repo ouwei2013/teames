@@ -521,6 +521,156 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _load_enterprise_local_gateway_config() -> dict:
+    """Return local-enterprise join config for gateway turns, if present."""
+    try:
+        path = get_hermes_home() / "enterprise-local.json"
+        if not path.exists():
+            return {}
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            return {}
+        if not parsed.get("server") or not parsed.get("device_token"):
+            return {}
+        return parsed
+    except Exception:
+        logger.debug("Could not load enterprise local gateway config", exc_info=True)
+        return {}
+
+
+def _enterprise_local_gateway_prompt(config: dict) -> str:
+    """Build local-enterprise guidance for messaging gateway sessions."""
+    user = config.get("user") or {}
+    device = config.get("device") or {}
+    agent = config.get("agent") or {}
+    agents = config.get("agents") or []
+    if not isinstance(agents, list) or not agents:
+        agents = [agent] if isinstance(agent, dict) and agent else []
+    remote_agent_lines = [
+        f"- {item.get('name') or item.get('id')} ({item.get('id')})"
+        for item in agents
+        if isinstance(item, dict)
+    ]
+    return (
+        "You are a local Hermes agent reached through the user's own messaging "
+        "gateway on this machine. The user may be talking to you from WhatsApp, "
+        "Weixin/WeChat, Telegram, or another local gateway platform. You can help "
+        "with local tasks using normal Hermes tools and local profile state. "
+        "When the user asks about products, menus, inventory, prices, orders, "
+        "delivery, pickups, stores, customer support, company policy, HR, "
+        "business-specific knowledge, or anything owned by an assigned business "
+        "agent, call enterprise_remote before answering. Do not answer "
+        "business-scope questions from general model knowledge. Do not send "
+        "private local files, secrets, credentials, screenshots, account data, "
+        "or internal documents to remote business agents unless the local user "
+        "explicitly agrees. Prefer summaries and minimal necessary excerpts over "
+        "raw data.\n\n"
+        f"Remote server: {config.get('server') or 'not connected'}\n"
+        f"Local device: {device.get('name') or device.get('id') or 'unknown'}\n"
+        f"Enterprise user: {user.get('email') or user.get('name') or user.get('id') or 'unknown'}\n"
+        f"Default business agent: {agent.get('name') or agent.get('id') or 'none'}\n"
+        "Assigned remote business agents:\n"
+        + ("\n".join(remote_agent_lines) if remote_agent_lines else "- none")
+    )
+
+
+_SOCIAL_GATEWAY_BIND_RE = re.compile(r"^\s*/(?:bind|start)\s+([A-Za-z0-9_-]+)\s*$", re.IGNORECASE)
+_SOCIAL_GATEWAY_CODE_RE = re.compile(r"^\s*(hms_[A-Za-z0-9_-]+)\s*$")
+
+
+def _extract_social_gateway_bind_code(text: str) -> str:
+    """Return a social gateway invite code from /bind, /start, or bare code text."""
+    value = (text or "").strip()
+    if not value:
+        return ""
+    match = _SOCIAL_GATEWAY_BIND_RE.match(value)
+    if match:
+        return match.group(1)
+    match = _SOCIAL_GATEWAY_CODE_RE.match(value)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _enterprise_social_gateway_prompt(auth: dict) -> str:
+    """Build the enterprise business-agent prompt for a social gateway binding."""
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            user = auth.get("user") or {}
+            agent = auth.get("agent") or {}
+            system_message = store.compile_agent_prompt(agent)
+            skill_names = store.list_user_agent_skill_names(user, agent["id"])
+            custom_skills = store.list_agent_custom_skills(
+                agent["id"],
+                tenant_id=agent["tenant_id"],
+                enabled_only=True,
+            ) + store.list_user_agent_custom_skills(
+                user,
+                agent["id"],
+                enabled_only=True,
+            )
+        finally:
+            store.close()
+
+        if not skill_names and not custom_skills:
+            return system_message
+
+        sections = []
+        remaining_budget = 24000
+        try:
+            from tools.skills_tool import skill_view
+        except Exception:
+            skill_view = None
+
+        for name in skill_names:
+            if not skill_view or remaining_budget <= 0:
+                break
+            try:
+                payload = json.loads(skill_view(name, preprocess=False))
+            except Exception:
+                continue
+            if not isinstance(payload, dict) or not payload.get("success"):
+                continue
+            content = str(payload.get("content") or "").strip()
+            if not content:
+                continue
+            if len(content) > remaining_budget:
+                content = content[:remaining_budget].rstrip()
+            sections.append(f"## Skill: {payload.get('name') or name}\n{content}")
+            remaining_budget -= len(content)
+
+        for skill in custom_skills:
+            if remaining_budget <= 0:
+                break
+            content = str(skill.get("content") or "").strip()
+            if not content:
+                continue
+            if len(content) > remaining_budget:
+                content = content[:remaining_budget].rstrip()
+            heading = f"## Enterprise Skill: {skill.get('name') or 'custom skill'}"
+            if skill.get("description"):
+                heading = f"{heading}\n{skill['description']}"
+            sections.append(f"{heading}\n{content}")
+            remaining_budget -= len(content)
+
+        if sections:
+            system_message = f"{system_message}\n\n# User-Selected Skills\n" + "\n\n".join(sections)
+        return system_message
+    except Exception:
+        logger.debug("Could not build enterprise social gateway prompt", exc_info=True)
+        return ""
+
+
+def _enterprise_social_enabled_toolsets(enabled_toolsets: list[str]) -> list[str]:
+    blocked = {"skills"}
+    next_toolsets = {str(toolset) for toolset in enabled_toolsets if str(toolset) not in blocked}
+    next_toolsets.add("enterprise_skills")
+    return sorted(next_toolsets)
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -941,15 +1091,95 @@ class GatewayRunner:
             try:
                 session_key = self.session_store._generate_session_key(source)
                 if isinstance(session_key, str) and session_key:
+                    suffix = self._social_gateway_session_suffix(source)
+                    if suffix:
+                        try:
+                            setattr(source, "enterprise_session_suffix", suffix)
+                        except Exception:
+                            pass
+                        if not session_key.endswith(suffix):
+                            return session_key + suffix
                     return session_key
             except Exception:
                 pass
         config = getattr(self, "config", None)
-        return build_session_key(
+        session_key = build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+        suffix = self._social_gateway_session_suffix(source)
+        if suffix:
+            try:
+                setattr(source, "enterprise_session_suffix", suffix)
+            except Exception:
+                pass
+        return session_key + suffix
+
+    def _social_gateway_bot_account_id(self, source: SessionSource) -> str:
+        """Return the connected bot/account id for platform-scoped social bindings."""
+        try:
+            value = getattr(source, "bot_account_id", None)
+            if value:
+                return str(value)
+        except Exception:
+            pass
+        try:
+            if source.platform and source.platform.value == "weixin" and source.chat_id and "|" in source.chat_id:
+                return source.chat_id.split("|", 1)[0]
+        except Exception:
+            pass
+        try:
+            adapter = self.adapters.get(source.platform)
+            for attr in ("_account_id", "_bot_id", "bot_id"):
+                value = getattr(adapter, attr, None)
+                if value:
+                    return str(value)
+        except Exception:
+            pass
+        return ""
+
+    def _resolve_social_gateway_auth(self, source: SessionSource) -> Optional[dict]:
+        """Resolve an enterprise social binding for this platform sender."""
+        if not source or not source.platform or not source.user_id:
+            return None
+        try:
+            from enterprise import EnterpriseStore
+
+            store = EnterpriseStore()
+            try:
+                auth = store.resolve_social_gateway_binding(
+                    platform=source.platform.value,
+                    external_user_id=str(source.user_id),
+                    bot_account_id=self._social_gateway_bot_account_id(source),
+                )
+                if auth:
+                    return auth
+                return store.resolve_social_gateway_binding_by_bot_account(
+                    platform=source.platform.value,
+                    bot_account_id=self._social_gateway_bot_account_id(source),
+                )
+            finally:
+                store.close()
+        except Exception:
+            logger.debug("social gateway binding lookup failed", exc_info=True)
+            return None
+
+    def _social_gateway_session_suffix(self, source: SessionSource) -> str:
+        auth = self._resolve_social_gateway_auth(source)
+        if not auth:
+            return ""
+        ctx = auth.get("access_context")
+        try:
+            data = ctx.as_dict()
+        except Exception:
+            data = {}
+        tenant_id = data.get("tenant_id") or auth.get("binding", {}).get("tenant_id")
+        user_id = data.get("user_id") or auth.get("binding", {}).get("user_id")
+        agent_id = data.get("agent_id") or auth.get("binding", {}).get("agent_id")
+        if tenant_id and user_id and agent_id:
+            return f":enterprise:{tenant_id}:{user_id}:{agent_id}"
+        return ""
 
     def _resolve_session_agent_runtime(
         self,
@@ -2848,11 +3078,16 @@ class GatewayRunner:
             return WeComAdapter(config)
 
         elif platform == Platform.WEIXIN:
-            from gateway.platforms.weixin import WeixinAdapter, check_weixin_requirements
+            from gateway.platforms.weixin import WeixinAdapter, WeixinMultiAccountAdapter, check_weixin_requirements
             if not check_weixin_requirements():
                 logger.warning("Weixin: aiohttp/cryptography not installed")
                 return None
-            return WeixinAdapter(config)
+            use_multi = (
+                is_truthy_value(getattr(config, "extra", {}).get("multi_account"), default=False)
+                or os.getenv("WEIXIN_MULTI_ACCOUNT", "").lower() in ("true", "1", "yes")
+                or os.getenv("ENTERPRISE_SOCIAL_WEIXIN_MULTI_ACCOUNT", "").lower() in ("true", "1", "yes")
+            )
+            return WeixinMultiAccountAdapter(config) if use_multi else WeixinAdapter(config)
 
         elif platform == Platform.MATTERMOST:
             from gateway.platforms.mattermost import MattermostAdapter, check_mattermost_requirements
@@ -3171,7 +3406,48 @@ class GatewayRunner:
             # flow with a None user_id.
             logger.debug("Ignoring message with no user_id from %s", source.platform.value)
             return None
-        elif not self._is_user_authorized(source):
+        else:
+            bind_code = _extract_social_gateway_bind_code(event.text or "")
+            if bind_code:
+                try:
+                    from enterprise import EnterpriseStore
+
+                    store = EnterpriseStore()
+                    try:
+                        bound = store.bind_social_gateway_user(
+                            code=bind_code,
+                            platform=source.platform.value,
+                            external_user_id=str(source.user_id),
+                            bot_account_id=self._social_gateway_bot_account_id(source),
+                            external_chat_id=source.chat_id,
+                            user_name=source.user_name,
+                        )
+                    finally:
+                        store.close()
+                    suffix = self._social_gateway_session_suffix(source)
+                    if suffix:
+                        setattr(source, "enterprise_session_suffix", suffix)
+                    agent = bound.get("agent") or {}
+                    return (
+                        "Connected. You can now chat with "
+                        f"{agent.get('name') or 'the remote agent'} here."
+                    )
+                except ValueError as exc:
+                    return f"Could not connect this chat: {exc}"
+                except Exception as exc:
+                    logger.exception("social gateway bind failed")
+                    return f"Could not connect this chat: {exc}"
+
+        social_gateway_auth = None if is_internal else self._resolve_social_gateway_auth(source)
+        if social_gateway_auth:
+            try:
+                suffix = self._social_gateway_session_suffix(source)
+                if suffix:
+                    setattr(source, "enterprise_session_suffix", suffix)
+                setattr(event, "enterprise_social_gateway_auth", social_gateway_auth)
+            except Exception:
+                pass
+        elif not is_internal and not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
@@ -9315,6 +9591,18 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enterprise_local_config = _load_enterprise_local_gateway_config()
+        enterprise_local_prompt = ""
+        if enterprise_local_config:
+            enterprise_local_prompt = _enterprise_local_gateway_prompt(enterprise_local_config)
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"enterprise_remote"})
+        enterprise_social_auth = self._resolve_social_gateway_auth(source)
+        enterprise_social_prompt = ""
+        enterprise_social_access_context = None
+        if enterprise_social_auth:
+            enterprise_social_prompt = _enterprise_social_gateway_prompt(enterprise_social_auth)
+            enterprise_social_access_context = enterprise_social_auth.get("access_context")
+            enabled_toolsets = _enterprise_social_enabled_toolsets(enabled_toolsets)
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -9654,6 +9942,10 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+            if enterprise_local_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + enterprise_local_prompt).strip()
+            if enterprise_social_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + enterprise_social_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
@@ -9843,6 +10135,7 @@ class GatewayRunner:
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    access_context=enterprise_social_access_context,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
@@ -10120,9 +10413,32 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            _enterprise_tokens = None
+            if enterprise_social_auth:
+                try:
+                    from gateway.session_context import set_enterprise_vars
+
+                    _ent_user = enterprise_social_auth.get("user") or {}
+                    _ent_agent = enterprise_social_auth.get("agent") or {}
+                    _enterprise_tokens = set_enterprise_vars(
+                        tenant_id=_ent_user.get("tenant_id") or _ent_agent.get("tenant_id") or "",
+                        user_id=_ent_user.get("id") or "",
+                        agent_id=_ent_agent.get("id") or "",
+                        agent_name=_ent_agent.get("name") or "",
+                        system_message=enterprise_social_prompt or "",
+                    )
+                except Exception:
+                    logger.debug("Could not set enterprise social gateway vars", exc_info=True)
             try:
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             finally:
+                if _enterprise_tokens is not None:
+                    try:
+                        from gateway.session_context import clear_enterprise_vars
+
+                        clear_enterprise_vars(_enterprise_tokens)
+                    except Exception:
+                        logger.debug("Could not clear enterprise social gateway vars", exc_info=True)
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result

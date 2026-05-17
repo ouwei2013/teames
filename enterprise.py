@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import secrets
 import sqlite3
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT,
     role TEXT NOT NULL DEFAULT 'member',
     api_key_hash TEXT UNIQUE,
+    password_hash TEXT,
     created_at REAL NOT NULL,
     disabled_at REAL
 );
@@ -176,6 +178,56 @@ CREATE TABLE IF NOT EXISTS local_agent_requests (
     responded_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS local_device_gateway_bindings (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    device_id TEXT NOT NULL REFERENCES local_devices(id),
+    platform TEXT NOT NULL,
+    bot_account_id TEXT NOT NULL DEFAULT '',
+    external_user_id TEXT NOT NULL,
+    external_chat_id TEXT,
+    user_name TEXT,
+    source_session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at REAL NOT NULL,
+    last_seen_at REAL,
+    UNIQUE(device_id, platform, bot_account_id, external_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS social_gateway_invites (
+    code_hash TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    platform TEXT,
+    label TEXT,
+    max_uses INTEGER NOT NULL DEFAULT 1,
+    uses INTEGER NOT NULL DEFAULT 0,
+    expires_at REAL,
+    created_by_user_id TEXT,
+    created_at REAL NOT NULL,
+    revoked_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS social_gateway_bindings (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    platform TEXT NOT NULL,
+    bot_account_id TEXT NOT NULL DEFAULT '',
+    external_user_id TEXT NOT NULL,
+    external_chat_id TEXT,
+    user_name TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    invite_code_hash TEXT REFERENCES social_gateway_invites(code_hash),
+    created_at REAL NOT NULL,
+    last_seen_at REAL,
+    revoked_at REAL,
+    UNIQUE(platform, bot_account_id, external_user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_enterprise_users_tenant ON users(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_enterprise_users_key ON users(api_key_hash);
 CREATE INDEX IF NOT EXISTS idx_enterprise_invites_tenant ON invites(tenant_id);
@@ -198,11 +250,48 @@ CREATE INDEX IF NOT EXISTS idx_enterprise_local_requests_device
     ON local_agent_requests(device_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_enterprise_local_requests_tenant
     ON local_agent_requests(tenant_id, user_id, agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_enterprise_local_gateway_bindings_tenant
+    ON local_device_gateway_bindings(tenant_id, user_id, agent_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_social_invites_tenant
+    ON social_gateway_invites(tenant_id, agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_enterprise_social_bindings_identity
+    ON social_gateway_bindings(platform, bot_account_id, external_user_id);
+CREATE INDEX IF NOT EXISTS idx_enterprise_social_bindings_tenant
+    ON social_gateway_bindings(tenant_id, user_id, agent_id);
 """
 
 
 def _hash_secret(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _hash_password(value: str) -> str:
+    password = (value or "").strip()
+    if len(password) < 6:
+        raise ValueError("password must be at least 6 characters")
+    salt = secrets.token_hex(16)
+    iterations = 120_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations)
+    return f"pbkdf2_sha256${iterations}${salt}${digest.hex()}"
+
+
+def _verify_password(value: str, encoded: Optional[str]) -> bool:
+    password = (value or "").strip()
+    if not password or not encoded:
+        return False
+    try:
+        scheme, iterations_text, salt, expected = encoded.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(iterations_text),
+        )
+        return hmac.compare_digest(digest.hex(), expected)
+    except Exception:
+        return False
 
 
 def _new_user_token() -> str:
@@ -227,6 +316,18 @@ def _new_device_code() -> str:
 
 def _new_device_token() -> str:
     return "hmdt_" + secrets.token_urlsafe(32)
+
+
+def _new_social_invite_code() -> str:
+    return "hms_" + secrets.token_urlsafe(18)
+
+
+def _new_social_binding_id() -> str:
+    return "sgb_" + uuid.uuid4().hex[:12]
+
+
+def _new_local_gateway_binding_id() -> str:
+    return "lgb_" + uuid.uuid4().hex[:12]
 
 
 def _new_bridge_request_id() -> str:
@@ -272,6 +373,12 @@ class EnterpriseStore:
     def _repair_schema(self) -> None:
         """Defensively add columns/tables for older enterprise.db files."""
         self._conn.executescript(SCHEMA_SQL)
+        user_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "password_hash" not in user_columns:
+            self._conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
 
     def _ensure_default_agents(self) -> None:
         tenants = self._conn.execute("SELECT * FROM tenants").fetchall()
@@ -561,6 +668,101 @@ class EnterpriseStore:
             (user_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def list_agent_users(
+        self,
+        agent_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        rows = self._conn.execute(
+            """SELECT u.id, u.tenant_id, u.email, u.name, u.role,
+                      u.created_at, u.disabled_at,
+                      uaa.role AS access_role,
+                      uaa.created_at AS access_created_at,
+                      (
+                        SELECT COUNT(*)
+                        FROM user_agent_skills s
+                        WHERE s.tenant_id = uaa.tenant_id
+                          AND s.user_id = uaa.user_id
+                          AND s.agent_id = uaa.agent_id
+                          AND s.enabled = 1
+                      ) AS skill_count,
+                      (
+                        SELECT COUNT(*)
+                        FROM user_agent_custom_skills cs
+                        WHERE cs.tenant_id = uaa.tenant_id
+                          AND cs.user_id = uaa.user_id
+                          AND cs.agent_id = uaa.agent_id
+                          AND cs.enabled = 1
+                      ) AS custom_skill_count,
+                      (
+                        SELECT COUNT(*)
+                        FROM social_gateway_bindings b
+                        WHERE b.tenant_id = uaa.tenant_id
+                          AND b.user_id = uaa.user_id
+                          AND b.agent_id = uaa.agent_id
+                          AND b.revoked_at IS NULL
+                          AND b.status = 'active'
+                      ) AS social_binding_count,
+                      (
+                        SELECT COUNT(*)
+                        FROM local_devices d
+                        WHERE d.tenant_id = uaa.tenant_id
+                          AND d.user_id = uaa.user_id
+                          AND d.agent_id = uaa.agent_id
+                          AND d.revoked_at IS NULL
+                      ) AS local_device_count,
+                      (
+                        SELECT MAX(b.last_seen_at)
+                        FROM social_gateway_bindings b
+                        WHERE b.tenant_id = uaa.tenant_id
+                          AND b.user_id = uaa.user_id
+                          AND b.agent_id = uaa.agent_id
+                      ) AS social_last_seen_at,
+                      (
+                        SELECT MAX(d.last_seen_at)
+                        FROM local_devices d
+                        WHERE d.tenant_id = uaa.tenant_id
+                          AND d.user_id = uaa.user_id
+                          AND d.agent_id = uaa.agent_id
+                      ) AS device_last_seen_at
+               FROM user_agent_access uaa
+               JOIN users u ON u.id = uaa.user_id AND u.tenant_id = uaa.tenant_id
+               WHERE uaa.tenant_id = ? AND uaa.agent_id = ?
+               ORDER BY COALESCE(social_last_seen_at, device_last_seen_at, uaa.created_at) DESC,
+                        u.created_at DESC""",
+            (agent["tenant_id"], agent["id"]),
+        ).fetchall()
+        users: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            last_seen_values = [
+                value
+                for value in (item.get("social_last_seen_at"), item.get("device_last_seen_at"))
+                if value is not None
+            ]
+            item["last_seen_at"] = max(last_seen_values) if last_seen_values else None
+            users.append(item)
+        return users
+
+    def get_agent_user(
+        self,
+        agent_id: str,
+        user_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        user_key = (user_id or "").strip()
+        if not user_key:
+            return None
+        for user in self.list_agent_users(agent_id, tenant_id=tenant_id):
+            if user.get("id") == user_key:
+                return user
+        return None
 
     def resolve_user_agent(
         self,
@@ -1037,6 +1239,44 @@ class EnterpriseStore:
             "agent": agent,
         }
 
+    def register_local_device_for_user(
+        self,
+        user: Dict[str, Any],
+        *,
+        agent_id: Optional[str] = None,
+        device_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not user or not user.get("id") or user.get("disabled_at") is not None:
+            raise ValueError("active user is required")
+        agent = self.resolve_user_agent(user, agent_id=agent_id)
+        now = time.time()
+        token = _new_device_token()
+        device_id = _new_device_id()
+        name = (device_name or "").strip() or "Local Hermes Agent"
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO local_devices
+                   (id, tenant_id, user_id, agent_id, name, api_key_hash, status,
+                    created_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                (
+                    device_id,
+                    user["tenant_id"],
+                    user["id"],
+                    agent["id"],
+                    name,
+                    _hash_secret(token),
+                    now,
+                    now,
+                ),
+            )
+        return {
+            "device": self.get_local_device(device_id),
+            "device_token": token,
+            "user": user,
+            "agent": agent,
+        }
+
     def get_local_device(self, device_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             """SELECT d.*, u.email AS user_email, u.name AS user_name,
@@ -1125,6 +1365,121 @@ class EnterpriseStore:
             "agent": agent,
             "access_context": access_context,
         }
+
+    def record_local_device_gateway_binding(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        agent_id: str,
+        device_id: str,
+        platform: str,
+        external_user_id: str,
+        bot_account_id: Optional[str] = None,
+        external_chat_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+        source_session_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        platform_key = (platform or "").strip().lower()
+        external_id = (external_user_id or "").strip()
+        bot_id = (bot_account_id or "").strip()
+        if not tenant_id or not user_id or not agent_id or not device_id or not platform_key or not external_id:
+            return None
+        now = time.time()
+        existing = self._conn.execute(
+            """SELECT id FROM local_device_gateway_bindings
+               WHERE device_id = ? AND platform = ? AND bot_account_id = ? AND external_user_id = ?
+               LIMIT 1""",
+            (device_id, platform_key, bot_id, external_id),
+        ).fetchone()
+        with self._conn:
+            if existing:
+                binding_id = existing["id"]
+                self._conn.execute(
+                    """UPDATE local_device_gateway_bindings
+                       SET tenant_id = ?, user_id = ?, agent_id = ?, external_chat_id = ?,
+                           user_name = COALESCE(?, user_name), source_session_id = COALESCE(?, source_session_id),
+                           status = 'active', last_seen_at = ?
+                       WHERE id = ?""",
+                    (
+                        tenant_id,
+                        user_id,
+                        agent_id,
+                        (external_chat_id or "").strip() or None,
+                        (user_name or "").strip() or None,
+                        (source_session_id or "").strip() or None,
+                        now,
+                        binding_id,
+                    ),
+                )
+            else:
+                binding_id = _new_local_gateway_binding_id()
+                self._conn.execute(
+                    """INSERT INTO local_device_gateway_bindings
+                       (id, tenant_id, user_id, agent_id, device_id, platform, bot_account_id,
+                        external_user_id, external_chat_id, user_name, source_session_id,
+                        created_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        binding_id,
+                        tenant_id,
+                        user_id,
+                        agent_id,
+                        device_id,
+                        platform_key,
+                        bot_id,
+                        external_id,
+                        (external_chat_id or "").strip() or None,
+                        (user_name or "").strip() or None,
+                        (source_session_id or "").strip() or None,
+                        now,
+                        now,
+                    ),
+                )
+        row = self._conn.execute(
+            """SELECT b.*, d.name AS local_device_name, u.email AS user_email, u.name AS user_name_saved,
+                      a.name AS agent_name
+               FROM local_device_gateway_bindings b
+               JOIN local_devices d ON d.id = b.device_id
+               JOIN users u ON u.id = b.user_id AND u.tenant_id = b.tenant_id
+               JOIN agents a ON a.id = b.agent_id AND a.tenant_id = b.tenant_id
+               WHERE b.id = ?""",
+            (binding_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_agent_local_device_gateway_bindings(
+        self,
+        agent_id: str,
+        *,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        params: List[Any] = [agent["tenant_id"], agent["id"]]
+        user_clause = ""
+        if user_id:
+            user_clause = "AND b.user_id = ?"
+            params.append((user_id or "").strip())
+        rows = self._conn.execute(
+            f"""SELECT b.*, d.name AS local_device_name, u.email AS user_email, u.name AS user_name_saved,
+                       a.name AS agent_name
+                FROM local_device_gateway_bindings b
+                JOIN local_devices d ON d.id = b.device_id
+                JOIN users u ON u.id = b.user_id AND u.tenant_id = b.tenant_id
+                JOIN agents a ON a.id = b.agent_id AND a.tenant_id = b.tenant_id
+                WHERE b.tenant_id = ? AND b.agent_id = ? {user_clause}
+                ORDER BY b.last_seen_at DESC, b.created_at DESC""",
+            tuple(params),
+        ).fetchall()
+        bindings = []
+        for row in rows:
+            binding = dict(row)
+            binding["binding_type"] = "local_device_gateway"
+            bindings.append(binding)
+        return bindings
 
     def create_local_agent_request(
         self,
@@ -1393,10 +1748,12 @@ class EnterpriseStore:
         *,
         email: Optional[str] = None,
         name: Optional[str] = None,
+        password: Optional[str] = None,
     ) -> Dict[str, Any]:
         code = (code or "").strip()
         if not code:
             raise ValueError("invite code is required")
+        password_hash = _hash_password(password) if password is not None else None
         now = time.time()
         with self._conn:
             invite = self._conn.execute(
@@ -1410,13 +1767,54 @@ class EnterpriseStore:
                 raise ValueError("invite code has been revoked")
             if invite_dict.get("expires_at") is not None and invite_dict["expires_at"] < now:
                 raise ValueError("invite code has expired")
-            if int(invite_dict.get("uses") or 0) >= int(invite_dict.get("max_uses") or 1):
-                raise ValueError("invite code has already been used")
-
             invite_email = invite_dict.get("email")
             provided_email = (email or "").strip() or invite_email
             if invite_email and provided_email and invite_email.lower() != provided_email.lower():
                 raise ValueError("invite code is restricted to a different email")
+            if int(invite_dict.get("uses") or 0) >= int(invite_dict.get("max_uses") or 1):
+                if password is not None:
+                    existing = self.authenticate_invite_password(code, password)
+                    if existing:
+                        return existing
+                    if invite_email and provided_email:
+                        user_row = self._conn.execute(
+                            """SELECT * FROM users
+                               WHERE tenant_id = ? AND lower(email) = lower(?) AND disabled_at IS NULL
+                               ORDER BY created_at DESC LIMIT 1""",
+                            (invite_dict["tenant_id"], provided_email),
+                        ).fetchone()
+                        if user_row:
+                            user = dict(user_row)
+                            if not user.get("password_hash"):
+                                token = _new_user_token()
+                                updated_name = (name or "").strip() or user.get("name") or provided_email
+                                self._conn.execute(
+                                    """UPDATE users
+                                       SET password_hash = ?, api_key_hash = ?, name = ?
+                                       WHERE id = ? AND tenant_id = ?""",
+                                    (
+                                        _hash_password(password),
+                                        _hash_secret(token),
+                                        updated_name,
+                                        user["id"],
+                                        user["tenant_id"],
+                                    ),
+                                )
+                                user["name"] = updated_name
+                                user_payload = {
+                                    "id": user["id"],
+                                    "tenant_id": user["tenant_id"],
+                                    "email": user.get("email"),
+                                    "name": updated_name,
+                                    "role": user.get("role"),
+                                    "created_at": user.get("created_at"),
+                                }
+                                return {
+                                    "user": user_payload,
+                                    "api_key": token,
+                                    "agents": self.list_user_agents(user["id"]),
+                                }
+                raise ValueError("invite code has already been used")
 
             token = _new_user_token()
             user_id = f"user_{uuid.uuid4().hex[:12]}"
@@ -1429,8 +1827,8 @@ class EnterpriseStore:
                 agent_ids = [self._default_agent_for_tenant(invite_dict["tenant_id"])["id"]]
             self._conn.execute(
                 """INSERT INTO users
-                   (id, tenant_id, email, name, role, api_key_hash, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (id, tenant_id, email, name, role, api_key_hash, password_hash, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     user_id,
                     invite_dict["tenant_id"],
@@ -1438,6 +1836,7 @@ class EnterpriseStore:
                     (name or "").strip() or provided_email or "User",
                     invite_dict["role"],
                     _hash_secret(token),
+                    password_hash,
                     now,
                 ),
             )
@@ -1467,6 +1866,83 @@ class EnterpriseStore:
             "api_key": token,
             "agents": self.list_user_agents(user_id),
         }
+
+    def authenticate_invite_password(self, code: str, password: str) -> Optional[Dict[str, Any]]:
+        code = (code or "").strip()
+        if not code:
+            return None
+        invite = self._conn.execute(
+            "SELECT * FROM invites WHERE code_hash = ?",
+            (_hash_secret(code),),
+        ).fetchone()
+        if not invite:
+            return None
+        invite_dict = dict(invite)
+        now = time.time()
+        if invite_dict.get("revoked_at") is not None:
+            return None
+        if invite_dict.get("expires_at") is not None and invite_dict["expires_at"] < now:
+            return None
+        invite_email = (invite_dict.get("email") or "").strip()
+        if not invite_email:
+            return None
+        user_row = self._conn.execute(
+            """SELECT * FROM users
+               WHERE tenant_id = ? AND lower(email) = lower(?) AND disabled_at IS NULL
+               ORDER BY created_at DESC LIMIT 1""",
+            (invite_dict["tenant_id"], invite_email),
+        ).fetchone()
+        if not user_row:
+            return None
+        user = dict(user_row)
+        if not _verify_password(password, user.get("password_hash")):
+            return None
+        token = self.issue_user_api_key(user["id"])
+        return {
+            "user": user,
+            "api_key": token,
+            "agents": self.list_user_agents(user["id"]),
+        }
+
+    def authenticate_password(self, email: str, password: str) -> Optional[Dict[str, Any]]:
+        normalized_email = (email or "").strip()
+        if not normalized_email or not (password or "").strip():
+            return None
+        user_row = self._conn.execute(
+            """SELECT u.*, t.name AS tenant_name
+               FROM users u
+               JOIN tenants t ON t.id = u.tenant_id
+               WHERE lower(u.email) = lower(?) AND u.disabled_at IS NULL
+               ORDER BY u.created_at DESC LIMIT 1""",
+            (normalized_email,),
+        ).fetchone()
+        if not user_row:
+            return None
+        user = dict(user_row)
+        if not _verify_password(password, user.get("password_hash")):
+            return None
+        token = self.issue_user_api_key(user["id"])
+        agents = self.list_user_agents(user["id"])
+        return {
+            "user": user,
+            "api_key": token,
+            "agents": agents,
+            "access_context": AccessContext(
+                tenant_id=user["tenant_id"],
+                workspace_id="default",
+                user_id=user["id"],
+                agent_id=(agents[0]["id"] if agents else "default"),
+            ),
+        }
+
+    def issue_user_api_key(self, user_id: str) -> str:
+        token = _new_user_token()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE users SET api_key_hash = ? WHERE id = ? AND disabled_at IS NULL",
+                (_hash_secret(token), user_id),
+            )
+        return token
 
     def authenticate_api_key(self, token: str) -> Optional[Dict[str, Any]]:
         token = (token or "").strip()
@@ -1531,3 +2007,350 @@ class EnterpriseStore:
             item.pop("code_hash", None)
             invites.append(item)
         return invites
+
+    def create_social_gateway_invite(
+        self,
+        *,
+        agent_id: str,
+        platform: Optional[str] = None,
+        label: Optional[str] = None,
+        max_uses: int = 1,
+        expires_days: Optional[int] = 7,
+        created_by_user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        tenant = self.get_default_tenant()
+        if not tenant:
+            raise ValueError("enterprise tenant is not initialized")
+        agent = self.get_agent(agent_id, tenant_id=tenant["id"])
+        if not agent or agent.get("status") != "active":
+            raise ValueError("agent not found or disabled")
+        normalized_platform = (platform or "").strip().lower() or None
+        uses_limit = max(1, int(max_uses or 1))
+        expires_at = None
+        if expires_days is not None and int(expires_days) > 0:
+            expires_at = time.time() + int(expires_days) * 86400
+        code = _new_social_invite_code()
+        code_hash = _hash_secret(code)
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                """INSERT INTO social_gateway_invites
+                   (code_hash, tenant_id, agent_id, platform, label, max_uses,
+                    expires_at, created_by_user_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    code_hash,
+                    tenant["id"],
+                    agent["id"],
+                    normalized_platform,
+                    (label or "").strip() or None,
+                    uses_limit,
+                    expires_at,
+                    created_by_user_id,
+                    now,
+                ),
+            )
+        return {
+            "code": code,
+            "tenant_id": tenant["id"],
+            "agent_id": agent["id"],
+            "agent_name": agent.get("name"),
+            "platform": normalized_platform,
+            "label": (label or "").strip() or None,
+            "max_uses": uses_limit,
+            "uses": 0,
+            "expires_at": expires_at,
+            "created_at": now,
+        }
+
+    def _get_social_gateway_invite_by_code(self, code: str) -> Optional[Dict[str, Any]]:
+        code = (code or "").strip()
+        if not code:
+            return None
+        row = self._conn.execute(
+            """SELECT i.*, a.name AS agent_name
+               FROM social_gateway_invites i
+               JOIN agents a ON a.id = i.agent_id AND a.tenant_id = i.tenant_id
+               WHERE i.code_hash = ?""",
+            (_hash_secret(code),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_social_gateway_invites(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT i.tenant_id, i.agent_id, a.name AS agent_name, i.platform,
+                      i.label, i.max_uses, i.uses, i.expires_at,
+                      i.created_by_user_id, i.created_at, i.revoked_at
+               FROM social_gateway_invites i
+               JOIN agents a ON a.id = i.agent_id AND a.tenant_id = i.tenant_id
+               ORDER BY i.created_at DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def bind_social_gateway_user(
+        self,
+        *,
+        code: str,
+        platform: str,
+        external_user_id: str,
+        bot_account_id: Optional[str] = None,
+        external_chat_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        platform_key = (platform or "").strip().lower()
+        external_id = (external_user_id or "").strip()
+        bot_id = (bot_account_id or "").strip()
+        if not platform_key:
+            raise ValueError("platform is required")
+        if not external_id:
+            raise ValueError("external user id is required")
+        invite = self._get_social_gateway_invite_by_code(code)
+        if not invite:
+            raise ValueError("invalid social gateway invite code")
+        now = time.time()
+        if invite.get("revoked_at") is not None:
+            raise ValueError("social gateway invite has been revoked")
+        if invite.get("expires_at") is not None and invite["expires_at"] < now:
+            raise ValueError("social gateway invite has expired")
+        if invite.get("platform") and invite["platform"] != platform_key:
+            raise ValueError("social gateway invite is restricted to a different platform")
+        existing = self.resolve_social_gateway_binding(
+            platform=platform_key,
+            external_user_id=external_id,
+            bot_account_id=bot_id,
+            include_revoked=True,
+        )
+        is_new_binding = existing is None
+        existing_invite_hash = (existing or {}).get("binding", {}).get("invite_code_hash")
+        is_same_invite = bool(existing_invite_hash and existing_invite_hash == invite.get("code_hash"))
+        if (is_new_binding or not is_same_invite) and int(invite.get("uses") or 0) >= int(invite.get("max_uses") or 1):
+            raise ValueError("social gateway invite has already been used")
+
+        with self._conn:
+            if existing:
+                user_id = existing["user"]["id"]
+                binding_id = existing["binding"]["id"]
+            else:
+                user_id = f"user_{uuid.uuid4().hex[:12]}"
+                display_name = (user_name or "").strip() or f"{platform_key} user"
+                self._conn.execute(
+                    """INSERT INTO users
+                       (id, tenant_id, email, name, role, created_at)
+                       VALUES (?, ?, NULL, ?, 'member', ?)""",
+                    (user_id, invite["tenant_id"], display_name, now),
+                )
+                binding_id = _new_social_binding_id()
+
+            self.grant_agent_access(
+                user_id=user_id,
+                agent_id=invite["agent_id"],
+                role="user",
+                tenant_id=invite["tenant_id"],
+                granted_by_user_id=invite.get("created_by_user_id"),
+                commit=False,
+            )
+            if existing:
+                self._conn.execute(
+                    """UPDATE social_gateway_bindings
+                       SET tenant_id = ?, user_id = ?, agent_id = ?, external_chat_id = ?,
+                           user_name = COALESCE(?, user_name), status = 'active',
+                           invite_code_hash = ?, last_seen_at = ?, revoked_at = NULL
+                       WHERE id = ?""",
+                    (
+                        invite["tenant_id"],
+                        user_id,
+                        invite["agent_id"],
+                        (external_chat_id or "").strip() or None,
+                        (user_name or "").strip() or None,
+                        invite["code_hash"],
+                        now,
+                        binding_id,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT INTO social_gateway_bindings
+                       (id, tenant_id, user_id, agent_id, platform, bot_account_id,
+                        external_user_id, external_chat_id, user_name, invite_code_hash,
+                        created_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        binding_id,
+                        invite["tenant_id"],
+                        user_id,
+                        invite["agent_id"],
+                        platform_key,
+                        bot_id,
+                        external_id,
+                        (external_chat_id or "").strip() or None,
+                        (user_name or "").strip() or None,
+                        invite["code_hash"],
+                        now,
+                        now,
+                    ),
+                )
+            if is_new_binding or not is_same_invite:
+                self._conn.execute(
+                    "UPDATE social_gateway_invites SET uses = uses + 1 WHERE code_hash = ?",
+                    (invite["code_hash"],),
+                )
+        resolved = self.resolve_social_gateway_binding(
+            platform=platform_key,
+            external_user_id=external_id,
+            bot_account_id=bot_id,
+        )
+        if not resolved:
+            raise RuntimeError("failed to create social gateway binding")
+        resolved["invite"] = {
+            "tenant_id": invite["tenant_id"],
+            "agent_id": invite["agent_id"],
+            "agent_name": invite.get("agent_name"),
+            "platform": invite.get("platform"),
+            "label": invite.get("label"),
+        }
+        return resolved
+
+    def resolve_social_gateway_binding(
+        self,
+        *,
+        platform: str,
+        external_user_id: str,
+        bot_account_id: Optional[str] = None,
+        include_revoked: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        platform_key = (platform or "").strip().lower()
+        external_id = (external_user_id or "").strip()
+        bot_id = (bot_account_id or "").strip()
+        if not platform_key or not external_id:
+            return None
+        revoked_clause = "" if include_revoked else "AND b.revoked_at IS NULL AND b.status = 'active'"
+        row = self._conn.execute(
+            f"""SELECT b.*, u.email AS user_email, u.name AS user_name_saved, u.role AS user_role,
+                       u.created_at AS user_created_at, u.disabled_at AS user_disabled_at,
+                       a.name AS agent_name, a.description AS agent_description
+                FROM social_gateway_bindings b
+                JOIN users u ON u.id = b.user_id AND u.tenant_id = b.tenant_id
+                JOIN agents a ON a.id = b.agent_id AND a.tenant_id = b.tenant_id
+                WHERE b.platform = ? AND b.bot_account_id = ? AND b.external_user_id = ?
+                      {revoked_clause}
+                ORDER BY b.created_at DESC LIMIT 1""",
+            (platform_key, bot_id, external_id),
+        ).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        if data.get("user_disabled_at") is not None and not include_revoked:
+            return None
+        now = time.time()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE social_gateway_bindings SET last_seen_at = ? WHERE id = ?",
+                (now, data["id"]),
+            )
+        binding = {
+            "id": data["id"],
+            "tenant_id": data["tenant_id"],
+            "user_id": data["user_id"],
+            "agent_id": data["agent_id"],
+            "platform": data["platform"],
+            "bot_account_id": data.get("bot_account_id") or "",
+            "external_user_id": data["external_user_id"],
+            "external_chat_id": data.get("external_chat_id"),
+            "user_name": data.get("user_name"),
+            "status": data.get("status"),
+            "invite_code_hash": data.get("invite_code_hash"),
+            "created_at": data.get("created_at"),
+            "last_seen_at": now,
+            "revoked_at": data.get("revoked_at"),
+        }
+        user = {
+            "id": data["user_id"],
+            "tenant_id": data["tenant_id"],
+            "email": data.get("user_email"),
+            "name": data.get("user_name_saved") or data.get("user_name"),
+            "role": data.get("user_role") or "member",
+            "created_at": data.get("user_created_at"),
+            "disabled_at": data.get("user_disabled_at"),
+        }
+        agent = self.get_agent(data["agent_id"], tenant_id=data["tenant_id"]) or {
+            "id": data["agent_id"],
+            "tenant_id": data["tenant_id"],
+            "name": data.get("agent_name"),
+            "description": data.get("agent_description"),
+        }
+        return {
+            "binding": binding,
+            "user": user,
+            "agent": agent,
+            "access_context": AccessContext(
+                tenant_id=data["tenant_id"],
+                workspace_id="default",
+                user_id=data["user_id"],
+                agent_id=data["agent_id"],
+            ),
+        }
+
+    def resolve_social_gateway_binding_by_bot_account(
+        self,
+        *,
+        platform: str,
+        bot_account_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        platform_key = (platform or "").strip().lower()
+        bot_id = (bot_account_id or "").strip()
+        if not platform_key or not bot_id:
+            return None
+        rows = self._conn.execute(
+            """SELECT external_user_id
+               FROM social_gateway_bindings
+               WHERE platform = ? AND bot_account_id = ?
+                     AND revoked_at IS NULL AND status = 'active'
+               ORDER BY created_at DESC""",
+            (platform_key, bot_id),
+        ).fetchall()
+        external_ids = [row["external_user_id"] for row in rows]
+        if len(set(external_ids)) != 1:
+            return None
+        return self.resolve_social_gateway_binding(
+            platform=platform_key,
+            bot_account_id=bot_id,
+            external_user_id=external_ids[0],
+        )
+
+    def list_social_gateway_bindings(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT b.*, u.email AS user_email, u.name AS user_name_saved,
+                      a.name AS agent_name
+               FROM social_gateway_bindings b
+               JOIN users u ON u.id = b.user_id AND u.tenant_id = b.tenant_id
+               JOIN agents a ON a.id = b.agent_id AND a.tenant_id = b.tenant_id
+               ORDER BY b.created_at DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_agent_social_gateway_bindings(
+        self,
+        agent_id: str,
+        *,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        agent = self.get_agent(agent_id, tenant_id=tenant_id)
+        if not agent:
+            raise ValueError("agent not found")
+        params: List[Any] = [agent["tenant_id"], agent["id"]]
+        user_clause = ""
+        if user_id:
+            user_clause = "AND b.user_id = ?"
+            params.append((user_id or "").strip())
+        rows = self._conn.execute(
+            f"""SELECT b.*, u.email AS user_email, u.name AS user_name_saved,
+                       a.name AS agent_name
+                FROM social_gateway_bindings b
+                JOIN users u ON u.id = b.user_id AND u.tenant_id = b.tenant_id
+                JOIN agents a ON a.id = b.agent_id AND a.tenant_id = b.tenant_id
+                WHERE b.tenant_id = ? AND b.agent_id = ? {user_clause}
+                ORDER BY b.last_seen_at DESC, b.created_at DESC""",
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]

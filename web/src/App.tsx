@@ -59,12 +59,13 @@ import AnalyticsPage from "@/pages/AnalyticsPage";
 import CronPage from "@/pages/CronPage";
 import SkillsPage from "@/pages/SkillsPage";
 import ChatPage from "@/pages/ChatPage";
+import EnterpriseAdminChatPage from "@/pages/EnterpriseAdminChatPage";
 import EnterpriseAdminPage from "@/pages/EnterpriseAdminPage";
 import EnterpriseBuilderPage from "@/pages/EnterpriseBuilderPage";
-import EnterpriseLocalPage from "@/pages/EnterpriseLocalPage";
 import EnterprisePortalPage from "@/pages/EnterprisePortalPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
+import { TeamesLogo, TeamesWordmark } from "@/components/enterprise/TeamesBrand";
 import { useI18n } from "@/i18n";
 import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
@@ -75,19 +76,27 @@ function RootRedirect() {
   return <Navigate to="/sessions" replace />;
 }
 
+function WorkspaceRedirect() {
+  return <Navigate to="/enterprise" replace />;
+}
+
 const CHAT_NAV_ITEM: NavItem = {
-  path: "/chat",
+  path: "/admin-chat",
   labelKey: "chat",
   label: "Chat",
-  icon: Terminal,
+  icon: MessageSquare,
 };
 
 /** Built-in routes except /chat (only with `hermes dashboard --tui`). */
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
+  "/admin-chat": EnterpriseAdminChatPage,
+  "/local": WorkspaceRedirect,
+  "/local/*": WorkspaceRedirect,
   "/analytics": AnalyticsPage,
   "/enterprise": EnterpriseAdminPage,
+  "/enterprise/agents/:agentId/users/:userId": EnterpriseAdminPage,
   "/enterprise-builder": EnterpriseBuilderPage,
   "/logs": LogsPage,
   "/cron": CronPage,
@@ -112,13 +121,8 @@ const BUILTIN_NAV_REST: NavItem[] = [
   },
   {
     path: "/enterprise",
-    label: "Enterprise",
+    label: "Workspace",
     icon: Shield,
-  },
-  {
-    path: "/enterprise-builder",
-    label: "Builder",
-    icon: Sparkles,
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
@@ -264,8 +268,7 @@ export default function App() {
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isEnterprisePortalRoute =
     normalizedPath === "/portal" || normalizedPath === "/accept-invite";
-  const isEnterpriseLocalRoute = normalizedPath === "/local";
-  const isChatRoute = normalizedPath === "/chat";
+  const isChatRoute = normalizedPath === "/chat" || normalizedPath === "/admin-chat";
   const isBuilderRoute = normalizedPath === "/enterprise-builder";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
 
@@ -277,11 +280,7 @@ export default function App() {
     [embeddedChat],
   );
 
-  const builtinNav = useMemo(
-    () =>
-      embeddedChat ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST] : BUILTIN_NAV_REST,
-    [embeddedChat],
-  );
+  const builtinNav = useMemo(() => [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST], []);
 
   const navItems = useMemo(
     () => buildNavItems(builtinNav, manifests),
@@ -329,7 +328,7 @@ export default function App() {
 
   if (isEnterprisePortalRoute) {
     return (
-      <div className="font-mondwest flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black uppercase text-midground antialiased">
+      <div className="enterprise-shell flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden text-midground antialiased">
         <SelectionSwitcher />
         <Backdrop />
         <EnterprisePortalPage />
@@ -337,20 +336,10 @@ export default function App() {
     );
   }
 
-  if (isEnterpriseLocalRoute) {
-    return (
-      <div className="font-mondwest flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black uppercase text-midground antialiased">
-        <SelectionSwitcher />
-        <Backdrop />
-        <EnterpriseLocalPage />
-      </div>
-    );
-  }
-
   return (
     <div
       data-layout-variant={layoutVariant}
-      className="font-mondwest flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-black uppercase text-midground antialiased"
+      className="enterprise-shell font-mondwest flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-transparent text-midground antialiased"
     >
       <SelectionSwitcher />
       <Backdrop />
@@ -385,9 +374,9 @@ export default function App() {
         </button>
 
         <Typography
-          className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground"
-          style={{ mixBlendMode: "plus-lighter" }}
+          className="flex items-center gap-2 font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground"
         >
+          <TeamesLogo className="h-9 w-9 border-current/20 bg-transparent" />
           {t.app.brand}
         </Typography>
       </header>
@@ -427,18 +416,13 @@ export default function App() {
           >
             <div
               className={cn(
-                "flex h-14 shrink-0 items-center justify-between gap-2 px-5",
-                "border-b border-current/20",
+                "flex h-16 shrink-0 items-center justify-between gap-2 px-5",
               )}
             >
-              <Typography
-                className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground"
-                style={{ mixBlendMode: "plus-lighter" }}
-              >
-                Hermes
-                <br />
-                Agent
-              </Typography>
+              <TeamesWordmark
+                compact
+                className="[&>span]:h-11 [&>span]:w-11 [&>span]:border-current/20 [&>span]:bg-transparent [&_div:last-child>div:first-child]:font-mondwest [&_div:last-child>div:first-child]:text-[1rem] [&_div:last-child>div:first-child]:font-bold [&_div:last-child>div:first-child]:tracking-[0.05em]"
+              />
 
               <button
                 type="button"
@@ -457,7 +441,7 @@ export default function App() {
             <PluginSlot name="header-left" />
 
             <nav
-              className="min-h-0 w-full flex-1 overflow-y-auto overflow-x-hidden border-t border-current/10 py-2"
+              className="min-h-0 w-full flex-1 overflow-y-auto overflow-x-hidden py-2"
               aria-label={t.app.navigation}
             >
               <ul className="flex flex-col">

@@ -61,6 +61,9 @@ CONFIGURABLE_TOOLSETS = [
     ("todo",            "📋 Task Planning",             "todo"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
+    ("enterprise_remote", "🏢 Remote Workspace Agents", "list, chat with, and search assigned remote business agents"),
+    ("enterprise_builder", "🏗️ Workspace Builder",      "build business agents, skills, and invites"),
+    ("enterprise_local_bridge", "📊 Local Agent Reports", "request local-agent reports and schedule recurring report plans"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
@@ -829,6 +832,30 @@ def _toolset_has_keys(ts_key: str, config: dict = None) -> bool:
     """Check if a toolset's required API keys are configured."""
     if config is None:
         config = load_config()
+
+    if ts_key == "enterprise_remote":
+        try:
+            from hermes_constants import get_hermes_home
+            import json
+
+            path = get_hermes_home() / "enterprise-local.json"
+            if not path.exists():
+                return False
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            return bool(
+                isinstance(parsed, dict)
+                and parsed.get("server")
+                and parsed.get("device_token")
+            )
+        except Exception:
+            return False
+
+    if ts_key in {"enterprise_builder", "enterprise_local_bridge"}:
+        try:
+            from hermes_constants import get_hermes_home
+            return (get_hermes_home() / "enterprise.db").exists()
+        except Exception:
+            return False
 
     if ts_key == "vision":
         try:

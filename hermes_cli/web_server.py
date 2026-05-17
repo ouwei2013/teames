@@ -1,5 +1,5 @@
 """
-Hermes Agent — Web UI server.
+Teames — Web UI server.
 
 Provides a FastAPI backend serving the Vite/React frontend and REST API
 endpoints for managing configuration, environment variables, and sessions.
@@ -18,6 +18,8 @@ import os
 import queue
 import re
 import secrets
+import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -25,6 +27,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import base64
+import hashlib
+import io
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -69,7 +74,7 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
-app = FastAPI(title="Hermes Agent", version=__version__)
+app = FastAPI(title="Teames", version=__version__)
 
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
@@ -89,6 +94,13 @@ _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
 _LOCAL_WEB_CONNECT_STATES: Dict[str, Dict[str, Any]] = {}
 _LOCAL_WEB_CONNECT_STATE_TTL = 10 * 60
+_WEIXIN_SOCIAL_QR_STATES: Dict[str, Dict[str, Any]] = {}
+_WEIXIN_SOCIAL_QR_TTL = 10 * 60
+_WHATSAPP_PAIR_STATES: Dict[str, Dict[str, Any]] = {}
+_WHATSAPP_PAIR_TTL = 10 * 60
+_LOCAL_WEB_REQUEST_POLLER_STARTED = False
+_LOCAL_WEB_REQUEST_POLLER_LOCK = threading.Lock()
+_LOCAL_WEB_REQUESTS_IN_PROGRESS: set[str] = set()
 
 # CORS: restrict to localhost origins only.  The web UI is intended to run
 # locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
@@ -115,6 +127,7 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/plugins",
     "/api/dashboard/plugins/rescan",
     "/api/enterprise/invites/redeem",
+    "/api/enterprise/login",
     "/api/enterprise/me",
     "/api/enterprise/chat",
     "/api/enterprise/chat/stream",
@@ -125,10 +138,14 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/enterprise/portal/local-devices",
     "/api/enterprise/portal/local-devices/code",
     "/api/enterprise/local-agent/register",
+    "/api/enterprise/local-agent/register-invite",
+    "/api/enterprise/local-agent/register-login",
     "/api/enterprise/local-web/callback",
     "/api/enterprise/local-agent/agents",
     "/api/enterprise/local-agent/chat",
+    "/api/enterprise/local-agent/history/search",
     "/api/enterprise/local-agent/requests",
+    "/api/enterprise/social-gateways/whatsapp/webhook",
 })
 
 
@@ -251,6 +268,7 @@ async def auth_middleware(request: Request, call_next):
         path in _PUBLIC_API_PATHS
         or path.startswith("/api/plugins/")
         or path.startswith("/api/enterprise/portal/cron/jobs/")
+        or path.startswith("/api/enterprise/portal/skills/")
         or path.startswith("/api/enterprise/local-agent/requests/")
     )
     if path.startswith("/api/") and not is_public:
@@ -367,6 +385,7 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "human_delay": "display",
     "dashboard": "display",
     "code_execution": "agent",
+    "prompt_caching": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -478,16 +497,35 @@ class EnterpriseInviteCreate(BaseModel):
     agent_ids: Optional[List[str]] = None
 
 
+class EnterpriseSocialInviteCreate(BaseModel):
+    agent_id: str
+    platform: Optional[str] = None
+    label: Optional[str] = None
+    max_uses: int = 1
+    expires_days: Optional[int] = 7
+
+
+class EnterpriseTelegramBotConfigure(BaseModel):
+    token: str
+
+
 class EnterpriseInviteRedeem(BaseModel):
     code: str
     email: Optional[str] = None
     name: Optional[str] = None
+    password: Optional[str] = None
+
+
+class EnterpriseLoginBody(BaseModel):
+    email: str
+    password: str
 
 
 class EnterpriseChatBody(BaseModel):
     message: str
     session_id: Optional[str] = None
     agent_id: Optional[str] = None
+    gateway_origin: Optional[Dict[str, Any]] = None
 
 
 class EnterpriseBuilderChatBody(BaseModel):
@@ -502,8 +540,10 @@ class EnterpriseLocalWebConnectBody(BaseModel):
 
 class EnterpriseLocalWebJoinBody(BaseModel):
     server: str
-    code: str
+    code: Optional[str] = None
+    email: Optional[str] = None
     name: Optional[str] = None
+    password: Optional[str] = None
 
 
 class EnterpriseLocalWebRequestAnswerBody(BaseModel):
@@ -534,6 +574,34 @@ class EnterpriseSkillCatalogToggle(BaseModel):
     enabled: bool
 
 
+def _builtin_skill_detail(name: str) -> Dict[str, Any]:
+    from tools.skills_tool import skill_view
+
+    payload = json.loads(skill_view(name, preprocess=False))
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise HTTPException(
+            status_code=404,
+            detail=str(payload.get("error") if isinstance(payload, dict) else "Skill not found"),
+        )
+    payload["source"] = "builtin"
+    return payload
+
+
+def _custom_skill_detail(skill: Dict[str, Any], source: str) -> Dict[str, Any]:
+    return {
+        "success": True,
+        "name": skill.get("name") or "",
+        "description": skill.get("description") or "",
+        "category": skill.get("category") or "custom",
+        "content": skill.get("content") or "",
+        "enabled": bool(skill.get("enabled")),
+        "source": source,
+        "skill_dir": skill.get("skill_dir"),
+        "files": skill.get("files", []),
+        "updated_at": skill.get("updated_at"),
+    }
+
+
 class EnterpriseCronJobCreate(BaseModel):
     agent_id: str
     prompt: str
@@ -552,6 +620,21 @@ class EnterpriseLocalDeviceRegister(BaseModel):
     name: Optional[str] = None
 
 
+class EnterpriseLocalInviteRegister(BaseModel):
+    code: str
+    password: str
+    device_name: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
+
+
+class EnterpriseLocalLoginRegister(BaseModel):
+    email: str
+    password: str
+    device_name: Optional[str] = None
+    agent_id: Optional[str] = None
+
+
 class EnterpriseLocalRequestCreate(BaseModel):
     device_id: str
     request: str
@@ -567,6 +650,12 @@ class EnterpriseLocalReportPlanCreate(BaseModel):
 class EnterpriseLocalRequestResponse(BaseModel):
     response: str
     status: str = "responded"
+
+
+class EnterpriseLocalHistorySearch(BaseModel):
+    query: str
+    agent_id: Optional[str] = None
+    limit: int = 10
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
@@ -860,8 +949,18 @@ async def get_sessions(limit: int = 20, offset: int = 0):
         from hermes_state import SessionDB
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
+            admin_user_id = _dashboard_admin_user_id()
+            if admin_user_id:
+                all_sessions = db.list_sessions_rich(
+                    limit=max(200, int(limit or 20) + int(offset or 0) + 200),
+                    offset=0,
+                )
+                visible_sessions = _dashboard_filter_owner_sessions(all_sessions, admin_user_id)
+                total = len(visible_sessions)
+                sessions = visible_sessions[int(offset or 0): int(offset or 0) + int(limit or 20)]
+            else:
+                sessions = db.list_sessions_rich(limit=limit, offset=offset)
+                total = db.session_count()
             now = time.time()
             for s in sessions:
                 s["is_active"] = (
@@ -897,9 +996,13 @@ async def search_sessions(q: str = "", limit: int = 20):
                     terms.append(token + "*")
             prefix_query = " ".join(terms)
             matches = db.search_messages(query=prefix_query, limit=limit)
+            admin_user_id = _dashboard_admin_user_id()
+            social_bindings = _active_social_gateway_bindings() if admin_user_id else []
             # Group by session_id — return unique sessions with their best snippet
             seen: dict = {}
             for m in matches:
+                if not _dashboard_session_visible_to_owner(m, admin_user_id, social_bindings):
+                    continue
                 sid = m["session_id"]
                 if sid not in seen:
                     seen[sid] = {
@@ -1085,6 +1188,39 @@ async def enterprise_agent_skill_catalog(agent_id: str):
         raise HTTPException(status_code=500, detail="Enterprise skill catalog failed")
 
 
+@app.get("/api/enterprise/agents/{agent_id}/skill-catalog/{skill_name}")
+async def enterprise_agent_skill_catalog_detail(agent_id: str, skill_name: str):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            agent = store.get_agent(agent_id)
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            custom = store.get_agent_custom_skill(
+                agent["id"],
+                skill_name,
+                tenant_id=agent["tenant_id"],
+            )
+            if custom:
+                return _custom_skill_detail(custom, "agent_custom")
+            return _builtin_skill_detail(skill_name)
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        _log.exception(
+            "GET /api/enterprise/agents/%s/skill-catalog/%s failed",
+            agent_id,
+            skill_name,
+        )
+        raise HTTPException(status_code=500, detail="Enterprise skill detail failed")
+
+
 @app.put("/api/enterprise/agents/{agent_id}/skill-catalog")
 async def enterprise_agent_skill_catalog_toggle(agent_id: str, body: EnterpriseSkillCatalogToggle):
     try:
@@ -1105,6 +1241,448 @@ async def enterprise_agent_skill_catalog_toggle(agent_id: str, body: EnterpriseS
     except Exception:
         _log.exception("PUT /api/enterprise/agents/%s/skill-catalog failed", agent_id)
         raise HTTPException(status_code=500, detail="Enterprise skill catalog update failed")
+
+
+def _enterprise_agent_user_cron_jobs(user_id: str, agent_id: str) -> List[Dict[str, Any]]:
+    try:
+        from cron.jobs import list_jobs
+
+        return [
+            _enterprise_job_payload(job)
+            for job in list_jobs(include_disabled=True)
+            if isinstance(job.get("enterprise"), dict)
+            and (job.get("enterprise") or {}).get("user_id") == user_id
+            and (job.get("enterprise") or {}).get("agent_id") == agent_id
+        ]
+    except Exception:
+        _log.debug("Could not load enterprise agent user cron jobs", exc_info=True)
+        return []
+
+
+def _enterprise_agent_user_access_context(
+    agent: Dict[str, Any],
+    user: Dict[str, Any],
+    *,
+    workspace_id: str = "default",
+) -> AccessContext:
+    return AccessContext(
+        tenant_id=agent["tenant_id"],
+        workspace_id=workspace_id,
+        user_id=user["id"],
+        agent_id=agent["id"],
+    )
+
+
+def _enterprise_agent_user_access_contexts(
+    agent: Dict[str, Any],
+    user: Dict[str, Any],
+) -> List[AccessContext]:
+    return [
+        _enterprise_agent_user_access_context(agent, user, workspace_id="default"),
+        _enterprise_agent_user_access_context(agent, user, workspace_id="enterprise_local_remote"),
+    ]
+
+
+def _active_social_gateway_bindings() -> List[Dict[str, Any]]:
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            return [
+                binding
+                for binding in store.list_social_gateway_bindings()
+                if binding.get("status") == "active" and not binding.get("revoked_at")
+            ]
+        finally:
+            store.close()
+    except Exception:
+        _log.debug("Could not load social gateway bindings", exc_info=True)
+        return []
+
+
+def _session_matches_social_gateway_binding(
+    session: Dict[str, Any],
+    bindings: List[Dict[str, Any]],
+) -> bool:
+    source = str(session.get("source") or "").strip().lower()
+    external_id = str(session.get("user_id") or "").strip()
+    if not source or not external_id:
+        return False
+    for binding in bindings:
+        if str(binding.get("platform") or "").strip().lower() != source:
+            continue
+        binding_external_ids = {
+            str(value).strip()
+            for value in (binding.get("external_user_id"), binding.get("external_chat_id"))
+            if value
+        }
+        if external_id in binding_external_ids:
+            return True
+    return False
+
+
+def _enterprise_agent_user_social_bindings(
+    user: Dict[str, Any],
+    agent: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            return [
+                binding
+                for binding in store.list_agent_social_gateway_bindings(
+                    agent["id"],
+                    user_id=user["id"],
+                    tenant_id=agent["tenant_id"],
+                )
+                if binding.get("status") == "active" and not binding.get("revoked_at")
+            ]
+        finally:
+            store.close()
+    except Exception:
+        _log.debug("Could not load enterprise agent user social bindings", exc_info=True)
+        return []
+
+
+def _enterprise_agent_user_gateway_bindings(
+    user: Dict[str, Any],
+    agent: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            social_bindings = store.list_agent_social_gateway_bindings(
+                agent["id"],
+                user_id=user["id"],
+                tenant_id=agent["tenant_id"],
+            )
+            local_gateway_bindings = store.list_agent_local_device_gateway_bindings(
+                agent["id"],
+                user_id=user["id"],
+                tenant_id=agent["tenant_id"],
+            )
+            return [*social_bindings, *local_gateway_bindings]
+        finally:
+            store.close()
+    except Exception:
+        _log.debug("Could not load enterprise agent user gateway bindings", exc_info=True)
+        return []
+
+
+def _enterprise_agent_user_social_sessions(
+    db: Any,
+    bindings: List[Dict[str, Any]],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    sessions: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for binding in bindings:
+        platform = str(binding.get("platform") or "").strip().lower()
+        if not platform:
+            continue
+        candidates = db.list_sessions_rich(
+            source=platform,
+            limit=max(limit, 50),
+            offset=0,
+        )
+        for session in candidates:
+            if session.get("id") in seen:
+                continue
+            if not _session_matches_social_gateway_binding(session, [binding]):
+                continue
+            session["enterprise_legacy_gateway"] = True
+            sessions.append(session)
+            seen.add(session["id"])
+    return sessions
+
+
+def _enterprise_agent_user_sessions(
+    user: Dict[str, Any],
+    agent: Dict[str, Any],
+    *,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    db = None
+    try:
+        from hermes_state import SessionDB
+
+        capped_limit = max(1, min(int(limit or 100), 200))
+        db = SessionDB()
+        context_sessions: List[Dict[str, Any]] = []
+        context_total = 0
+        for access_context in _enterprise_agent_user_access_contexts(agent, user):
+            workspace_sessions = db.list_sessions_rich(
+                limit=capped_limit,
+                offset=0,
+                access_context=access_context,
+            )
+            for session in workspace_sessions:
+                session["workspace_id"] = access_context.workspace_id
+            context_sessions.extend(workspace_sessions)
+            context_total += db.session_count(access_context=access_context)
+        social_sessions = _enterprise_agent_user_social_sessions(
+            db,
+            _enterprise_agent_user_social_bindings(user, agent),
+            limit=capped_limit,
+        )
+        sessions_by_id: Dict[str, Dict[str, Any]] = {}
+        for session in [*context_sessions, *social_sessions]:
+            sid = session.get("id")
+            if sid and sid not in sessions_by_id:
+                sessions_by_id[sid] = session
+        sessions = sorted(
+            sessions_by_id.values(),
+            key=lambda item: item.get("last_active") or item.get("started_at") or 0,
+            reverse=True,
+        )
+        total = context_total + len(
+            [
+                session
+                for session in social_sessions
+                if session.get("id") not in {item.get("id") for item in context_sessions}
+            ]
+        )
+        now = time.time()
+        for session in sessions[:capped_limit]:
+            session["is_active"] = (
+                session.get("ended_at") is None
+                and (now - session.get("last_active", session.get("started_at", 0))) < 300
+            )
+        return {"sessions": sessions[:capped_limit], "total": total}
+    except Exception:
+        _log.debug("Could not load enterprise agent user sessions", exc_info=True)
+        return {"sessions": [], "total": 0}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _dashboard_admin_user_id() -> Optional[str]:
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            tenant = store.get_default_tenant()
+            if not tenant:
+                return None
+            users = store.list_users()
+            admin = next(
+                (user for user in users if user.get("role") == "admin" and not user.get("disabled_at")),
+                None,
+            ) or next((user for user in users if not user.get("disabled_at")), None)
+            return str(admin["id"]) if admin and admin.get("id") else None
+        finally:
+            store.close()
+    except Exception:
+        return None
+
+
+def _dashboard_session_visible_to_owner(
+    session: Dict[str, Any],
+    admin_user_id: Optional[str],
+    social_bindings: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    if not admin_user_id:
+        return True
+    tenant_id = session.get("tenant_id")
+    if tenant_id in (None, ""):
+        bindings = social_bindings if social_bindings is not None else _active_social_gateway_bindings()
+        if _session_matches_social_gateway_binding(session, bindings):
+            return False
+        return True
+    return session.get("user_id") == admin_user_id
+
+
+def _dashboard_filter_owner_sessions(
+    sessions: List[Dict[str, Any]],
+    admin_user_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    social_bindings = _active_social_gateway_bindings() if admin_user_id else []
+    return [
+        session
+        for session in sessions
+        if _dashboard_session_visible_to_owner(session, admin_user_id, social_bindings)
+    ]
+
+
+def _dashboard_cron_visible_to_owner(job: Dict[str, Any], admin_user_id: Optional[str]) -> bool:
+    if not admin_user_id:
+        return True
+    enterprise = job.get("enterprise")
+    if not isinstance(enterprise, dict) or not enterprise.get("user_id"):
+        return True
+    return enterprise.get("user_id") == admin_user_id
+
+
+def _ensure_dashboard_cron_visible(job: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not _dashboard_cron_visible_to_owner(job, _dashboard_admin_user_id()):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.get("/api/enterprise/agents/{agent_id}/users")
+async def enterprise_agent_users(agent_id: str):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            agent = store.get_agent(agent_id)
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            users = store.list_agent_users(agent["id"], tenant_id=agent["tenant_id"])
+            for user in users:
+                user["cron_job_count"] = len(_enterprise_agent_user_cron_jobs(user["id"], agent["id"]))
+                user["session_count"] = _enterprise_agent_user_sessions(user, agent, limit=1)["total"]
+                user["social_binding_count"] = len(_enterprise_agent_user_gateway_bindings(user, agent))
+            return {"agent": agent, "users": users}
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/agents/%s/users failed", agent_id)
+        raise HTTPException(status_code=500, detail="Enterprise agent users failed")
+
+
+@app.get("/api/enterprise/agents/{agent_id}/users/{user_id}")
+async def enterprise_agent_user_detail(agent_id: str, user_id: str):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            agent = store.get_agent(agent_id)
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            user = store.get_agent_user(agent["id"], user_id, tenant_id=agent["tenant_id"])
+            if not user:
+                raise HTTPException(status_code=404, detail="Agent user not found")
+            skills = store.list_user_agent_skill_names(user, agent["id"])
+            custom_skills = store.list_user_agent_custom_skills(
+                user,
+                agent["id"],
+                enabled_only=False,
+            )
+            social_bindings = [
+                *store.list_agent_social_gateway_bindings(
+                    agent["id"],
+                    user_id=user["id"],
+                    tenant_id=agent["tenant_id"],
+                ),
+                *store.list_agent_local_device_gateway_bindings(
+                    agent["id"],
+                    user_id=user["id"],
+                    tenant_id=agent["tenant_id"],
+                ),
+            ]
+            local_devices = [
+                device
+                for device in store.list_local_devices(agent_id=agent["id"], include_revoked=True)
+                if device.get("user_id") == user["id"]
+            ]
+            cron_jobs = _enterprise_agent_user_cron_jobs(user["id"], agent["id"])
+            session_result = _enterprise_agent_user_sessions(user, agent)
+            user["cron_job_count"] = len(cron_jobs)
+            user["session_count"] = session_result["total"]
+            user["social_binding_count"] = len(social_bindings)
+            return {
+                "agent": agent,
+                "user": user,
+                "skills": skills,
+                "custom_skills": custom_skills,
+                "social_bindings": social_bindings,
+                "local_devices": local_devices,
+                "cron_jobs": cron_jobs,
+                "sessions": session_result["sessions"],
+                "session_total": session_result["total"],
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/agents/%s/users/%s failed", agent_id, user_id)
+        raise HTTPException(status_code=500, detail="Enterprise agent user detail failed")
+
+
+@app.get("/api/enterprise/agents/{agent_id}/users/{user_id}/sessions/{session_id}/messages")
+async def enterprise_agent_user_session_messages(agent_id: str, user_id: str, session_id: str):
+    try:
+        from enterprise import EnterpriseStore
+        from hermes_state import SessionDB
+
+        store = EnterpriseStore()
+        try:
+            agent = store.get_agent(agent_id)
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            user = store.get_agent_user(agent["id"], user_id, tenant_id=agent["tenant_id"])
+            if not user:
+                raise HTTPException(status_code=404, detail="Agent user not found")
+            access_contexts = _enterprise_agent_user_access_contexts(agent, user)
+        finally:
+            store.close()
+
+        db = SessionDB()
+        try:
+            sid = None
+            message_access_context: Optional[AccessContext] = None
+            for access_context in access_contexts:
+                sid = db.resolve_session_id(session_id, access_context=access_context)
+                if sid:
+                    message_access_context = access_context
+                    break
+            if not sid:
+                raw_sid = db.resolve_session_id(session_id)
+                raw_session = db.get_session(raw_sid) if raw_sid else None
+                if raw_session and _session_matches_social_gateway_binding(
+                    raw_session,
+                    _enterprise_agent_user_social_bindings(user, agent),
+                ):
+                    sid = raw_sid
+                    message_access_context = None
+                else:
+                    raise HTTPException(status_code=404, detail="Session not found")
+            return {
+                "agent": agent,
+                "user": user,
+                "session_id": sid,
+                "messages": db.get_messages(sid, access_context=message_access_context),
+            }
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception:
+        _log.exception(
+            "GET /api/enterprise/agents/%s/users/%s/sessions/%s/messages failed",
+            agent_id,
+            user_id,
+            session_id,
+        )
+        raise HTTPException(status_code=500, detail="Enterprise agent user session messages failed")
 
 
 @app.get("/api/enterprise/invites")
@@ -1143,13 +1721,1187 @@ async def enterprise_create_invite(body: EnterpriseInviteCreate):
         raise HTTPException(status_code=500, detail="Enterprise invite creation failed")
 
 
+def _public_base_url(request: Request) -> str:
+    configured = (
+        os.getenv("HERMES_PUBLIC_BASE_URL")
+        or os.getenv("ENTERPRISE_PUBLIC_BASE_URL")
+        or os.getenv("SOCIAL_GATEWAY_PUBLIC_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+    if configured:
+        return configured
+    return str(request.base_url).rstrip("/")
+
+
+def _qr_png_data_url(value: str) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        import qrcode
+
+        qr = qrcode.QRCode(border=2, box_size=6)
+        qr.add_data(value)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return None
+
+
+def _cleanup_weixin_social_qr_states() -> None:
+    now = time.time()
+    expired = [
+        key
+        for key, item in _WEIXIN_SOCIAL_QR_STATES.items()
+        if now - float(item.get("created_at") or now) > _WEIXIN_SOCIAL_QR_TTL
+    ]
+    for key in expired:
+        _WEIXIN_SOCIAL_QR_STATES.pop(key, None)
+
+
+async def _fetch_weixin_social_qr() -> Dict[str, str]:
+    from gateway.platforms.weixin import (
+        EP_GET_BOT_QR,
+        ILINK_BASE_URL,
+        QR_TIMEOUT_MS,
+        _api_get,
+        _make_ssl_connector,
+    )
+    import aiohttp
+
+    async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
+        payload = await _api_get(
+            session,
+            base_url=ILINK_BASE_URL,
+            endpoint=f"{EP_GET_BOT_QR}?bot_type=3",
+            timeout_ms=QR_TIMEOUT_MS,
+        )
+    qrcode = str(payload.get("qrcode") or "")
+    qrcode_url = str(payload.get("qrcode_img_content") or "")
+    if not qrcode:
+        raise RuntimeError("iLink QR response missing qrcode")
+    qr_data = qrcode_url or qrcode
+    return {
+        "qrcode": qrcode,
+        "qr_data": qr_data,
+        "qr_image": _qr_png_data_url(qr_data) or "",
+    }
+
+
+async def _poll_weixin_social_qr(qrcode: str, base_url: Optional[str] = None) -> Dict[str, Any]:
+    from gateway.platforms.weixin import (
+        EP_GET_QR_STATUS,
+        ILINK_BASE_URL,
+        QR_TIMEOUT_MS,
+        _api_get,
+        _make_ssl_connector,
+    )
+    import aiohttp
+
+    async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
+        return await _api_get(
+            session,
+            base_url=(base_url or ILINK_BASE_URL),
+            endpoint=f"{EP_GET_QR_STATUS}?qrcode={urllib.parse.quote(qrcode)}",
+            timeout_ms=QR_TIMEOUT_MS,
+        )
+
+
+def _normalize_whatsapp_phone(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.split("@", 1)[0].split(":", 1)[0]
+    return re.sub(r"[^0-9]", "", text)
+
+
+def _whatsapp_session_dir() -> Path:
+    return Path(get_hermes_home()) / "whatsapp" / "session"
+
+
+def _whatsapp_bridge_dir() -> Path:
+    return PROJECT_ROOT / "scripts" / "whatsapp-bridge"
+
+
+def _find_whatsapp_phone_in_json(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("id", "jid", "me", "user", "phoneNumber"):
+            if key in value:
+                found = _find_whatsapp_phone_in_json(value[key])
+                if found:
+                    return found
+        for item in value.values():
+            found = _find_whatsapp_phone_in_json(item)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _find_whatsapp_phone_in_json(item)
+            if found:
+                return found
+    elif isinstance(value, str):
+        if "@s.whatsapp.net" in value or re.match(r"^\d{6,}(:\d+)?@", value):
+            return _normalize_whatsapp_phone(value)
+    return ""
+
+
+def _whatsapp_native_paired_number() -> str:
+    configured = (
+        os.getenv("SOCIAL_GATEWAY_WHATSAPP_NUMBER")
+        or os.getenv("WHATSAPP_BUSINESS_NUMBER")
+        or os.getenv("WHATSAPP_PHONE_NUMBER")
+        or ""
+    ).strip()
+    if configured:
+        return _normalize_whatsapp_phone(configured)
+    creds_path = _whatsapp_session_dir() / "creds.json"
+    if not creds_path.exists():
+        return ""
+    try:
+        parsed = json.loads(creds_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return _find_whatsapp_phone_in_json(parsed)
+
+
+def _telegram_configured_username() -> str:
+    return (
+        os.getenv("SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME")
+        or os.getenv("TELEGRAM_BOT_USERNAME")
+        or ""
+    ).strip().lstrip("@")
+
+
+def _telegram_bot_token() -> str:
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if token:
+        return token
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        cfg = load_gateway_config()
+        platform_cfg = cfg.platforms.get(Platform.TELEGRAM)
+        if platform_cfg and platform_cfg.token:
+            return str(platform_cfg.token).strip()
+    except Exception:
+        _log.debug("Could not read Telegram token from gateway config", exc_info=True)
+    return ""
+
+
+def _telegram_bot_get_me(token: str) -> Dict[str, Any]:
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("Telegram bot token is required")
+    url = f"https://api.telegram.org/bot{urllib.parse.quote(token, safe=':')}/getMe"
+    try:
+        with urllib.request.urlopen(url, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else exc.reason
+        raise ValueError(f"Telegram rejected the bot token: {detail}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Could not reach Telegram Bot API: {exc}") from exc
+    if not payload.get("ok") or not isinstance(payload.get("result"), dict):
+        raise ValueError(f"Telegram getMe failed: {payload}")
+    return payload["result"]
+
+
+def _telegram_gateway_status(*, refresh: bool = False, token_override: str = "", persist: bool = False) -> Dict[str, Any]:
+    token = (token_override or _telegram_bot_token()).strip()
+    username = _telegram_configured_username()
+    result: Dict[str, Any] = {}
+    message = ""
+
+    if token and (refresh or token_override or not username):
+        result = _telegram_bot_get_me(token)
+        username = str(result.get("username") or "").strip().lstrip("@")
+        if not username:
+            raise ValueError("Telegram bot has no username; create a bot username in BotFather first")
+        if persist:
+            save_env_value("TELEGRAM_BOT_TOKEN", token)
+            save_env_value("SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME", username)
+            save_env_value("TELEGRAM_BOT_USERNAME", username)
+        elif token and not _telegram_configured_username():
+            try:
+                save_env_value("SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME", username)
+                save_env_value("TELEGRAM_BOT_USERNAME", username)
+            except Exception:
+                _log.debug("Could not persist Telegram bot username", exc_info=True)
+
+    if username and token and importlib.util.find_spec("telegram") is None:
+        return {
+            "status": "needs_dependency",
+            "token_present": True,
+            "username": username,
+            "bot_id": result.get("id"),
+            "first_name": result.get("first_name"),
+            "message": "Install python-telegram-bot in the Hermes Python environment, then restart Hermes gateway.",
+        }
+
+    if username and token:
+        message = "Telegram bot is configured. Create invite QR codes for users to open this bot."
+        return {
+            "status": "connected",
+            "token_present": bool(token),
+            "username": username,
+            "bot_id": result.get("id"),
+            "first_name": result.get("first_name"),
+            "message": message,
+        }
+
+    if username:
+        return {
+            "status": "needs_token",
+            "token_present": False,
+            "username": username,
+            "message": "Telegram bot username is known, but the bot token is missing. Paste the bot token to enable Telegram invites.",
+        }
+
+    if token:
+        return {
+            "status": "needs_username",
+            "token_present": True,
+            "message": "Telegram bot token is present, but the bot username could not be resolved. Refresh status or paste the token again.",
+        }
+
+    return {
+        "status": "not_configured",
+        "token_present": False,
+        "message": "Paste a Telegram bot token from BotFather to enable Telegram QR invites.",
+    }
+
+
+def _cleanup_whatsapp_pair_states() -> None:
+    now = time.time()
+    for key, item in list(_WHATSAPP_PAIR_STATES.items()):
+        if now - float(item.get("created_at") or now) > _WHATSAPP_PAIR_TTL:
+            proc = item.get("process")
+            try:
+                if proc and proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+            _WHATSAPP_PAIR_STATES.pop(key, None)
+
+
+def _ensure_whatsapp_bridge_dependencies() -> None:
+    bridge_dir = _whatsapp_bridge_dir()
+    if not (bridge_dir / "bridge.js").exists():
+        raise RuntimeError(f"WhatsApp bridge not found: {bridge_dir / 'bridge.js'}")
+    if (bridge_dir / "node_modules").exists():
+        return
+    npm = shutil.which("npm")
+    if not npm:
+        raise RuntimeError("npm is required to install the WhatsApp bridge")
+    result = subprocess.run(
+        [npm, "install", "--no-fund", "--no-audit", "--progress=false"],
+        cwd=str(bridge_dir),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"npm install failed: {detail[-1000:]}")
+
+
+def _detect_local_proxy_url() -> str:
+    for host, port in (("127.0.0.1", 7890), ("127.0.0.1", 7891), ("127.0.0.1", 1080), ("127.0.0.1", 10808)):
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return f"http://{host}:{port}"
+        except OSError:
+            continue
+    return ""
+
+
+def _apply_whatsapp_bridge_proxy_env(env: Dict[str, str]) -> str:
+    existing = (
+        env.get("WHATSAPP_PROXY_URL")
+        or env.get("HTTPS_PROXY")
+        or env.get("https_proxy")
+        or env.get("HTTP_PROXY")
+        or env.get("http_proxy")
+        or ""
+    ).strip()
+    proxy_url = existing or _detect_local_proxy_url()
+    if not proxy_url:
+        return ""
+
+    env["WHATSAPP_PROXY_URL"] = proxy_url
+    env.setdefault("HTTPS_PROXY", proxy_url)
+    env.setdefault("https_proxy", proxy_url)
+    env.setdefault("HTTP_PROXY", proxy_url)
+    env.setdefault("http_proxy", proxy_url)
+    env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
+    env.setdefault("no_proxy", "localhost,127.0.0.1,::1")
+    return proxy_url
+
+
+def _finalize_whatsapp_pair_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    proc = state.get("process")
+    if proc and proc.poll() is not None and state.get("status") not in {"connected", "failed"}:
+        phone = state.get("phone_number") or _whatsapp_native_paired_number()
+        if phone:
+            state["status"] = "connected"
+            state["phone_number"] = phone
+            try:
+                save_env_value("WHATSAPP_ENABLED", "true")
+                save_env_value("WHATSAPP_MODE", "bot")
+                save_env_value("WHATSAPP_ALLOWED_USERS", "*")
+                save_env_value("SOCIAL_GATEWAY_WHATSAPP_NUMBER", phone)
+                proxy_url = str(state.get("proxy_url") or "").strip()
+                if proxy_url:
+                    save_env_value("WHATSAPP_PROXY_URL", proxy_url)
+            except Exception:
+                _log.debug("Could not persist WhatsApp gateway env flags", exc_info=True)
+        elif proc.returncode not in (0, None):
+            state["status"] = "failed"
+            state["message"] = state.get("message") or f"WhatsApp pairing exited with code {proc.returncode}"
+    return state
+
+
+def _read_whatsapp_pair_output(pair_id: str, proc: subprocess.Popen) -> None:
+    state = _WHATSAPP_PAIR_STATES.get(pair_id)
+    if not state:
+        return
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            text = line.strip()
+            if not text:
+                continue
+            if not text.startswith("{"):
+                if "Connection closed" in text or "WhatsApp pairing mode" in text or "Session:" in text:
+                    state["message"] = text
+                    if state.get("status") == "starting" and "Connection closed" in text:
+                        state["status"] = "connecting"
+                continue
+            try:
+                event = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("event") == "qr" and event.get("qr"):
+                qr_value = str(event["qr"])
+                state["status"] = "waiting"
+                state["qr_data"] = qr_value
+                state["qr_image"] = _qr_png_data_url(qr_value)
+            elif event.get("event") == "connected":
+                phone = _normalize_whatsapp_phone(event.get("userId"))
+                state["status"] = "connected"
+                if phone:
+                    state["phone_number"] = phone
+                state["message"] = "WhatsApp paired successfully."
+        _finalize_whatsapp_pair_state(state)
+    except Exception as exc:
+        state["status"] = "failed"
+        state["message"] = str(exc)
+
+
+def _social_gateway_link_payload(
+    *,
+    request: Request,
+    code: str,
+    platform: Optional[str],
+) -> Dict[str, Any]:
+    platform_key = (platform or "generic").strip().lower()
+    bind_text = f"/bind {code}"
+    base_url = _public_base_url(request)
+    landing_url = f"{base_url}/enterprise/social/bind?code={urllib.parse.quote(code)}"
+    setup_required = False
+    setup_hint = ""
+
+    if platform_key in {"whatsapp", "wa"}:
+        phone = _whatsapp_native_paired_number()
+        if phone:
+            qr_data = f"https://wa.me/{phone}?text={urllib.parse.quote(bind_text)}"
+            setup_hint = (
+                "Scan with the phone camera or system QR scanner. WhatsApp opens with the bind message prefilled; tap Send."
+            )
+        else:
+            qr_data = landing_url
+            setup_required = True
+            setup_hint = (
+                "Set SOCIAL_GATEWAY_WHATSAPP_NUMBER to generate a WhatsApp Business deep link. "
+                "Without it this is not a valid WhatsApp QR."
+            )
+        label = "WhatsApp"
+    elif platform_key in {"telegram", "tg"}:
+        username = ""
+        try:
+            status = _telegram_gateway_status(refresh=False)
+            if status.get("status") == "connected":
+                username = str(status.get("username") or "").strip().lstrip("@")
+        except Exception:
+            _log.debug("Could not resolve Telegram bot username", exc_info=True)
+        if username:
+            qr_data = f"https://t.me/{username}?start={urllib.parse.quote(code)}"
+            setup_hint = "Telegram opens the bot with this invite code. Tap Start to connect."
+        else:
+            qr_data = landing_url
+            setup_required = True
+            setup_hint = "Configure the server Telegram bot before creating Telegram invite QR codes."
+        label = "Telegram"
+    elif platform_key in {"weixin", "wechat", "wecom"}:
+        # For the OpenClaw/iLink flow this should be the WeChat ClawBot contact
+        # QR/link. We cannot derive that from the iLink login token, so expose a
+        # configured QR/link while carrying the bind code separately.
+        qr_image_override = (
+            os.getenv("SOCIAL_GATEWAY_WEIXIN_CONTACT_QR_IMAGE_URL")
+            or os.getenv("WEIXIN_CONTACT_QR_IMAGE_URL")
+            or ""
+        ).strip()
+        qr_data = (
+            os.getenv("SOCIAL_GATEWAY_WEIXIN_CONTACT_QR_PAYLOAD")
+            or os.getenv("SOCIAL_GATEWAY_WEIXIN_CONTACT_QR_URL")
+            or os.getenv("WEIXIN_CONTACT_QR_URL")
+            or os.getenv("WEIXIN_BOT_QR_URL")
+            or ""
+        ).strip()
+        if not qr_data:
+            qr_data = landing_url
+            setup_required = True
+            setup_hint = (
+                "Set SOCIAL_GATEWAY_WEIXIN_CONTACT_QR_IMAGE_URL to a WeChat ClawBot contact QR image, "
+                "or SOCIAL_GATEWAY_WEIXIN_CONTACT_QR_PAYLOAD to a scannable WeChat QR payload."
+            )
+        label = "WeChat"
+    else:
+        qr_data = landing_url
+        label = platform_key.title() if platform_key != "generic" else "Gateway"
+
+    return {
+        "platform": platform_key,
+        "platform_label": label,
+        "bind_text": bind_text,
+        "qr_data": qr_data,
+        "qr_image": (
+            None
+            if platform_key in {"whatsapp", "wa"} and setup_required
+            else (
+                qr_image_override
+                if platform_key in {"weixin", "wechat", "wecom"} and qr_image_override
+                else _qr_png_data_url(qr_data)
+            )
+        ),
+        "landing_url": landing_url,
+        "setup_required": setup_required,
+        "setup_hint": setup_hint,
+    }
+
+
+@app.get("/api/enterprise/social-invites")
+async def enterprise_social_invites(request: Request):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            invites = store.list_social_gateway_invites()
+            for invite in invites:
+                invite["link"] = _social_gateway_link_payload(
+                    request=request,
+                    code="",
+                    platform=invite.get("platform"),
+                )
+                # Old invite codes are intentionally not persisted in plaintext.
+                # A fresh QR must be created by issuing a new invite.
+                invite["link"].pop("bind_text", None)
+                invite["link"].pop("qr_image", None)
+                invite["link"].pop("qr_data", None)
+            return {"invites": invites}
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/social-invites failed")
+        raise HTTPException(status_code=500, detail="Enterprise social invites failed")
+
+
+@app.post("/api/enterprise/social-invites")
+async def enterprise_create_social_invite(request: Request, body: EnterpriseSocialInviteCreate):
+    try:
+        from enterprise import EnterpriseStore
+
+        platform_key = (body.platform or "").strip().lower()
+        store = EnterpriseStore()
+        try:
+            if platform_key in {"telegram", "tg"}:
+                status = _telegram_gateway_status(refresh=False)
+                if status.get("status") != "connected":
+                    raise ValueError(status.get("message") or "Configure the server Telegram bot before creating Telegram invites")
+            invite = store.create_social_gateway_invite(
+                agent_id=body.agent_id,
+                platform=body.platform,
+                label=body.label,
+                max_uses=body.max_uses,
+                expires_days=body.expires_days,
+            )
+            if platform_key in {"weixin", "wechat", "wecom"}:
+                qr_payload = await _fetch_weixin_social_qr()
+                qr_id = secrets.token_urlsafe(18)
+                _cleanup_weixin_social_qr_states()
+                _WEIXIN_SOCIAL_QR_STATES[qr_id] = {
+                    "created_at": time.time(),
+                    "code": invite["code"],
+                    "qrcode": qr_payload["qrcode"],
+                    "base_url": None,
+                    "invite": invite,
+                    "confirmed": False,
+                }
+                invite["link"] = {
+                    "platform": "weixin",
+                    "platform_label": "WeChat",
+                    "bind_text": "",
+                    "qr_data": qr_payload["qr_data"],
+                    "qr_image": qr_payload["qr_image"],
+                    "landing_url": f"{_public_base_url(request)}/enterprise/social/weixin/{qr_id}",
+                    "setup_required": False,
+                    "setup_hint": "",
+                    "qr_id": qr_id,
+                    "qr_status_url": f"/api/enterprise/social-invites/weixin/qr/{qr_id}/status",
+                }
+            else:
+                invite["link"] = _social_gateway_link_payload(
+                    request=request,
+                    code=invite["code"],
+                    platform=invite.get("platform"),
+                )
+            return invite
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/social-invites failed")
+        raise HTTPException(status_code=500, detail="Enterprise social invite creation failed")
+
+
+@app.get("/api/enterprise/social-invites/weixin/qr/{qr_id}/status")
+async def enterprise_weixin_social_qr_status(qr_id: str):
+    _cleanup_weixin_social_qr_states()
+    state = _WEIXIN_SOCIAL_QR_STATES.get(qr_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Weixin QR session not found or expired")
+    try:
+        payload = await _poll_weixin_social_qr(
+            str(state.get("qrcode") or ""),
+            base_url=state.get("base_url"),
+        )
+        status = str(payload.get("status") or "wait")
+        if status == "scaned_but_redirect" and payload.get("redirect_host"):
+            state["base_url"] = f"https://{payload['redirect_host']}"
+        if status != "confirmed":
+            return {"status": status, "confirmed": False}
+
+        account_id = str(payload.get("ilink_bot_id") or "")
+        token = str(payload.get("bot_token") or "")
+        base_url = str(payload.get("baseurl") or state.get("base_url") or "")
+        user_id = str(payload.get("ilink_user_id") or "")
+        if not account_id or not token:
+            raise HTTPException(status_code=502, detail="Weixin QR confirmed but credentials were incomplete")
+
+        from gateway.platforms.weixin import ILINK_BASE_URL, save_weixin_account
+        from enterprise import EnterpriseStore
+
+        save_weixin_account(
+            str(get_hermes_home()),
+            account_id=account_id,
+            token=token,
+            base_url=base_url or ILINK_BASE_URL,
+            user_id=user_id,
+        )
+        try:
+            save_env_value("WEIXIN_MULTI_ACCOUNT", "true")
+            save_env_value("WEIXIN_DM_POLICY", "open")
+        except Exception:
+            _log.debug("Could not persist Weixin multi-account env flags", exc_info=True)
+
+        store = EnterpriseStore()
+        try:
+            binding = store.bind_social_gateway_user(
+                code=str(state.get("code") or ""),
+                platform="weixin",
+                bot_account_id=account_id,
+                external_user_id=user_id or account_id,
+                external_chat_id=user_id or account_id,
+                user_name=user_id or account_id,
+            )
+        finally:
+            store.close()
+        state["confirmed"] = True
+        state["credentials"] = {
+            "account_id": account_id,
+            "base_url": base_url or ILINK_BASE_URL,
+            "user_id": user_id,
+        }
+        state["binding"] = binding
+        return {
+            "status": "confirmed",
+            "confirmed": True,
+            "account_id": account_id,
+            "user_id": user_id,
+            "agent": binding.get("agent"),
+            "user": binding.get("user"),
+            "restart_required": True,
+            "message": "Weixin account connected. Restart Hermes gateway if it is already running.",
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/social-invites/weixin/qr/%s/status failed", qr_id)
+        raise HTTPException(status_code=500, detail="Weixin QR status failed")
+
+
+@app.get("/api/enterprise/social-bindings")
+async def enterprise_social_bindings():
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            return {"bindings": store.list_social_gateway_bindings()}
+        finally:
+            store.close()
+    except Exception:
+        _log.exception("GET /api/enterprise/social-bindings failed")
+        raise HTTPException(status_code=500, detail="Enterprise social bindings failed")
+
+
+@app.get("/api/enterprise/social-gateways/telegram/status")
+async def enterprise_telegram_gateway_status(refresh: bool = False):
+    try:
+        return _telegram_gateway_status(refresh=refresh)
+    except ValueError as exc:
+        return {
+            "status": "invalid",
+            "token_present": bool(_telegram_bot_token()),
+            "message": str(exc),
+        }
+    except Exception as exc:
+        _log.exception("GET /api/enterprise/social-gateways/telegram/status failed")
+        return {
+            "status": "unreachable",
+            "token_present": bool(_telegram_bot_token()),
+            "username": _telegram_configured_username() or None,
+            "message": str(exc),
+        }
+
+
+@app.post("/api/enterprise/social-gateways/telegram/configure")
+async def enterprise_telegram_gateway_configure(body: EnterpriseTelegramBotConfigure):
+    try:
+        token = (body.token or "").strip()
+        if not token:
+            raise HTTPException(status_code=400, detail="Telegram bot token is required")
+        status = _telegram_gateway_status(refresh=True, token_override=token, persist=True)
+        status["restart_required"] = True
+        status["message"] = (
+            "Telegram bot configured. Restart Hermes gateway if it is already running, then create invite QR codes."
+        )
+        return status
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        _log.exception("POST /api/enterprise/social-gateways/telegram/configure failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/enterprise/social-gateways/whatsapp/pair")
+async def enterprise_whatsapp_native_pair():
+    _cleanup_whatsapp_pair_states()
+    existing_phone = _whatsapp_native_paired_number()
+    if existing_phone:
+        return {
+            "id": "",
+            "status": "connected",
+            "phone_number": existing_phone,
+            "message": "WhatsApp is already paired on this server.",
+        }
+    try:
+        _ensure_whatsapp_bridge_dependencies()
+        session_dir = _whatsapp_session_dir()
+        session_dir.mkdir(parents=True, exist_ok=True)
+        pair_id = secrets.token_urlsafe(18)
+        env = os.environ.copy()
+        env["HERMES_WHATSAPP_QR_JSON"] = "1"
+        env["WHATSAPP_MODE"] = "bot"
+        proxy_url = _apply_whatsapp_bridge_proxy_env(env)
+        proc = subprocess.Popen(
+            [
+                shutil.which("node") or "node",
+                str(_whatsapp_bridge_dir() / "bridge.js"),
+                "--pair-only",
+                "--session",
+                str(session_dir),
+            ],
+            cwd=str(_whatsapp_bridge_dir()),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        state: Dict[str, Any] = {
+            "id": pair_id,
+            "created_at": time.time(),
+            "status": "starting",
+            "process": proc,
+            "proxy_url": proxy_url,
+            "message": "Starting WhatsApp pairing.",
+        }
+        _WHATSAPP_PAIR_STATES[pair_id] = state
+        threading.Thread(
+            target=_read_whatsapp_pair_output,
+            args=(pair_id, proc),
+            daemon=True,
+        ).start()
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            _finalize_whatsapp_pair_state(state)
+            if state.get("qr_image") or state.get("status") in {"connected", "failed"}:
+                break
+            time.sleep(0.25)
+        return {
+            key: value
+            for key, value in state.items()
+            if key not in {"process"}
+        }
+    except Exception as exc:
+        _log.exception("POST /api/enterprise/social-gateways/whatsapp/pair failed")
+        raise HTTPException(status_code=500, detail=f"WhatsApp pairing failed: {exc}")
+
+
+@app.get("/api/enterprise/social-gateways/whatsapp/pair/status")
+async def enterprise_whatsapp_native_pair_current_status():
+    phone = _whatsapp_native_paired_number()
+    if phone:
+        return {
+            "id": "",
+            "status": "connected",
+            "phone_number": phone,
+            "message": "WhatsApp is already paired on this server.",
+        }
+    return {
+        "id": "",
+        "status": "not_paired",
+        "message": "Pair the server-side WhatsApp bot once before creating WhatsApp user invites.",
+    }
+
+
+@app.get("/api/enterprise/social-gateways/whatsapp/pair/{pair_id}/status")
+async def enterprise_whatsapp_native_pair_status(pair_id: str):
+    _cleanup_whatsapp_pair_states()
+    state = _WHATSAPP_PAIR_STATES.get(pair_id)
+    if not state:
+        phone = _whatsapp_native_paired_number()
+        if phone:
+            return {"id": pair_id, "status": "connected", "phone_number": phone}
+        raise HTTPException(status_code=404, detail="WhatsApp pairing session not found or expired")
+    _finalize_whatsapp_pair_state(state)
+    return {
+        key: value
+        for key, value in state.items()
+        if key not in {"process"}
+    }
+
+
+def _whatsapp_cloud_access_token() -> str:
+    return (
+        os.getenv("WHATSAPP_CLOUD_ACCESS_TOKEN")
+        or os.getenv("WHATSAPP_ACCESS_TOKEN")
+        or os.getenv("META_WHATSAPP_ACCESS_TOKEN")
+        or ""
+    ).strip()
+
+
+def _whatsapp_cloud_default_phone_number_id() -> str:
+    return (
+        os.getenv("WHATSAPP_CLOUD_PHONE_NUMBER_ID")
+        or os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+        or os.getenv("META_WHATSAPP_PHONE_NUMBER_ID")
+        or ""
+    ).strip()
+
+
+def _whatsapp_cloud_verify_token() -> str:
+    return (
+        os.getenv("WHATSAPP_CLOUD_WEBHOOK_VERIFY_TOKEN")
+        or os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+        or os.getenv("META_WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+        or ""
+    ).strip()
+
+
+def _whatsapp_cloud_api_version() -> str:
+    return (os.getenv("WHATSAPP_CLOUD_API_VERSION") or os.getenv("META_GRAPH_API_VERSION") or "v20.0").strip()
+
+
+def _whatsapp_cloud_app_secret() -> str:
+    return (
+        os.getenv("WHATSAPP_CLOUD_APP_SECRET")
+        or os.getenv("WHATSAPP_APP_SECRET")
+        or os.getenv("META_APP_SECRET")
+        or ""
+    ).strip()
+
+
+def _verify_whatsapp_cloud_signature(request: Request, body: bytes) -> None:
+    app_secret = _whatsapp_cloud_app_secret()
+    if not app_secret:
+        return
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    prefix = "sha256="
+    if not signature.startswith(prefix):
+        raise HTTPException(status_code=403, detail="Missing WhatsApp webhook signature")
+    digest = hmac.new(app_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    expected = prefix + digest
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=403, detail="Invalid WhatsApp webhook signature")
+
+
+def _extract_social_gateway_bind_code_local(text: str) -> str:
+    value = (text or "").strip()
+    if not value:
+        return ""
+    match = re.match(r"^\s*/(?:bind|start)\s+([A-Za-z0-9_-]+)\s*$", value, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.match(r"^\s*(hms_[A-Za-z0-9_-]+)\s*$", value)
+    return match.group(1) if match else ""
+
+
+def _whatsapp_cloud_send_text(
+    *,
+    to: str,
+    text: str,
+    phone_number_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    token = _whatsapp_cloud_access_token()
+    resolved_phone_number_id = (phone_number_id or _whatsapp_cloud_default_phone_number_id()).strip()
+    if not token:
+        raise RuntimeError("WHATSAPP_CLOUD_ACCESS_TOKEN is not configured")
+    if not resolved_phone_number_id:
+        raise RuntimeError("WHATSAPP_CLOUD_PHONE_NUMBER_ID is not configured")
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": text[:4000] if text else "",
+        },
+    }
+    data = json.dumps(payload).encode("utf-8")
+    url = f"https://graph.facebook.com/{_whatsapp_cloud_api_version()}/{urllib.parse.quote(resolved_phone_number_id)}/messages"
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"WhatsApp Cloud API send failed: {exc.code} {exc.reason}: {detail}") from exc
+
+
+def _whatsapp_cloud_events(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    events: List[Dict[str, str]] = []
+    for entry in payload.get("entry") or []:
+        for change in entry.get("changes") or []:
+            value = change.get("value") or {}
+            metadata = value.get("metadata") or {}
+            phone_number_id = str(metadata.get("phone_number_id") or _whatsapp_cloud_default_phone_number_id())
+            contact_names: Dict[str, str] = {}
+            for contact in value.get("contacts") or []:
+                wa_id = str(contact.get("wa_id") or "").strip()
+                profile = contact.get("profile") or {}
+                name = str(profile.get("name") or "").strip()
+                if wa_id and name:
+                    contact_names[wa_id] = name
+            for message in value.get("messages") or []:
+                sender = str(message.get("from") or "").strip()
+                if not sender:
+                    continue
+                msg_type = str(message.get("type") or "").strip()
+                text = ""
+                if msg_type == "text":
+                    text = str((message.get("text") or {}).get("body") or "").strip()
+                elif msg_type:
+                    text = f"[{msg_type} message]"
+                if not text:
+                    continue
+                events.append(
+                    {
+                        "from": sender,
+                        "text": text,
+                        "phone_number_id": phone_number_id,
+                        "name": contact_names.get(sender, ""),
+                        "message_id": str(message.get("id") or ""),
+                    }
+                )
+    return events
+
+
+def _enterprise_social_gateway_session_id(
+    *,
+    platform: str,
+    bot_account_id: str,
+    external_user_id: str,
+    agent_id: str,
+) -> str:
+    digest = hashlib.sha256(
+        f"{platform}:{bot_account_id}:{external_user_id}:{agent_id}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"social-{platform}-{digest}"
+
+
+def _run_enterprise_social_gateway_chat(
+    *,
+    auth: Dict[str, Any],
+    platform: str,
+    message: str,
+    external_user_id: str,
+    external_chat_id: str,
+    user_name: str = "",
+    bot_account_id: str = "",
+) -> str:
+    from gateway.run import (
+        _load_gateway_config,
+        _resolve_gateway_model,
+        _resolve_runtime_agent_kwargs,
+    )
+    from gateway.session_context import (
+        clear_enterprise_vars,
+        clear_session_vars,
+        set_enterprise_vars,
+        set_session_vars,
+    )
+    from hermes_cli.tools_config import _get_platform_tools
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    agent = auth.get("agent") or {}
+    user = auth.get("user") or {}
+    access_context = auth.get("access_context")
+    if not isinstance(access_context, AccessContext):
+        access_context = AccessContext.coerce(access_context)
+    session_id = _enterprise_social_gateway_session_id(
+        platform=platform,
+        bot_account_id=bot_account_id,
+        external_user_id=external_user_id,
+        agent_id=str(agent.get("id") or access_context.agent_id or "default"),
+    )
+    try:
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        model = _resolve_gateway_model()
+    except Exception:
+        admin_inference = _enterprise_local_web_admin_inference_runtime()
+        if not admin_inference:
+            raise
+        runtime_kwargs = dict(admin_inference.get("runtime_kwargs") or {})
+        model = str(admin_inference.get("model") or "")
+    user_config = _load_gateway_config()
+    enabled_toolsets = _enterprise_enabled_toolsets(
+        _get_platform_tools(user_config, "api_server")
+    )
+    if "enterprise_skills" not in enabled_toolsets:
+        enabled_toolsets.append("enterprise_skills")
+
+    db = SessionDB()
+    try:
+        history = db.get_messages_as_conversation(session_id, access_context=access_context)
+        system_message = auth.get("system_message") or ""
+        agent_runner = AIAgent(
+            model=model,
+            **runtime_kwargs,
+            max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+            quiet_mode=True,
+            verbose_logging=False,
+            enabled_toolsets=enabled_toolsets,
+            session_id=session_id,
+            platform=platform,
+            user_id=external_user_id,
+            user_name=user_name,
+            chat_id=external_chat_id,
+            chat_name=user_name,
+            session_db=db,
+            access_context=access_context,
+        )
+        session_tokens = set_session_vars(
+            platform=platform,
+            chat_id=external_chat_id,
+            chat_name=user_name,
+            user_id=external_user_id,
+            user_name=user_name,
+            session_key=session_id,
+        )
+        enterprise_tokens = set_enterprise_vars(
+            tenant_id=user.get("tenant_id") or access_context.tenant_id or "",
+            user_id=user.get("id") or access_context.user_id or "",
+            agent_id=agent.get("id") or access_context.agent_id or "",
+            agent_name=agent.get("name") or "",
+            system_message=system_message,
+        )
+        try:
+            result = agent_runner.run_conversation(
+                user_message=message,
+                system_message=system_message,
+                conversation_history=history,
+                task_id=f"enterprise-social-{platform}",
+            )
+        finally:
+            clear_enterprise_vars(enterprise_tokens)
+            clear_session_vars(session_tokens)
+        return result.get("final_response", "") or ""
+    finally:
+        db.close()
+
+
+def _handle_whatsapp_cloud_event(event: Dict[str, str]) -> None:
+    sender = event.get("from") or ""
+    text = event.get("text") or ""
+    phone_number_id = event.get("phone_number_id") or ""
+    user_name = event.get("name") or sender
+    if not sender or not text:
+        return
+    try:
+        from enterprise import EnterpriseStore
+
+        bind_code = _extract_social_gateway_bind_code_local(text)
+        store = EnterpriseStore()
+        try:
+            if bind_code:
+                binding = store.bind_social_gateway_user(
+                    code=bind_code,
+                    platform="whatsapp",
+                    external_user_id=sender,
+                    bot_account_id=phone_number_id,
+                    external_chat_id=sender,
+                    user_name=user_name,
+                )
+                agent = binding.get("agent") or {}
+                reply = f"Connected. You can now chat with {agent.get('name') or 'the remote agent'} here."
+                _whatsapp_cloud_send_text(to=sender, text=reply, phone_number_id=phone_number_id)
+                return
+
+            auth = store.resolve_social_gateway_binding(
+                platform="whatsapp",
+                external_user_id=sender,
+                bot_account_id=phone_number_id,
+            )
+            if auth:
+                agent = store.get_agent(auth["agent"]["id"], tenant_id=auth["agent"]["tenant_id"]) or auth["agent"]
+                auth["agent"] = agent
+                auth["agents"] = [agent]
+                auth["system_message"] = _append_enterprise_skill_prompt(
+                    store.compile_agent_prompt(agent),
+                    store.list_user_agent_skill_names(auth["user"], agent["id"]),
+                    store.list_agent_custom_skills(
+                        agent["id"],
+                        tenant_id=agent["tenant_id"],
+                        enabled_only=True,
+                    )
+                    + store.list_user_agent_custom_skills(
+                        auth["user"],
+                        agent["id"],
+                        enabled_only=True,
+                    ),
+                )
+        finally:
+            store.close()
+
+        if not auth:
+            _whatsapp_cloud_send_text(
+                to=sender,
+                text="This WhatsApp chat is not connected yet. Please scan the invite QR again or send the /bind code from your invite.",
+                phone_number_id=phone_number_id,
+            )
+            return
+
+        reply = _run_enterprise_social_gateway_chat(
+            auth=auth,
+            platform="whatsapp",
+            message=text,
+            external_user_id=sender,
+            external_chat_id=sender,
+            user_name=user_name,
+            bot_account_id=phone_number_id,
+        )
+        if reply:
+            _whatsapp_cloud_send_text(to=sender, text=reply, phone_number_id=phone_number_id)
+    except Exception:
+        _log.exception("WhatsApp Cloud gateway event failed")
+        try:
+            _whatsapp_cloud_send_text(
+                to=sender,
+                text="Sorry, the agent could not process that message right now.",
+                phone_number_id=phone_number_id,
+            )
+        except Exception:
+            _log.debug("Could not send WhatsApp Cloud failure message", exc_info=True)
+
+
+@app.get("/api/enterprise/social-gateways/whatsapp/webhook")
+async def enterprise_whatsapp_cloud_webhook_verify(request: Request):
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    expected = _whatsapp_cloud_verify_token()
+    if mode == "subscribe" and challenge and expected and hmac.compare_digest(str(token or ""), expected):
+        return HTMLResponse(content=str(challenge), status_code=200)
+    raise HTTPException(status_code=403, detail="WhatsApp webhook verification failed")
+
+
+@app.post("/api/enterprise/social-gateways/whatsapp/webhook")
+async def enterprise_whatsapp_cloud_webhook(request: Request):
+    body = await request.body()
+    _verify_whatsapp_cloud_signature(request, body)
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid WhatsApp webhook JSON") from exc
+    events = _whatsapp_cloud_events(payload if isinstance(payload, dict) else {})
+    for event in events:
+        threading.Thread(
+            target=_handle_whatsapp_cloud_event,
+            args=(event,),
+            daemon=True,
+        ).start()
+    return {"ok": True, "accepted": len(events)}
+
+
 @app.post("/api/enterprise/invites/redeem")
 async def enterprise_redeem_invite(body: EnterpriseInviteRedeem):
     try:
         from enterprise import EnterpriseStore
         store = EnterpriseStore()
         try:
-            result = store.redeem_invite(body.code, email=body.email, name=body.name)
+            if not (body.password or "").strip():
+                raise ValueError("password is required")
+            if not (body.email or "").strip():
+                raise ValueError("email is required")
+            result = store.redeem_invite(
+                body.code,
+                email=body.email,
+                name=body.name,
+                password=body.password,
+            )
             return {
                 "user": result["user"],
                 "api_key": result["api_key"],
@@ -1163,6 +2915,31 @@ async def enterprise_redeem_invite(body: EnterpriseInviteRedeem):
     except Exception:
         _log.exception("POST /api/enterprise/invites/redeem failed")
         raise HTTPException(status_code=500, detail="Enterprise invite redemption failed")
+
+
+@app.post("/api/enterprise/login")
+async def enterprise_login(body: EnterpriseLoginBody):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            result = store.authenticate_password(body.email, body.password)
+            if not result:
+                raise HTTPException(status_code=401, detail="Invalid email or password")
+            return {
+                "user": result["user"],
+                "api_key": result["api_key"],
+                "api_base": "/v1",
+                "agents": result.get("agents", []),
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("POST /api/enterprise/login failed")
+        raise HTTPException(status_code=500, detail="Enterprise login failed")
 
 
 def _enterprise_bearer_token(request: Request) -> str:
@@ -1260,23 +3037,34 @@ def _append_enterprise_skill_prompt(
     return f"{system_message}\n\n{skill_prompt}"
 
 
-def _load_enterprise_builder_playbook() -> str:
-    skill_path = PROJECT_ROOT / "skills" / "enterprise" / "agent-builder" / "SKILL.md"
+def _load_enterprise_skill_playbook(skill_name: str, label: str) -> str:
+    skill_path = PROJECT_ROOT / "skills" / "enterprise" / skill_name / "SKILL.md"
     try:
         content = skill_path.read_text(encoding="utf-8").strip()
     except Exception:
         return ""
     return (
-        '[SYSTEM: The "enterprise-agent-builder" skill is preloaded as the '
-        "builder playbook for this admin-only session. Follow it while using "
-        "normal Hermes tools and the enterprise_builder tool.]\n\n"
+        f'[SYSTEM: The "{label}" skill is preloaded as an enterprise playbook. '
+        "Follow it while using normal Hermes tools and controlled enterprise tools.]\n\n"
         f"[Skill directory: {skill_path.parent}]\n\n"
         f"{content}"
     )
 
 
+def _load_enterprise_builder_playbook() -> str:
+    return _load_enterprise_skill_playbook("agent-builder", "enterprise-agent-builder")
+
+
+def _load_enterprise_local_report_playbook() -> str:
+    return _load_enterprise_skill_playbook(
+        "local-report-collaboration",
+        "enterprise-local-report-collaboration",
+    )
+
+
 def _enterprise_admin_builder_prompt(tenant: Dict[str, Any], admin_user: Dict[str, Any]) -> str:
     playbook = _load_enterprise_builder_playbook()
+    report_playbook = _load_enterprise_local_report_playbook()
     base = (
         "# Enterprise Agent Builder Mode\n"
         "You are a native Hermes Agent running as an admin-only Enterprise Agent Builder. "
@@ -1306,7 +3094,7 @@ def _enterprise_admin_builder_prompt(tenant: Dict[str, Any], admin_user: Dict[st
         "follow-up questions before creating executable data-fetch scripts. Never say a "
         "change was applied unless the controlled enterprise tool returned success."
     )
-    return "\n\n".join(part for part in (base, playbook) if part)
+    return "\n\n".join(part for part in (base, playbook, report_playbook) if part)
 
 
 def _sanitize_trace_value(value: Any, *, max_len: int = 240) -> Any:
@@ -1492,6 +3280,13 @@ def _load_enterprise_admin_builder_setup() -> tuple[Dict[str, Any], Dict[str, An
         raise HTTPException(status_code=500, detail="Enterprise builder setup failed")
 
 
+def _try_load_enterprise_admin_builder_setup() -> Optional[tuple[Dict[str, Any], Dict[str, Any], str]]:
+    try:
+        return _load_enterprise_admin_builder_setup()
+    except HTTPException:
+        return None
+
+
 def _enterprise_admin_builder_lists(tenant_id: str) -> Dict[str, Any]:
     from enterprise import EnterpriseStore
 
@@ -1581,6 +3376,54 @@ async def enterprise_portal_skills(request: Request, agent_id: Optional[str] = N
     except Exception:
         _log.exception("GET /api/enterprise/portal/skills failed")
         raise HTTPException(status_code=500, detail="Enterprise skills failed")
+
+
+@app.get("/api/enterprise/portal/skills/{skill_name}")
+async def enterprise_portal_skill_detail(
+    request: Request,
+    skill_name: str,
+    agent_id: Optional[str] = None,
+):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid user token")
+            agent = store.resolve_user_agent(auth["user"], agent_id=agent_id)
+            custom = store.get_user_agent_custom_skill(auth["user"], agent["id"], skill_name)
+            if custom:
+                return _custom_skill_detail(custom, "custom")
+            agent_custom = store.get_agent_custom_skill(
+                agent["id"],
+                skill_name,
+                tenant_id=auth["user"]["tenant_id"],
+            )
+            if agent_custom:
+                return _custom_skill_detail(agent_custom, "agent_custom")
+            allowed = set(
+                store.list_agent_skill_catalog(
+                    agent["id"],
+                    tenant_id=auth["user"]["tenant_id"],
+                    enabled_only=True,
+                )
+            )
+            if skill_name not in allowed:
+                raise HTTPException(status_code=403, detail="Skill is not available for this agent")
+            return _builtin_skill_detail(skill_name)
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _log.exception("GET /api/enterprise/portal/skills/%s failed", skill_name)
+        raise HTTPException(status_code=500, detail="Enterprise skill detail failed")
 
 
 @app.put("/api/enterprise/portal/skills/toggle")
@@ -1704,6 +3547,87 @@ async def enterprise_portal_toolsets(request: Request, agent_id: Optional[str] =
         raise HTTPException(status_code=500, detail="Enterprise toolsets failed")
 
 
+def _enterprise_portal_auth_context(request: Request, agent_id: Optional[str] = None) -> Dict[str, Any]:
+    from enterprise import EnterpriseStore
+
+    store = EnterpriseStore()
+    try:
+        auth = store.authenticate_api_key(_enterprise_bearer_token(request))
+        if not auth:
+            raise HTTPException(status_code=401, detail="Invalid user token")
+        agent = store.resolve_user_agent(auth["user"], agent_id=agent_id)
+        auth["agent"] = agent
+        auth["access_context"] = AccessContext(
+            tenant_id=auth["user"]["tenant_id"],
+            workspace_id="default",
+            user_id=auth["user"]["id"],
+            agent_id=agent["id"],
+        )
+        return auth
+    finally:
+        store.close()
+
+
+@app.get("/api/enterprise/portal/chat/sessions")
+async def enterprise_portal_chat_sessions(
+    request: Request,
+    agent_id: Optional[str] = None,
+    limit: int = 20,
+):
+    try:
+        from hermes_state import SessionDB
+
+        auth = _enterprise_portal_auth_context(request, agent_id=agent_id)
+        db = SessionDB()
+        try:
+            sessions = db.list_sessions_rich(
+                source="web",
+                limit=max(1, min(int(limit or 20), 50)),
+                offset=0,
+                access_context=auth["access_context"],
+            )
+            now = time.time()
+            for session in sessions:
+                session["is_active"] = (
+                    session.get("ended_at") is None
+                    and (now - session.get("last_active", session.get("started_at", 0))) < 300
+                )
+            return {"agent": auth["agent"], "sessions": sessions}
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/enterprise/portal/chat/sessions failed")
+        raise HTTPException(status_code=500, detail="Enterprise portal chat history failed")
+
+
+@app.get("/api/enterprise/portal/chat/sessions/{session_id}/messages")
+async def enterprise_portal_chat_session_messages(
+    request: Request,
+    session_id: str,
+    agent_id: Optional[str] = None,
+):
+    try:
+        from hermes_state import SessionDB
+
+        auth = _enterprise_portal_auth_context(request, agent_id=agent_id)
+        db = SessionDB()
+        try:
+            sid = db.resolve_session_id(session_id, access_context=auth["access_context"])
+            if not sid:
+                raise HTTPException(status_code=404, detail="Session not found")
+            messages = db.get_messages(sid, access_context=auth["access_context"])
+            return {"agent": auth["agent"], "session_id": sid, "messages": messages}
+        finally:
+            db.close()
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("GET /api/enterprise/portal/chat/sessions/{session_id}/messages failed")
+        raise HTTPException(status_code=500, detail="Enterprise portal chat messages failed")
+
+
 @app.get("/api/enterprise/portal/local-devices")
 async def enterprise_portal_local_devices(request: Request, agent_id: Optional[str] = None):
     try:
@@ -1816,6 +3740,7 @@ def _enterprise_local_report_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     meta = payload.get("enterprise_local_report")
     if isinstance(meta, dict):
         payload["device_id"] = meta.get("device_id")
+        payload["agent_id"] = meta.get("agent_id")
         payload["request"] = meta.get("request")
         payload["device_name"] = meta.get("device_name")
         payload["user_email"] = meta.get("user_email")
@@ -1923,6 +3848,7 @@ async def enterprise_create_local_report_plan(body: EnterpriseLocalReportPlanCre
                     "enterprise_local_report": {
                         "plan_id": plan_id,
                         "device_id": body.device_id,
+                        "agent_id": device.get("agent_id"),
                         "request": body.request.strip(),
                         "device_name": device.get("name"),
                         "user_email": device.get("user_email"),
@@ -1990,6 +3916,77 @@ async def enterprise_local_agent_register(body: EnterpriseLocalDeviceRegister):
     except Exception:
         _log.exception("POST /api/enterprise/local-agent/register failed")
         raise HTTPException(status_code=500, detail="Enterprise local agent registration failed")
+
+
+@app.post("/api/enterprise/local-agent/register-invite")
+async def enterprise_local_agent_register_invite(body: EnterpriseLocalInviteRegister):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            result = store.redeem_invite(
+                body.code,
+                email=body.email,
+                name=body.name,
+                password=body.password,
+            )
+            agents = result.get("agents") or []
+            agent_id = agents[0]["id"] if agents else None
+            device = store.register_local_device_for_user(
+                result["user"],
+                agent_id=agent_id,
+                device_name=body.device_name,
+            )
+            return {
+                "device": device["device"],
+                "device_token": device["device_token"],
+                "user": device["user"],
+                "agent": device["agent"],
+            }
+        finally:
+            store.close()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/local-agent/register-invite failed")
+        raise HTTPException(status_code=500, detail="Enterprise local invite registration failed")
+
+
+@app.post("/api/enterprise/local-agent/register-login")
+async def enterprise_local_agent_register_login(body: EnterpriseLocalLoginRegister):
+    try:
+        from enterprise import EnterpriseStore
+
+        store = EnterpriseStore()
+        try:
+            auth = store.authenticate_password(body.email, body.password)
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid email or password")
+            device = store.register_local_device_for_user(
+                auth["user"],
+                agent_id=body.agent_id,
+                device_name=body.device_name,
+            )
+            return {
+                "device": device["device"],
+                "device_token": device["device_token"],
+                "user": device["user"],
+                "agent": device["agent"],
+            }
+        finally:
+            store.close()
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/local-agent/register-login failed")
+        raise HTTPException(status_code=500, detail="Enterprise local login registration failed")
 
 
 def _enterprise_local_web_config_path() -> Path:
@@ -2105,13 +4102,44 @@ def _enterprise_local_web_status() -> Dict[str, Any]:
     return status
 
 
-def _join_enterprise_local_web(server: str, code: str, name: Optional[str] = None) -> Dict[str, Any]:
+def _join_enterprise_local_web(
+    server: str,
+    code: Optional[str],
+    name: Optional[str] = None,
+    password: Optional[str] = None,
+    email: Optional[str] = None,
+) -> Dict[str, Any]:
     normalized_server = (server or "").strip().rstrip("/")
+    if not normalized_server.startswith(("http://", "https://")):
+        raise ValueError("remote server must start with http:// or https://")
+    invite_password = (password or "").strip()
+    login_email = (email or "").strip()
+    if login_email and invite_password:
+        path = "/api/enterprise/local-agent/register-login"
+        payload = {
+            "email": login_email,
+            "password": invite_password,
+            "device_name": name,
+        }
+    elif invite_password:
+        if not (code or "").strip():
+            raise ValueError("invite code is required")
+        path = "/api/enterprise/local-agent/register-invite"
+        payload = {
+            "code": code,
+            "password": invite_password,
+            "device_name": name,
+        }
+    else:
+        if not (code or "").strip():
+            raise ValueError("device code is required")
+        path = "/api/enterprise/local-agent/register"
+        payload = {"code": code, "name": name}
     result = _enterprise_local_web_http_json(
         normalized_server,
-        "/api/enterprise/local-agent/register",
+        path,
         method="POST",
-        payload={"code": code, "name": name},
+        payload=payload,
     )
     config = {
         "server": normalized_server,
@@ -2138,7 +4166,11 @@ def _enterprise_local_web_prompt(config: Dict[str, Any]) -> str:
     ]
     return (
         "You are a local Hermes agent running on the user's own computer. "
+        "The user should experience one agent, not separate admin/local modes. "
         "You can help with local tasks using the local Hermes tools and local profile state. "
+        "If this installation also owns a workspace, you may help manage that workspace, "
+        "build agents, create invites, and coordinate with connected local devices using "
+        "the available enterprise tools. "
         "When the user asks about products, menus, inventory, prices, orders, delivery, "
         "pickups, stores, customer support, company policy, HR, business-specific knowledge, "
         "or anything owned by an assigned business agent, you MUST call enterprise_remote "
@@ -2319,7 +4351,7 @@ def _enterprise_local_web_remote_chat(config: Dict[str, Any], message: str, sess
 
 
 def _enterprise_local_web_request_prompt(agent: Dict[str, Any], user: Dict[str, Any], device: Dict[str, Any]) -> str:
-    return (
+    base = (
         "You are a local Hermes Agent installed on the user's own machine. "
         "You represent the local user, not the admin. An enterprise admin or "
         "business agent may send collaboration requests, but they cannot remote "
@@ -2333,10 +4365,190 @@ def _enterprise_local_web_request_prompt(agent: Dict[str, Any], user: Dict[str, 
         "minimal necessary excerpts over raw data. You may use enterprise_remote "
         "tools to consult remote business agents assigned to this user when the "
         "request is about company policy, HR, support, or business-specific "
-        "knowledge. Do not send private local data to remote business agents "
+        "knowledge. If the request asks about this user's prior conversation, "
+        "summarize from the scoped local transcript provided in this request "
+        "instead of keyword-searching isolated snippets. Do not send private local data to remote business agents "
         "unless the local user explicitly agrees. Explain what you did and what "
         "you did not access."
     )
+    playbook = _load_enterprise_local_report_playbook()
+    return "\n\n".join(part for part in (base, playbook) if part)
+
+
+def _enterprise_local_web_access_context(
+    config: Dict[str, Any],
+    *,
+    user: Optional[Dict[str, Any]] = None,
+    agent: Optional[Dict[str, Any]] = None,
+    workspace_id: str = "enterprise_local_web",
+) -> Optional[AccessContext]:
+    user_info = user or config.get("user") or {}
+    agent_info = agent or config.get("agent") or {}
+    device = config.get("device") or {}
+    tenant_id = user_info.get("tenant_id") or device.get("tenant_id")
+    user_id = user_info.get("id") or device.get("user_id")
+    agent_id = agent_info.get("id") or config.get("default_agent_id") or device.get("agent_id")
+    if not (tenant_id and user_id and agent_id):
+        return None
+    return AccessContext(
+        tenant_id=str(tenant_id),
+        workspace_id=workspace_id,
+        user_id=str(user_id),
+        agent_id=str(agent_id),
+    )
+
+
+def _enterprise_local_web_session_access_context(
+    db: Any,
+    session_id: str,
+    access_context: Optional[AccessContext],
+) -> Optional[AccessContext]:
+    """Scope new local sessions, while keeping legacy unscoped sessions readable."""
+    if access_context is None:
+        return None
+    existing = db.get_session(session_id)
+    if not existing:
+        return access_context
+    scoped_values = (
+        existing.get("tenant_id"),
+        existing.get("workspace_id"),
+        existing.get("user_id"),
+        existing.get("agent_id"),
+    )
+    if not any(scoped_values):
+        return None
+    return access_context
+
+
+def _enterprise_local_web_format_history_message(message: Dict[str, Any]) -> Optional[str]:
+    role = str(message.get("role") or "").strip()
+    content = str(message.get("content") or "").strip()
+    if not role or not content:
+        return None
+    if role == "tool":
+        try:
+            payload = json.loads(content)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            tool_name = payload.get("tool") or payload.get("name") or "tool"
+            if payload.get("final_response"):
+                content = f"[{tool_name} remote response] {payload.get('final_response')}"
+            elif payload.get("error"):
+                content = f"[{tool_name} error] {payload.get('error')}"
+            else:
+                return None
+        else:
+            content = f"[tool result] {content}"
+    return f"{role.upper()}: {content}"
+
+
+def _enterprise_local_web_request_history_context(
+    config: Dict[str, Any],
+    item: Dict[str, Any],
+    auth: Dict[str, Any],
+    *,
+    max_sessions: int = 8,
+    max_chars: int = 50000,
+) -> str:
+    """Build a scoped transcript for admin-request summaries.
+
+    This is deliberately transcript-first. Reports should summarize what the
+    local agent and this user actually discussed, including remote-agent tool
+    results, instead of relying on keyword FTS hits.
+    """
+    from hermes_state import SessionDB
+
+    user = auth.get("user") or config.get("user") or {}
+    agent = auth.get("agent") or config.get("agent") or {}
+    device = auth.get("device") or config.get("device") or {}
+    access_context = _enterprise_local_web_access_context(config, user=user, agent=agent)
+    current_request_id = str(item.get("id") or "")
+    session_ids: List[str] = []
+
+    db = SessionDB()
+    try:
+        if access_context is not None:
+            for session in db.list_sessions_rich(
+                source="enterprise_local_web",
+                limit=max_sessions,
+                access_context=access_context,
+            ):
+                sid = str(session.get("id") or "")
+                if sid and current_request_id not in sid:
+                    session_ids.append(sid)
+
+        # Legacy local sessions created before access_context scoping did not
+        # persist tenant/user/agent columns. For those, only include a session
+        # when it clearly contains this device/remote-agent fingerprint.
+        if len(session_ids) < max_sessions:
+            device_id = str(device.get("id") or "")
+            agent_id = str(agent.get("id") or item.get("agent_id") or "")
+            fingerprints = [
+                value
+                for value in (
+                    device_id,
+                    f"local-remote-{device_id}-{agent_id}" if device_id and agent_id else "",
+                )
+                if value
+            ]
+            with db._lock:  # noqa: SLF001 - migration bridge for legacy unscoped local sessions.
+                rows = db._conn.execute(  # noqa: SLF001
+                    """SELECT id
+                       FROM sessions
+                       WHERE source = 'enterprise_local_web'
+                         AND tenant_id IS NULL
+                         AND user_id IS NULL
+                         AND agent_id IS NULL
+                       ORDER BY started_at DESC
+                       LIMIT ?""",
+                    (max_sessions * 4,),
+                ).fetchall()
+            for row in rows:
+                sid = str(row["id"])
+                if sid in session_ids or current_request_id in sid:
+                    continue
+                messages = db.get_messages(sid)
+                joined = "\n".join(str(message.get("content") or "") for message in messages)
+                if fingerprints and not any(marker in joined for marker in fingerprints):
+                    continue
+                session_ids.append(sid)
+                if len(session_ids) >= max_sessions:
+                    break
+
+        if not session_ids:
+            return (
+                "No scoped local conversation transcript was found for this user, "
+                "device, and business agent."
+            )
+
+        sections: List[str] = []
+        used_chars = 0
+        for sid in reversed(session_ids[:max_sessions]):
+            messages = db.get_messages(sid)
+            lines: List[str] = []
+            for message in messages:
+                formatted = _enterprise_local_web_format_history_message(message)
+                if formatted:
+                    lines.append(formatted)
+            if not lines:
+                continue
+            section = f"Session {sid}\n" + "\n".join(lines)
+            if used_chars + len(section) > max_chars:
+                remaining = max_chars - used_chars
+                if remaining <= 1000:
+                    break
+                section = section[:remaining] + "\n...[history truncated]"
+            sections.append(section)
+            used_chars += len(section)
+            if used_chars >= max_chars:
+                break
+
+        return "\n\n---\n\n".join(sections) if sections else (
+            "No usable scoped local conversation transcript was found."
+        )
+    finally:
+        db.close()
 
 
 def _enterprise_local_web_run_collaboration_request(
@@ -2371,6 +4583,13 @@ def _enterprise_local_web_run_collaboration_request(
     user = auth.get("user") or config.get("user") or {}
     agent_info = auth.get("agent") or config.get("agent") or {}
     request_id = str(item.get("id") or secrets.token_hex(6))
+    access_context = _enterprise_local_web_access_context(config, user=user, agent=agent_info)
+    history_context = _enterprise_local_web_request_history_context(config, item, auth)
+    system_message = (
+        _enterprise_local_web_request_prompt(agent_info, user, device)
+        + "\n\nScoped local conversation transcript available to you:\n"
+        + history_context
+    )
 
     agent = AIAgent(
         model=model,
@@ -2381,6 +4600,7 @@ def _enterprise_local_web_run_collaboration_request(
         enabled_toolsets=enabled_toolsets,
         platform="enterprise_local_web_request",
         session_id=f"enterprise-local-{request_id}",
+        access_context=access_context,
     )
     session_tokens = set_session_vars(
         platform="enterprise_local_web_request",
@@ -2393,7 +4613,7 @@ def _enterprise_local_web_run_collaboration_request(
     try:
         result = agent.run_conversation(
             user_message=item.get("request") or "",
-            system_message=_enterprise_local_web_request_prompt(agent_info, user, device),
+            system_message=system_message,
             task_id="enterprise-local-web-request",
         )
         return result.get("final_response", "") or "I could not produce a local response."
@@ -2477,7 +4697,12 @@ def _temporary_env(values: Dict[str, str]):
 
 def _enterprise_local_web_admin_inference_runtime() -> Optional[Dict[str, Any]]:
     """Resolve default/admin profile inference credentials for local-web fallback."""
-    admin_home = get_default_hermes_root()
+    native_admin_home = Path.home() / ".hermes"
+    admin_home = (
+        native_admin_home
+        if (native_admin_home / "config.yaml").exists()
+        else get_default_hermes_root()
+    )
     local_home = get_hermes_home()
     try:
         if admin_home.resolve() == local_home.resolve():
@@ -2579,12 +4804,35 @@ async def enterprise_local_web_connect_url(request: Request, body: EnterpriseLoc
 @app.post("/api/enterprise/local-web/join")
 async def enterprise_local_web_join(body: EnterpriseLocalWebJoinBody):
     try:
-        return _join_enterprise_local_web(body.server, body.code, name=body.name)
+        return _join_enterprise_local_web(
+            body.server,
+            body.code,
+            name=body.name,
+            password=body.password,
+            email=body.email,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         _log.exception("POST /api/enterprise/local-web/join failed")
+        message = str(exc)
+        if message.startswith("401 "):
+            raise HTTPException(status_code=401, detail=message)
+        if message.startswith("403 "):
+            raise HTTPException(status_code=403, detail=message)
         raise HTTPException(status_code=500, detail=f"Local web join failed: {exc}")
+
+
+@app.post("/api/enterprise/local-web/disconnect")
+async def enterprise_local_web_disconnect():
+    try:
+        path = _enterprise_local_web_config_path()
+        if path.exists():
+            path.unlink()
+        return _enterprise_local_web_status()
+    except Exception as exc:
+        _log.exception("POST /api/enterprise/local-web/disconnect failed")
+        raise HTTPException(status_code=500, detail=f"Local web disconnect failed: {exc}")
 
 
 @app.get("/api/enterprise/local-web/callback", name="enterprise_local_web_callback")
@@ -2599,10 +4847,10 @@ async def enterprise_local_web_callback(code: str, state: str):
             code,
             name=pending.get("name"),
         )
-        return RedirectResponse(url="/local?connected=1", status_code=303)
+        return RedirectResponse(url="/enterprise?connected=1", status_code=303)
     except Exception as exc:
         detail = urllib.parse.quote(str(exc), safe="")
-        return RedirectResponse(url=f"/local?error={detail}", status_code=303)
+        return RedirectResponse(url=f"/enterprise?error={detail}", status_code=303)
 
 
 @app.get("/api/enterprise/local-web/requests")
@@ -2613,7 +4861,7 @@ async def enterprise_local_web_requests(limit: int = 10):
     try:
         result = _enterprise_local_web_http_json(
             str(config.get("server") or ""),
-            f"/api/enterprise/local-agent/requests?limit={max(1, min(int(limit or 10), 100))}",
+            f"/api/enterprise/local-agent/requests?limit={max(1, min(int(limit or 10), 100))}&history=1",
             token=str(config.get("device_token") or ""),
         )
         return result
@@ -2658,6 +4906,79 @@ async def enterprise_local_web_request_answer(request_id: str, body: EnterpriseL
     except Exception as exc:
         _log.exception("POST /api/enterprise/local-web/requests/%s/answer failed", request_id)
         raise HTTPException(status_code=500, detail=f"Local request answer failed: {exc}")
+
+
+def _enterprise_local_web_auto_answer_request(
+    config: Dict[str, Any],
+    item: Dict[str, Any],
+    polled: Dict[str, Any],
+) -> None:
+    request_id = str(item.get("id") or "")
+    if not request_id:
+        return
+    with _LOCAL_WEB_REQUEST_POLLER_LOCK:
+        if request_id in _LOCAL_WEB_REQUESTS_IN_PROGRESS:
+            return
+        _LOCAL_WEB_REQUESTS_IN_PROGRESS.add(request_id)
+    try:
+        response = _enterprise_local_web_run_collaboration_request(config, item, polled)
+        if not response.strip():
+            response = "I could not produce a local response."
+        _enterprise_local_web_http_json(
+            str(config.get("server") or ""),
+            f"/api/enterprise/local-agent/requests/{request_id}/response",
+            method="POST",
+            token=str(config.get("device_token") or ""),
+            payload={"response": response, "status": "responded"},
+        )
+        _log.info("Auto-responded to enterprise local-agent request %s", request_id)
+    except Exception:
+        _log.exception("Auto-response failed for enterprise local-agent request %s", request_id)
+    finally:
+        with _LOCAL_WEB_REQUEST_POLLER_LOCK:
+            _LOCAL_WEB_REQUESTS_IN_PROGRESS.discard(request_id)
+
+
+def _enterprise_local_web_request_poller_loop() -> None:
+    interval = max(2, int(os.getenv("HERMES_LOCAL_WEB_REQUEST_POLL_INTERVAL", "5") or "5"))
+    limit = max(1, min(int(os.getenv("HERMES_LOCAL_WEB_REQUEST_POLL_LIMIT", "5") or "5"), 25))
+    while True:
+        try:
+            config = _read_enterprise_local_web_config()
+            if not (config.get("server") and config.get("device_token")):
+                time.sleep(interval)
+                continue
+            polled = _enterprise_local_web_http_json(
+                str(config.get("server") or ""),
+                f"/api/enterprise/local-agent/requests?limit={limit}",
+                token=str(config.get("device_token") or ""),
+            )
+            for item in polled.get("requests") or []:
+                if item.get("response") or item.get("status") not in {"pending", "delivered"}:
+                    continue
+                threading.Thread(
+                    target=_enterprise_local_web_auto_answer_request,
+                    args=(config, item, polled),
+                    daemon=True,
+                ).start()
+        except Exception:
+            _log.debug("Enterprise local-web request poll failed", exc_info=True)
+        time.sleep(interval)
+
+
+def _start_enterprise_local_web_request_poller() -> None:
+    if os.getenv("HERMES_LOCAL_WEB_REQUEST_POLLER", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    global _LOCAL_WEB_REQUEST_POLLER_STARTED
+    with _LOCAL_WEB_REQUEST_POLLER_LOCK:
+        if _LOCAL_WEB_REQUEST_POLLER_STARTED:
+            return
+        _LOCAL_WEB_REQUEST_POLLER_STARTED = True
+    threading.Thread(
+        target=_enterprise_local_web_request_poller_loop,
+        name="enterprise-local-web-request-poller",
+        daemon=True,
+    ).start()
 
 
 @app.post("/api/enterprise/local-web/chat/stream")
@@ -2751,7 +5072,12 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
             _resolve_gateway_model,
             _resolve_runtime_agent_kwargs,
         )
-        from gateway.session_context import clear_session_vars, set_session_vars
+        from gateway.session_context import (
+            clear_enterprise_vars,
+            clear_session_vars,
+            set_enterprise_vars,
+            set_session_vars,
+        )
         from hermes_cli.tools_config import _get_platform_tools
         from hermes_state import SessionDB
         from run_agent import AIAgent
@@ -2763,7 +5089,11 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             model = _resolve_gateway_model()
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "cli")) | {"enterprise_remote"})
+        admin_context = _try_load_enterprise_admin_builder_setup()
+        extra_toolsets = {"enterprise_remote"}
+        if admin_context:
+            extra_toolsets.update({"enterprise_builder", "enterprise_local_bridge"})
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "cli")) | extra_toolsets)
         live_trace: List[Dict[str, Any]] = []
 
         def _emit_trace(item: Dict[str, Any]) -> None:
@@ -2815,7 +5145,16 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
 
         db = SessionDB()
         try:
-            history = db.get_messages_as_conversation(session_id)
+            local_access_context = _enterprise_local_web_access_context(config)
+            session_access_context = _enterprise_local_web_session_access_context(
+                db,
+                session_id,
+                local_access_context,
+            )
+            history = db.get_messages_as_conversation(
+                session_id,
+                access_context=session_access_context,
+            )
             agent = AIAgent(
                 model=model,
                 **runtime_kwargs,
@@ -2826,27 +5165,51 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
                 session_id=session_id,
                 platform="enterprise_local_web",
                 session_db=db,
+                access_context=session_access_context,
                 status_callback=_record_status,
                 tool_progress_callback=_record_tool_progress,
                 tool_gen_callback=_record_tool_gen,
                 stream_delta_callback=_record_stream_delta,
             )
+            platform_name = "enterprise_admin_builder" if admin_context else "enterprise_local_web"
             session_tokens = set_session_vars(
-                platform="enterprise_local_web",
+                platform=platform_name,
                 chat_id=session_id,
-                chat_name="Enterprise Local Agent",
+                chat_name="Workspace Agent",
                 user_id=(config.get("user") or {}).get("id") or "local-user",
                 user_name=(config.get("user") or {}).get("email") or "",
                 session_key=session_id,
             )
+            enterprise_tokens = None
+            system_message = _enterprise_local_web_prompt(config)
+            if admin_context:
+                tenant, admin_user, admin_system_message = admin_context
+                enterprise_tokens = set_enterprise_vars(
+                    tenant_id=tenant["id"],
+                    user_id=admin_user["id"],
+                    agent_id="enterprise_builder",
+                    agent_name="Workspace Agent",
+                    system_message=admin_system_message,
+                )
+                system_message = "\n\n".join(
+                    part
+                    for part in (
+                        _enterprise_local_web_prompt(config),
+                        "# Workspace Owner Capabilities\n"
+                        + admin_system_message,
+                    )
+                    if part
+                )
             try:
                 result = agent.run_conversation(
                     user_message=message,
-                    system_message=_enterprise_local_web_prompt(config),
+                    system_message=system_message,
                     conversation_history=history,
                     task_id="enterprise-local-web",
                 )
             finally:
+                if enterprise_tokens is not None:
+                    clear_enterprise_vars(enterprise_tokens)
                 clear_session_vars(session_tokens)
             result_messages = result.get("messages") or []
             if (
@@ -2907,6 +5270,55 @@ async def enterprise_local_web_chat_stream(body: EnterpriseBuilderChatBody):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/enterprise/local-web/chat/sessions")
+async def enterprise_local_web_chat_sessions(limit: int = 20):
+    config = _read_enterprise_local_web_config()
+    try:
+        if config.get("server") and config.get("device_token"):
+            config = _refresh_enterprise_local_web_config(config)
+    except Exception:
+        pass
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        access_context = _enterprise_local_web_access_context(config)
+        sessions = db.list_sessions_rich(
+            source="enterprise_local_web",
+            limit=limit,
+            offset=0,
+            access_context=access_context,
+        )
+        now = time.time()
+        for item in sessions:
+            item.pop("system_prompt", None)
+            item.pop("model_config", None)
+            item["is_active"] = (
+                item.get("ended_at") is None
+                and (now - item.get("last_active", item.get("started_at", 0))) < 300
+            )
+        return {"sessions": sessions}
+    finally:
+        db.close()
+
+
+@app.get("/api/enterprise/local-web/chat/sessions/{session_id}/messages")
+async def enterprise_local_web_chat_session_messages(session_id: str):
+    config = _read_enterprise_local_web_config()
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        access_context = _enterprise_local_web_access_context(config)
+        sid = db.resolve_session_id(session_id, access_context=access_context)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "session_id": sid,
+            "messages": db.get_messages(sid, access_context=access_context),
+        }
+    finally:
+        db.close()
 
 
 @app.get("/api/enterprise/local-agent/agents")
@@ -2991,6 +5403,33 @@ async def enterprise_local_agent_chat(request: Request, body: EnterpriseChatBody
         import uuid as _uuid
         session_id = f"local-remote-{auth['device']['id']}-{auth['agent']['id']}-{_uuid.uuid4().hex[:12]}"
 
+    gateway_origin = body.gateway_origin if isinstance(body.gateway_origin, dict) else {}
+    if gateway_origin:
+        try:
+            platform = str(gateway_origin.get("platform") or "").strip().lower()
+            external_user_id = str(gateway_origin.get("external_user_id") or "").strip()
+            external_chat_id = str(gateway_origin.get("external_chat_id") or "").strip()
+            bot_account_id = str(gateway_origin.get("bot_account_id") or "").strip()
+            if platform and external_user_id:
+                store = EnterpriseStore()
+                try:
+                    store.record_local_device_gateway_binding(
+                        tenant_id=auth["user"]["tenant_id"],
+                        user_id=auth["user"]["id"],
+                        agent_id=auth["agent"]["id"],
+                        device_id=auth["device"]["id"],
+                        platform=platform,
+                        external_user_id=external_user_id,
+                        bot_account_id=bot_account_id,
+                        external_chat_id=external_chat_id,
+                        user_name=str(gateway_origin.get("user_name") or "").strip() or None,
+                        source_session_id=session_id,
+                    )
+                finally:
+                    store.close()
+        except Exception:
+            _log.debug("Could not record local device gateway origin", exc_info=True)
+
     def _run_chat():
         from gateway.run import (
             _load_gateway_config,
@@ -3007,8 +5446,15 @@ async def enterprise_local_agent_chat(request: Request, body: EnterpriseChatBody
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            model = _resolve_gateway_model()
+        except Exception:
+            admin_inference = _enterprise_local_web_admin_inference_runtime()
+            if not admin_inference:
+                raise
+            runtime_kwargs = dict(admin_inference.get("runtime_kwargs") or {})
+            model = str(admin_inference.get("model") or "")
         user_config = _load_gateway_config()
         enabled_toolsets = _enterprise_enabled_toolsets(
             _get_platform_tools(user_config, "api_server")
@@ -3076,12 +5522,76 @@ async def enterprise_local_agent_chat(request: Request, body: EnterpriseChatBody
         raise HTTPException(status_code=500, detail=f"Local-agent remote chat failed: {exc}")
 
 
+@app.post("/api/enterprise/local-agent/history/search")
+async def enterprise_local_agent_history_search(request: Request, body: EnterpriseLocalHistorySearch):
+    query = (body.query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query is required")
+
+    try:
+        from enterprise import EnterpriseStore
+        from hermes_state import SessionDB
+
+        store = EnterpriseStore()
+        db = SessionDB()
+        try:
+            auth = store.authenticate_device_token(_enterprise_device_bearer_token(request))
+            if not auth:
+                raise HTTPException(status_code=401, detail="Invalid local device token")
+            agent = store.resolve_user_agent(
+                auth["user"],
+                agent_id=(body.agent_id or auth["device"].get("agent_id") or None),
+            )
+            limit = max(1, min(int(body.limit or 10), 25))
+            matches: List[Dict[str, Any]] = []
+            seen_match_ids: set[Any] = set()
+            for workspace_id in ("default", "enterprise_local_remote"):
+                access_context = AccessContext(
+                    tenant_id=auth["user"]["tenant_id"],
+                    workspace_id=workspace_id,
+                    user_id=auth["user"]["id"],
+                    agent_id=agent["id"],
+                )
+                for match in db.search_messages(
+                    query=query,
+                    role_filter=["user"],
+                    limit=limit,
+                    access_context=access_context,
+                ):
+                    match_id = match.get("id")
+                    if match_id in seen_match_ids:
+                        continue
+                    seen_match_ids.add(match_id)
+                    match["workspace_id"] = workspace_id
+                    matches.append(match)
+                    if len(matches) >= limit:
+                        break
+                if len(matches) >= limit:
+                    break
+            return {
+                "user": auth["user"],
+                "agent": agent,
+                "query": query,
+                "matches": matches,
+            }
+        finally:
+            db.close()
+            store.close()
+    except HTTPException:
+        raise
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception:
+        _log.exception("POST /api/enterprise/local-agent/history/search failed")
+        raise HTTPException(status_code=500, detail="Enterprise local history search failed")
+
+
 def _enterprise_device_bearer_token(request: Request) -> str:
     return _enterprise_bearer_token(request)
 
 
 @app.get("/api/enterprise/local-agent/requests")
-async def enterprise_local_agent_requests(request: Request, limit: int = 10):
+async def enterprise_local_agent_requests(request: Request, limit: int = 10, history: bool = False):
     try:
         from enterprise import EnterpriseStore
 
@@ -3090,14 +5600,21 @@ async def enterprise_local_agent_requests(request: Request, limit: int = 10):
             auth = store.authenticate_device_token(_enterprise_device_bearer_token(request))
             if not auth:
                 raise HTTPException(status_code=401, detail="Invalid local device token")
+            if history:
+                requests = store.list_local_agent_requests(
+                    device_id=auth["device"]["id"],
+                    limit=limit,
+                )
+            else:
+                requests = store.poll_local_agent_requests(
+                    auth["device"],
+                    limit=limit,
+                )
             return {
                 "device": auth["device"],
                 "user": auth["user"],
                 "agent": auth["agent"],
-                "requests": store.poll_local_agent_requests(
-                    auth["device"],
-                    limit=limit,
-                ),
+                "requests": requests,
             }
         finally:
             store.close()
@@ -3376,8 +5893,19 @@ async def enterprise_admin_builder_chat(body: EnterpriseBuilderChatBody):
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            model = _resolve_gateway_model()
+            fallback_source_home = ""
+        except Exception as exc:
+            admin_inference = _enterprise_local_web_admin_inference_runtime()
+            if not admin_inference:
+                _emit({"type": "error", "detail": f"Builder chat failed: {exc}"})
+                event_queue.put(done)
+                return
+            runtime_kwargs = dict(admin_inference.get("runtime_kwargs") or {})
+            model = str(admin_inference.get("model") or "")
+            fallback_source_home = str(admin_inference.get("source_home") or "")
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(
             set(_get_platform_tools(user_config, "api_server"))
@@ -3532,8 +6060,19 @@ async def enterprise_admin_builder_chat_stream(body: EnterpriseBuilderChatBody):
         from hermes_state import SessionDB
         from run_agent import AIAgent
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            model = _resolve_gateway_model()
+            fallback_source_home = ""
+        except Exception as exc:
+            admin_inference = _enterprise_local_web_admin_inference_runtime()
+            if not admin_inference:
+                _emit({"type": "error", "detail": f"Builder chat failed: {exc}"})
+                event_queue.put(done)
+                return
+            runtime_kwargs = dict(admin_inference.get("runtime_kwargs") or {})
+            model = str(admin_inference.get("model") or "")
+            fallback_source_home = str(admin_inference.get("source_home") or "")
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(
             set(_get_platform_tools(user_config, "api_server"))
@@ -3544,6 +6083,16 @@ async def enterprise_admin_builder_chat_stream(body: EnterpriseBuilderChatBody):
         def _emit_trace(item: Dict[str, Any]) -> None:
             live_trace.append(item)
             _emit({"type": "trace", "trace": item})
+
+        if fallback_source_home:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="status",
+                    title="Using default profile inference provider",
+                    detail=fallback_source_home,
+                    status="info",
+                )
+            )
 
         def _record_status(kind: str, msg: str) -> None:
             _emit_trace(
@@ -3670,6 +6219,271 @@ async def enterprise_admin_builder_chat_stream(body: EnterpriseBuilderChatBody):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/api/enterprise/admin-chat/stream")
+async def enterprise_admin_chat_stream(body: EnterpriseBuilderChatBody):
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    tenant, admin_user, _builder_system_message = _load_enterprise_admin_builder_setup()
+
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        import uuid as _uuid
+        session_id = f"enterprise-admin-{_uuid.uuid4().hex[:16]}"
+
+    access_context = AccessContext(
+        tenant_id=tenant["id"],
+        workspace_id="enterprise_admin",
+        user_id=admin_user["id"],
+        agent_id="enterprise_admin_default",
+    )
+
+    event_queue: "queue.Queue[Any]" = queue.Queue()
+    done = object()
+
+    def _emit(event: Dict[str, Any]) -> None:
+        try:
+            event_queue.put(event)
+        except Exception:
+            _log.debug("Enterprise admin chat stream enqueue failed", exc_info=True)
+
+    def _run_admin_chat_stream() -> None:
+        from gateway.run import (
+            _load_gateway_config,
+            _resolve_gateway_model,
+            _resolve_runtime_agent_kwargs,
+        )
+        from gateway.session_context import (
+            clear_enterprise_vars,
+            clear_session_vars,
+            set_enterprise_vars,
+            set_session_vars,
+        )
+        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            model = _resolve_gateway_model()
+            fallback_source_home = ""
+        except Exception as exc:
+            admin_inference = _enterprise_local_web_admin_inference_runtime()
+            if not admin_inference:
+                _emit({"type": "error", "detail": f"Admin chat failed: {exc}"})
+                event_queue.put(done)
+                return
+            runtime_kwargs = dict(admin_inference.get("runtime_kwargs") or {})
+            model = str(admin_inference.get("model") or "")
+            fallback_source_home = str(admin_inference.get("source_home") or "")
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(
+            set(_get_platform_tools(user_config, "api_server"))
+            | {"enterprise_local_bridge"}
+        )
+        live_trace: List[Dict[str, Any]] = []
+
+        def _emit_trace(item: Dict[str, Any]) -> None:
+            live_trace.append(item)
+            _emit({"type": "trace", "trace": item})
+
+        if fallback_source_home:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="status",
+                    title="Using default profile inference provider",
+                    detail=fallback_source_home,
+                    status="info",
+                )
+            )
+
+        def _record_status(kind: str, msg: str) -> None:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="status",
+                    title=str(msg),
+                    status="warning" if kind == "warn" else "info",
+                )
+            )
+
+        def _record_tool_progress(event: str, tool_name: str, preview: Any = None, args: Any = None, **kwargs: Any) -> None:
+            del args
+            status = "running"
+            title = f"Starting {tool_name}"
+            detail = str(preview or "")
+            if event == "tool.completed":
+                status = "error" if kwargs.get("is_error") else "success"
+                duration = kwargs.get("duration")
+                title = f"Completed {tool_name}"
+                detail = f"{duration:.1f}s" if isinstance(duration, (int, float)) else ""
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="tool_progress",
+                    title=title,
+                    detail=detail,
+                    status=status,
+                    tool=tool_name,
+                )
+            )
+
+        def _record_tool_gen(tool_name: str) -> None:
+            _emit_trace(
+                _builder_event_trace_item(
+                    kind="tool_generation",
+                    title=f"Preparing tool call: {tool_name}",
+                    status="running",
+                    tool=tool_name,
+                )
+            )
+
+        def _record_stream_delta(text: Any) -> None:
+            if isinstance(text, str) and text:
+                _emit({"type": "delta", "delta": text})
+
+        db = SessionDB()
+        try:
+            history = db.get_messages_as_conversation(
+                session_id,
+                access_context=access_context,
+            )
+            agent = AIAgent(
+                model=model,
+                **runtime_kwargs,
+                max_iterations=int(os.getenv("HERMES_MAX_ITERATIONS", "90")),
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                session_id=session_id,
+                platform="web",
+                session_db=db,
+                access_context=access_context,
+                status_callback=_record_status,
+                tool_progress_callback=_record_tool_progress,
+                tool_gen_callback=_record_tool_gen,
+                stream_delta_callback=_record_stream_delta,
+            )
+            system_message = (
+                "You are the default Hermes admin agent for this enterprise workspace. "
+                "Help the admin operate the workspace and coordinate with local agents when appropriate. "
+                "Use enterprise_local_bridge for admin-to-local-agent report requests and follow "
+                "the enterprise-local-report-collaboration playbook. Do not create or modify "
+                "business agents unless the admin explicitly asks to use the Builder.\n\n"
+                + _load_enterprise_local_report_playbook()
+            )
+            session_tokens = set_session_vars(
+                platform="enterprise_admin",
+                chat_id=session_id,
+                chat_name="Enterprise Admin Chat",
+                user_id=admin_user["id"],
+                user_name=admin_user.get("email") or admin_user.get("name") or "",
+                session_key=session_id,
+            )
+            enterprise_tokens = set_enterprise_vars(
+                tenant_id=tenant["id"],
+                user_id=admin_user["id"],
+                agent_id="enterprise_admin_default",
+                agent_name="Enterprise Admin",
+                system_message=system_message,
+            )
+            try:
+                result = agent.run_conversation(
+                    user_message=message,
+                    system_message=system_message,
+                    conversation_history=history,
+                    task_id="enterprise-admin-chat",
+                )
+            finally:
+                clear_enterprise_vars(enterprise_tokens)
+                clear_session_vars(session_tokens)
+            _emit({
+                "type": "final",
+                "session_id": session_id,
+                "final_response": result.get("final_response", ""),
+                "trace": (live_trace + _builder_trace_from_messages(result.get("messages") or []))[-40:],
+            })
+        except Exception as exc:
+            _log.exception("Enterprise admin chat stream failed")
+            _emit({"type": "error", "detail": f"Admin chat failed: {exc}"})
+        finally:
+            try:
+                db.close()
+            finally:
+                event_queue.put(done)
+
+    def _event_stream():
+        worker = threading.Thread(target=_run_admin_chat_stream, daemon=True)
+        worker.start()
+        while True:
+            event = event_queue.get()
+            if event is done:
+                break
+            yield _enterprise_builder_json_line(event)
+        worker.join(timeout=0.2)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/enterprise/admin-chat/sessions")
+async def enterprise_admin_chat_sessions(limit: int = 20):
+    tenant, admin_user, _builder_system_message = _load_enterprise_admin_builder_setup()
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        access_context = AccessContext(
+            tenant_id=tenant["id"],
+            workspace_id="enterprise_admin",
+            user_id=admin_user["id"],
+            agent_id="enterprise_admin_default",
+        )
+        sessions = db.list_sessions_rich(
+            limit=limit,
+            offset=0,
+            access_context=access_context,
+        )
+        now = time.time()
+        for item in sessions:
+            item.pop("system_prompt", None)
+            item.pop("model_config", None)
+            item["is_active"] = (
+                item.get("ended_at") is None
+                and (now - item.get("last_active", item.get("started_at", 0))) < 300
+            )
+        return {"sessions": sessions}
+    finally:
+        db.close()
+
+
+@app.get("/api/enterprise/admin-chat/sessions/{session_id}/messages")
+async def enterprise_admin_chat_session_messages(session_id: str):
+    tenant, admin_user, _builder_system_message = _load_enterprise_admin_builder_setup()
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        access_context = AccessContext(
+            tenant_id=tenant["id"],
+            workspace_id="enterprise_admin",
+            user_id=admin_user["id"],
+            agent_id="enterprise_admin_default",
+        )
+        sid = db.resolve_session_id(session_id, access_context=access_context)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {
+            "session_id": sid,
+            "messages": db.get_messages(sid, access_context=access_context),
+        }
+    finally:
+        db.close()
 
 
 @app.post("/api/enterprise/chat")
@@ -5180,6 +7994,10 @@ async def get_session_detail(session_id: str):
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        admin_user_id = _dashboard_admin_user_id()
+        social_bindings = _active_social_gateway_bindings() if admin_user_id else []
+        if not _dashboard_session_visible_to_owner(session, admin_user_id, social_bindings):
+            raise HTTPException(status_code=404, detail="Session not found")
         return session
     finally:
         db.close()
@@ -5193,6 +8011,11 @@ async def get_session_messages(session_id: str):
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
+        session = db.get_session(sid)
+        admin_user_id = _dashboard_admin_user_id()
+        social_bindings = _active_social_gateway_bindings() if admin_user_id else []
+        if not session or not _dashboard_session_visible_to_owner(session, admin_user_id, social_bindings):
+            raise HTTPException(status_code=404, detail="Session not found")
         messages = db.get_messages(sid)
         return {"session_id": sid, "messages": messages}
     finally:
@@ -5204,7 +8027,13 @@ async def delete_session_endpoint(session_id: str):
     from hermes_state import SessionDB
     db = SessionDB()
     try:
-        if not db.delete_session(session_id):
+        sid = db.resolve_session_id(session_id)
+        session = db.get_session(sid) if sid else None
+        admin_user_id = _dashboard_admin_user_id()
+        social_bindings = _active_social_gateway_bindings() if admin_user_id else []
+        if not session or not _dashboard_session_visible_to_owner(session, admin_user_id, social_bindings):
+            raise HTTPException(status_code=404, detail="Session not found")
+        if not db.delete_session(sid):
             raise HTTPException(status_code=404, detail="Session not found")
         return {"ok": True}
     finally:
@@ -5288,16 +8117,18 @@ class CronJobUpdate(BaseModel):
 @app.get("/api/cron/jobs")
 async def list_cron_jobs():
     from cron.jobs import list_jobs
-    return list_jobs(include_disabled=True)
+    admin_user_id = _dashboard_admin_user_id()
+    return [
+        job
+        for job in list_jobs(include_disabled=True)
+        if _dashboard_cron_visible_to_owner(job, admin_user_id)
+    ]
 
 
 @app.get("/api/cron/jobs/{job_id}")
 async def get_cron_job(job_id: str):
     from cron.jobs import get_job
-    job = get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    return _ensure_dashboard_cron_visible(get_job(job_id))
 
 
 @app.post("/api/cron/jobs")
@@ -5323,34 +8154,29 @@ async def update_cron_job(job_id: str, body: CronJobUpdate):
 
 @app.post("/api/cron/jobs/{job_id}/pause")
 async def pause_cron_job(job_id: str):
-    from cron.jobs import pause_job
-    job = pause_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    from cron.jobs import get_job, pause_job
+    _ensure_dashboard_cron_visible(get_job(job_id))
+    return _ensure_dashboard_cron_visible(pause_job(job_id))
 
 
 @app.post("/api/cron/jobs/{job_id}/resume")
 async def resume_cron_job(job_id: str):
-    from cron.jobs import resume_job
-    job = resume_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    from cron.jobs import get_job, resume_job
+    _ensure_dashboard_cron_visible(get_job(job_id))
+    return _ensure_dashboard_cron_visible(resume_job(job_id))
 
 
 @app.post("/api/cron/jobs/{job_id}/trigger")
 async def trigger_cron_job(job_id: str):
-    from cron.jobs import trigger_job
-    job = trigger_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    from cron.jobs import get_job, trigger_job
+    _ensure_dashboard_cron_visible(get_job(job_id))
+    return _ensure_dashboard_cron_visible(trigger_job(job_id))
 
 
 @app.delete("/api/cron/jobs/{job_id}")
 async def delete_cron_job(job_id: str):
-    from cron.jobs import remove_job
+    from cron.jobs import get_job, remove_job
+    _ensure_dashboard_cron_visible(get_job(job_id))
     if not remove_job(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"ok": True}
@@ -5368,8 +8194,11 @@ class SkillToggle(BaseModel):
 
 @app.get("/api/skills")
 async def get_skills():
+    from tools.skills_sync import sync_skills
     from tools.skills_tool import _find_all_skills
     from hermes_cli.skills_config import get_disabled_skills
+
+    sync_skills(quiet=True)
     config = load_config()
     disabled = get_disabled_skills(config)
     skills = _find_all_skills(skip_disabled=True)
@@ -5412,12 +8241,15 @@ async def get_toolsets():
             tools = sorted(set(resolve_toolset(name)))
         except Exception:
             tools = []
+        configured = _toolset_has_keys(name, config)
         is_enabled = name in enabled_toolsets
+        if name in {"enterprise_builder", "enterprise_local_bridge"} and configured:
+            is_enabled = True
         result.append({
             "name": name, "label": label, "description": desc,
             "enabled": is_enabled,
             "available": is_enabled,
-            "configured": _toolset_has_keys(name, config),
+            "configured": configured,
             "tools": tools,
         })
     return result
@@ -6425,6 +9257,8 @@ def start_server(
             webbrowser.open(f"http://{host}:{port}{path}")
 
         threading.Thread(target=_open, daemon=True).start()
+
+    _start_enterprise_local_web_request_poller()
 
     print(f"  Hermes Web UI → http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
