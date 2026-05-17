@@ -134,6 +134,10 @@ WhatsApp bridge runtime support, and QR generation without installing Slack,
 Discord, Matrix, or other gateway adapters you do not use. Install
 `.[all,dev]` only when you want every upstream Hermes optional integration.
 
+If pip starts downloading `slack-bolt` or `slack-sdk`, you are not using the
+lightweight install path. Stop the command, make sure you have pulled the latest
+repo, and run `pip install -e ".[portal,dev]"` instead of `.[all,dev]`.
+
 ### 2. Configure a model provider
 
 ```bash

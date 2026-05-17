@@ -90,9 +90,12 @@ google = [
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 web = ["fastapi>=0.104.0,<1", "uvicorn[standard]>=0.24.0,<1"]
 # Teames remote portal + social QR path without Slack/Discord/Matrix extras.
+# Keep this list direct instead of using self-referential extras like
+# `hermes-agent[web]`; older pip resolvers can backtrack into unrelated extras.
 portal = [
-  "hermes-agent[web]",
-  "hermes-agent[cron]",
+  "fastapi>=0.104.0,<1",
+  "uvicorn[standard]>=0.24.0,<1",
+  "croniter>=6.0.0,<7",
   "aiohttp>=3.13.3,<4",
   "python-telegram-bot[webhooks]>=22.6,<23",
   "qrcode>=7.0,<8",
