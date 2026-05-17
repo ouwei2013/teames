@@ -88,6 +88,43 @@ scoped instruction on top of the base Hermes agent prompt, so each workspace
 agent gets a business role while preserving Hermes tools, memory, skills,
 gateway behavior, and scheduler support.
 
+## Example Use Cases
+
+### 1. Remote portal: Weight Manager agent for social users
+
+A health coach, clinic, or wellness business can run Teames on a server and
+create a `weight_manager` agent that knows its coaching style, diet principles,
+check-in workflow, and reminder rules. The admin creates the agent in the
+workspace portal, connects a social gateway, and sends QR invites to users.
+
+Users do not need to install anything. After scanning the invite, they can ask
+questions from WeChat, WhatsApp, Telegram, or another supported social channel.
+Teames maps the social account to the invited user, runs the assigned
+`weight_manager` agent, stores the session, and sends the reply back to the same
+social app.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/remote-portal-weight-manager.png" alt="Remote portal Weight Manager example" width="900">
+</p>
+
+### 2. Organization: local agents with controlled remote access
+
+A company may want every employee to use an agent, but still keep control over
+which business agents can answer company questions. With Teames, employees can
+run their own local agent while joining a company workspace. Their local agent
+can consult approved remote agents such as a support policy agent, sales
+playbook agent, or security review agent.
+
+This is useful when the employee's personal context should stay local, but the
+company still needs governance. The admin can control which remote agents are
+available, review reports about local-to-remote interactions, improve shared
+policies, and understand how business agents are being used without taking over
+the employee's whole local workspace.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/local-remote-reporting.png" alt="Local agent remote access and admin reporting example" width="900">
+</p>
+
 ## Quick Start
 
 ### 1. Clone and install
