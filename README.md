@@ -117,7 +117,7 @@ cd teames
 # Prefer the repo virtual environment.
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[all,dev]"
+pip install -e ".[portal,dev]"
 
 # Frontend dependencies for the dashboard.
 cd web
@@ -128,6 +128,11 @@ cd ..
 
 The command-line entry point is still `hermes` for compatibility with the
 upstream Hermes Agent runtime.
+
+`portal` installs the Teames dashboard, cron support, Telegram QR support,
+WhatsApp bridge runtime support, and QR generation without installing Slack,
+Discord, Matrix, or other gateway adapters you do not use. Install
+`.[all,dev]` only when you want every upstream Hermes optional integration.
 
 ### 2. Configure a model provider
 
