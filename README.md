@@ -14,17 +14,27 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT license"></a>
 </p>
 
-Teames is a fork of Hermes Agent focused on businesses, teams, and organizations.
-It keeps Hermes' tool-calling agent runtime, memory, skills, terminal tools, cron,
-and messaging gateway, then adds a workspace layer where an administrator can build
-business agents and invite users through email or social QR codes.
+Private agents such as Hermes or OpenClaw are great when one person wants a
+personal AI agent. Teames is for the next step: businesses, teams, and
+organizations that want agents they can build, share, govern, and connect to the
+social apps their users already use.
 
-The main idea is simple:
+If you run a business, Teames lets you quickly create an agent that understands
+your services, policies, tone, workflows, and tools. You install Teames, create a
+workspace, build a business agent by chatting with Teames or editing the agent
+configuration, connect the agent to your social gateway accounts, and send invite
+QR codes to your users. Once a user scans the QR code, they can talk to your
+business agent from WeChat, WhatsApp, Telegram, or another supported gateway.
 
-- admins create workspace agents such as support, sales, fitness coaching, or internal operations agents;
-- users can join from a browser, a local installed agent, or a social app;
-- social QR invites bind WeChat, WhatsApp, or Telegram accounts to a remote business agent;
-- the same runtime can route local-agent questions to remote workspace agents when needed.
+If you run an organization, Teames gives every employee a capable agent while
+keeping the workspace under administrative control. People can use their own
+local agent, join company workspaces, access approved remote agents, and still
+keep personal work separate. Admins can manage workspace agents, invited users,
+social bindings, skills, cron jobs, sessions, and access from one portal.
+
+Under the hood, Teames keeps Hermes' tool-calling agent runtime, memory, skills,
+terminal tools, cron, and messaging gateway, then adds the workspace and social
+access layer needed for business use.
 
 ## Highlights
 
@@ -80,7 +90,7 @@ gateway behavior.
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/<your-org>/teames.git
+git clone https://github.com/ouwei2013/teames.git
 cd teames
 
 # Prefer the repo virtual environment.
