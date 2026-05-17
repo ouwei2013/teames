@@ -174,19 +174,8 @@ Open:
 http://<server-ip>:9119/enterprise
 ```
 
-For SSH tunneling:
-
-```bash
-ssh -p 6000 \
-  -L 19119:127.0.0.1:9119 \
-  user@server
-```
-
-Then open:
-
-```text
-http://127.0.0.1:19119/enterprise
-```
+If the portal is only bound to localhost on a remote machine, use your normal
+SSH port-forwarding setup and open the forwarded local URL in your browser.
 
 ### 4. Start the remote social gateway
 
