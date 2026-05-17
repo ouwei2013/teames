@@ -27,10 +27,10 @@ QR codes to your users. Once a user scans the QR code, they can talk to your
 business agent from WeChat, WhatsApp, Telegram, or another supported gateway.
 
 If you run an organization, Teames gives every employee a capable agent while
-keeping the workspace under administrative control. People can use their own
-local agent, join company workspaces, access approved remote agents, and still
-keep personal work separate. Admins can manage workspace agents, invited users,
-social bindings, skills, cron jobs, sessions, and access from one portal.
+keeping the workspace under administrative control. People can access approved
+workspace agents from the browser or social apps, while admins manage workspace
+agents, invited users, social bindings, skills, cron jobs, sessions, and access
+from one portal.
 
 Under the hood, Teames keeps Hermes' tool-calling agent runtime, memory, skills,
 terminal tools, cron, and messaging gateway, then adds the workspace and social
@@ -44,7 +44,6 @@ access layer needed for business use.
 | Builder chat | Describe the agent you want, review a draft, then let the controlled builder tool create agents, skills, and invites. |
 | Remote portal | Run Teames on a server so users do not need to install a local agent before chatting. |
 | Social QR access | Invite users through WeChat, WhatsApp, Telegram, or generic bind links. |
-| Local mode | A user's installed local agent can join a remote workspace and consult assigned remote agents. |
 | Social gateway routing | Messages from social platforms are mapped to tenant, user, and agent access context before the agent runs. |
 | Skills and tools | Reuses Hermes tools, toolsets, skills, cron, memory, session search, and gateway infrastructure. |
 
@@ -67,24 +66,6 @@ social app.
   <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/remote-portal-weight-manager.png" alt="Remote portal Weight Manager example" width="900">
 </p>
 
-### 2. Organization: local agents with controlled remote access
-
-A company may want every employee to use an agent, but still keep control over
-which business agents can answer company questions. With Teames, employees can
-run their own local agent while joining a company workspace. Their local agent
-can consult approved remote agents such as a support policy agent, sales
-playbook agent, or security review agent.
-
-This is useful when the employee's personal context should stay local, but the
-company still needs governance. The admin can control which remote agents are
-available, review reports about local-to-remote interactions, improve shared
-policies, and understand how business agents are being used without taking over
-the employee's whole local workspace.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/local-remote-reporting.png" alt="Local agent remote access and admin reporting example" width="900">
-</p>
-
 ## Architecture
 
 ```text
@@ -100,7 +81,7 @@ Hermes Agent Runtime
   model provider, tools, memory, skills, scheduler
 
 Users
-  browser / local agent / WeChat / WhatsApp / Telegram
+  browser / WeChat / WhatsApp / Telegram
         |
         v
 Gateway + Access Binding
@@ -112,8 +93,8 @@ Business Agent Reply
 
 A Teames workspace is the control center. Admins use the portal to create
 business agents, configure what they know, connect social gateways, and invite
-users. Users do not need to understand the runtime. They can open a browser,
-install a local agent, or scan a QR code from WeChat, WhatsApp, or Telegram.
+users. Users do not need to understand the runtime. They can open a browser or
+scan a QR code from WeChat, WhatsApp, or Telegram.
 
 When a message arrives, Teames identifies the user, checks which workspace agent
 they can access, runs that business agent on top of the Hermes runtime, and sends
@@ -194,7 +175,7 @@ each inbound message through its platform-specific binding.
 3. Use `Build Agents` to create agents with the configuration form or builder chat.
 4. Go to `People & Invites`.
 5. Create email invites, social QR invites, or inspect connected users.
-6. Users chat from the browser, local agent, WeChat, WhatsApp, Telegram, or another gateway.
+6. Users chat from the browser, WeChat, WhatsApp, Telegram, or another gateway.
 
 ## Builder Chat
 
@@ -212,37 +193,19 @@ present a draft first. Mutating actions such as `create_agent`, `update_agent`,
 
 ## Social QR Gateways
 
-Teames supports two different social binding cases. They solve different
-problems and should not be confused.
-
-### Case 1: Bind a social account to your own local agent
-
-This is the private-agent pattern inherited from Hermes. You install Teames on
-your own machine, configure a gateway platform such as Telegram or WhatsApp, and
-bind your personal social account to your local agent. Messages you send from
-that social app go to your own local agent. If your local agent has joined a
-remote workspace, it can also consult assigned remote business agents when the
-question belongs to that workspace.
-
-This case is for the agent owner. It does not invite outside users to a server
-bot, and it does not require the workspace Social QR flow.
-
-### Case 2: Send QR invites that bind users to a server bot
-
-This is the remote portal pattern for businesses and organizations. The admin
-pairs or configures a server-side bot once, then creates QR invites in the
-workspace. An invited user scans the QR code, sends or confirms the bind message,
-and Teames maps that user's social account to the selected remote business
-agent.
+Social QR is the remote portal onboarding path for businesses and organizations.
+The admin pairs or configures a server-side bot once, then creates QR invites in
+the workspace. An invited user scans the QR code, sends or confirms the bind
+message, and Teames maps that user's social account to the selected remote
+business agent.
 
 For WhatsApp and Telegram, once the server bot is paired/configured, admins can
 create more QR invites from the workspace without pairing again. The invite QR
 does not pair the admin's phone; it binds the invitee's social account to the
 server bot and assigned workspace agent.
 
-The platform setup below is for Case 2: remote portal onboarding. Users should
-not need to install a local agent just to talk to a business agent from a social
-app.
+Users should not need to install a local agent just to talk to a business agent
+from a social app.
 
 ### Telegram QR invites
 
@@ -317,34 +280,6 @@ or link. The gateway extracts bind codes from messages like:
 /bind hms_xxx
 /start hms_xxx
 hms_xxx
-```
-
-## Local Agent Mode
-
-Remote portal is the simplest path for invited users, but Teames also supports
-local agents.
-
-A user can install Teames locally, join a remote workspace with an invite code,
-and keep using one interface:
-
-- local chat for private computer tasks;
-- remote workspace agents for business-scope questions;
-- social gateway bindings that can route through the local agent when needed.
-
-Example local test server:
-
-```bash
-export HERMES_HOME=/tmp/teames-local-test
-hermes enterprise local serve \
-  --host 127.0.0.1 \
-  --port 9130 \
-  --no-open
-```
-
-Then open:
-
-```text
-http://127.0.0.1:9130/
 ```
 
 ## Development
