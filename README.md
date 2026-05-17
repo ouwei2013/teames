@@ -48,6 +48,43 @@ access layer needed for business use.
 | Social gateway routing | Messages from social platforms are mapped to tenant, user, and agent access context before the agent runs. |
 | Skills and tools | Reuses Hermes tools, toolsets, skills, cron, memory, session search, and gateway infrastructure. |
 
+## Example Use Cases
+
+### 1. Remote portal: Weight Manager agent for social users
+
+A health coach, clinic, or wellness business can run Teames on a server and
+create a `weight_manager` agent that knows its coaching style, diet principles,
+check-in workflow, and reminder rules. The admin creates the agent in the
+workspace portal, connects a social gateway, and sends QR invites to users.
+
+Users do not need to install anything. After scanning the invite, they can ask
+questions from WeChat, WhatsApp, Telegram, or another supported social channel.
+Teames maps the social account to the invited user, runs the assigned
+`weight_manager` agent, stores the session, and sends the reply back to the same
+social app.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/remote-portal-weight-manager.png" alt="Remote portal Weight Manager example" width="900">
+</p>
+
+### 2. Organization: local agents with controlled remote access
+
+A company may want every employee to use an agent, but still keep control over
+which business agents can answer company questions. With Teames, employees can
+run their own local agent while joining a company workspace. Their local agent
+can consult approved remote agents such as a support policy agent, sales
+playbook agent, or security review agent.
+
+This is useful when the employee's personal context should stay local, but the
+company still needs governance. The admin can control which remote agents are
+available, review reports about local-to-remote interactions, improve shared
+policies, and understand how business agents are being used without taking over
+the employee's whole local workspace.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/local-remote-reporting.png" alt="Local agent remote access and admin reporting example" width="900">
+</p>
+
 ## Architecture
 
 ```text
@@ -88,43 +125,6 @@ scoped instruction on top of the base Hermes agent prompt, so each workspace
 agent gets a business role while preserving Hermes tools, memory, skills,
 gateway behavior, and scheduler support.
 
-## Example Use Cases
-
-### 1. Remote portal: Weight Manager agent for social users
-
-A health coach, clinic, or wellness business can run Teames on a server and
-create a `weight_manager` agent that knows its coaching style, diet principles,
-check-in workflow, and reminder rules. The admin creates the agent in the
-workspace portal, connects a social gateway, and sends QR invites to users.
-
-Users do not need to install anything. After scanning the invite, they can ask
-questions from WeChat, WhatsApp, Telegram, or another supported social channel.
-Teames maps the social account to the invited user, runs the assigned
-`weight_manager` agent, stores the session, and sends the reply back to the same
-social app.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/remote-portal-weight-manager.png" alt="Remote portal Weight Manager example" width="900">
-</p>
-
-### 2. Organization: local agents with controlled remote access
-
-A company may want every employee to use an agent, but still keep control over
-which business agents can answer company questions. With Teames, employees can
-run their own local agent while joining a company workspace. Their local agent
-can consult approved remote agents such as a support policy agent, sales
-playbook agent, or security review agent.
-
-This is useful when the employee's personal context should stay local, but the
-company still needs governance. The admin can control which remote agents are
-available, review reports about local-to-remote interactions, improve shared
-policies, and understand how business agents are being used without taking over
-the employee's whole local workspace.
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/local-remote-reporting.png" alt="Local agent remote access and admin reporting example" width="900">
-</p>
-
 ## Quick Start
 
 ### 1. Clone and install
@@ -161,7 +161,7 @@ or other Hermes-supported providers. Secrets are stored in `~/.hermes/.env`.
 ### 3. Start the remote portal
 
 ```bash
-python3 -m hermes_cli.main dashboard \
+hermes dashboard \
   --host 0.0.0.0 \
   --port 9119 \
   --insecure \
@@ -180,7 +180,7 @@ SSH port-forwarding setup and open the forwarded local URL in your browser.
 ### 4. Start the remote social gateway
 
 ```bash
-python3 -m hermes_cli.main gateway run --replace --accept-hooks -v
+hermes gateway run --replace --accept-hooks -v
 ```
 
 The gateway can run multiple platforms at the same time. A single process can
@@ -212,10 +212,39 @@ present a draft first. Mutating actions such as `create_agent`, `update_agent`,
 
 ## Social QR Gateways
 
-Social QR is designed for remote portal onboarding. Users should not need to
-install a local agent just to talk to a business agent from a social app.
+Teames supports two different social binding cases. They solve different
+problems and should not be confused.
 
-### Telegram
+### Case 1: Bind a social account to your own local agent
+
+This is the private-agent pattern inherited from Hermes. You install Teames on
+your own machine, configure a gateway platform such as Telegram or WhatsApp, and
+bind your personal social account to your local agent. Messages you send from
+that social app go to your own local agent. If your local agent has joined a
+remote workspace, it can also consult assigned remote business agents when the
+question belongs to that workspace.
+
+This case is for the agent owner. It does not invite outside users to a server
+bot, and it does not require the workspace Social QR flow.
+
+### Case 2: Send QR invites that bind users to a server bot
+
+This is the remote portal pattern for businesses and organizations. The admin
+pairs or configures a server-side bot once, then creates QR invites in the
+workspace. An invited user scans the QR code, sends or confirms the bind message,
+and Teames maps that user's social account to the selected remote business
+agent.
+
+For WhatsApp and Telegram, once the server bot is paired/configured, admins can
+create more QR invites from the workspace without pairing again. The invite QR
+does not pair the admin's phone; it binds the invitee's social account to the
+server bot and assigned workspace agent.
+
+The platform setup below is for Case 2: remote portal onboarding. Users should
+not need to install a local agent just to talk to a business agent from a social
+app.
+
+### Telegram QR invites
 
 1. In Telegram, open `@BotFather`.
 2. Run `/newbot` and copy the bot token.
@@ -234,7 +263,7 @@ SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME=<bot-username>
 TELEGRAM_PROXY=http://127.0.0.1:7890   # optional, if Telegram needs a proxy
 ```
 
-### WhatsApp
+### WhatsApp QR invites
 
 Teames supports a server-side WhatsApp bot through the bundled WhatsApp bridge.
 The server bot is paired once. After pairing, admins can create WhatsApp QR
@@ -258,7 +287,7 @@ SOCIAL_GATEWAY_WHATSAPP_NUMBER=<paired-number>
 WHATSAPP_PROXY_URL=http://127.0.0.1:7890   # optional
 ```
 
-### WeChat / Weixin
+### WeChat / Weixin QR invites
 
 WeChat uses an iLink / ClawBot style authorization flow rather than a normal
 contact QR. The admin creates a QR in the portal; the user scans and confirms;
@@ -306,7 +335,7 @@ Example local test server:
 
 ```bash
 export HERMES_HOME=/tmp/teames-local-test
-python -m hermes_cli.main enterprise local serve \
+hermes enterprise local serve \
   --host 127.0.0.1 \
   --port 9130 \
   --no-open
@@ -341,10 +370,10 @@ npm run build
 
 ```bash
 # Portal
-python3 -m hermes_cli.main dashboard --host 0.0.0.0 --port 9119 --insecure --no-open
+hermes dashboard --host 0.0.0.0 --port 9119 --insecure --no-open
 
 # Gateway
-python3 -m hermes_cli.main gateway run --replace --accept-hooks -v
+hermes gateway run --replace --accept-hooks -v
 
 # Logs
 tail -f ~/.hermes/logs/agent.log

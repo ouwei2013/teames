@@ -768,7 +768,7 @@ export default function EnterpriseLocalPage() {
             </div>
             <p className="mt-1 text-xs normal-case text-muted-foreground">
               {view === "connection"
-                ? "Connect this computer to a remote workspace."
+                ? "Connect this computer to a remote workspace, or use it as your own local social gateway."
                 : "Work locally, with access to this device and assigned remote business agents."}
             </p>
           </div>
@@ -851,6 +851,28 @@ export default function EnterpriseLocalPage() {
                       <div className="truncate">Device name: {status?.device?.name || deviceName || "-"}</div>
                       <div className="truncate">Default agent: {status?.agent?.name || status?.default_agent_id || "-"}</div>
                     </div>
+                  </div>
+                  <div className="rounded-lg border border-border bg-background/40 p-3">
+                    <div className="mb-2 flex items-center gap-2 text-sm font-semibold normal-case text-midground">
+                      <PlugZap className="h-4 w-4" />
+                      Local Social Binding
+                    </div>
+                    <p className="text-xs normal-case text-muted-foreground">
+                      Bind your own Telegram, WhatsApp, or other gateway account to this local agent when you want
+                      messages from your social app to reach your private local agent first.
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Button type="button" variant="outline" size="sm" onClick={() => navigate("/config")}>
+                        Open Config
+                      </Button>
+                      <Button type="button" variant="outline" size="sm" onClick={() => navigate("/logs")}>
+                        Gateway Logs
+                      </Button>
+                    </div>
+                    <p className="mt-3 text-[11px] normal-case text-muted-foreground">
+                      Workspace QR invites are different: those bind invited users to a server-side bot and a remote
+                      business agent.
+                    </p>
                   </div>
                   <div className="rounded-lg border border-border bg-background/40 p-3">
                     <div className="mb-2 flex items-center gap-2 text-sm font-semibold normal-case text-midground">

@@ -27,6 +27,7 @@ import {
   Globe,
   Heart,
   KeyRound,
+  Laptop,
   Loader2,
   Menu,
   MessageSquare,
@@ -62,6 +63,7 @@ import ChatPage from "@/pages/ChatPage";
 import EnterpriseAdminChatPage from "@/pages/EnterpriseAdminChatPage";
 import EnterpriseAdminPage from "@/pages/EnterpriseAdminPage";
 import EnterpriseBuilderPage from "@/pages/EnterpriseBuilderPage";
+import EnterpriseLocalPage from "@/pages/EnterpriseLocalPage";
 import EnterprisePortalPage from "@/pages/EnterprisePortalPage";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
@@ -76,10 +78,6 @@ function RootRedirect() {
   return <Navigate to="/sessions" replace />;
 }
 
-function WorkspaceRedirect() {
-  return <Navigate to="/enterprise" replace />;
-}
-
 const CHAT_NAV_ITEM: NavItem = {
   path: "/admin-chat",
   labelKey: "chat",
@@ -92,8 +90,8 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/": RootRedirect,
   "/sessions": SessionsPage,
   "/admin-chat": EnterpriseAdminChatPage,
-  "/local": WorkspaceRedirect,
-  "/local/*": WorkspaceRedirect,
+  "/local": EnterpriseLocalPage,
+  "/local/*": EnterpriseLocalPage,
   "/analytics": AnalyticsPage,
   "/enterprise": EnterpriseAdminPage,
   "/enterprise/agents/:agentId/users/:userId": EnterpriseAdminPage,
@@ -123,6 +121,11 @@ const BUILTIN_NAV_REST: NavItem[] = [
     path: "/enterprise",
     label: "Workspace",
     icon: Shield,
+  },
+  {
+    path: "/local/connection",
+    label: "Local Agent",
+    icon: Laptop,
   },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
