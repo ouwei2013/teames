@@ -51,39 +51,42 @@ access layer needed for business use.
 ## Architecture
 
 ```text
-Browser Admin UI
+Admins
+  build agents, manage users, create QR invites
         |
-        | create agents / invites / social QR
         v
-Teames remote portal
+Teames Workspace Portal
+  agents, users, permissions, sessions, skills, cron jobs
         |
-        | enterprise store + access context
         v
-Hermes AIAgent runtime
-        |
-        +-- enterprise_builder tool
-        +-- enterprise_remote tool
-        +-- enterprise skills
-        +-- cron + sessions + memory
+Hermes Agent Runtime
+  model provider, tools, memory, skills, scheduler
 
-Social apps
-  WeChat / WhatsApp / Telegram
+Users
+  browser / local agent / WeChat / WhatsApp / Telegram
         |
         v
-Gateway adapters
-        |
-        | platform user id + bot account id
-        v
-Social gateway binding
+Gateway + Access Binding
+  identify user, workspace, and assigned agent
         |
         v
-Remote business agent
+Business Agent Reply
 ```
 
-Teames does not replace the Hermes runtime. A business agent prompt is appended
-as a scoped system message on top of the base Hermes agent prompt. This gives each
-workspace agent a business role while preserving the underlying tool, memory, and
-gateway behavior.
+A Teames workspace is the control center. Admins use the portal to create
+business agents, configure what they know, connect social gateways, and invite
+users. Users do not need to understand the runtime. They can open a browser,
+install a local agent, or scan a QR code from WeChat, WhatsApp, or Telegram.
+
+When a message arrives, Teames identifies the user, checks which workspace agent
+they can access, runs that business agent on top of the Hermes runtime, and sends
+the reply back to the same channel.
+
+Teames does not replace Hermes. It adds workspace, access, and social-gateway
+layers around the Hermes agent runtime. A business agent prompt is applied as a
+scoped instruction on top of the base Hermes agent prompt, so each workspace
+agent gets a business role while preserving Hermes tools, memory, skills,
+gateway behavior, and scheduler support.
 
 ## Quick Start
 
