@@ -277,6 +277,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
+        self._disconnecting = False
 
     def _whatsapp_require_mention(self) -> bool:
         configured = self.config.extra.get("require_mention")
@@ -455,6 +456,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return False
         
         logger.info("[%s] Bridge found at %s", self.name, bridge_path)
+        self._disconnecting = False
         
         # Acquire scoped lock to prevent duplicate sessions
         lock_acquired = False
@@ -638,6 +640,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def _check_managed_bridge_exit(self) -> Optional[str]:
         """Return a fatal error message if the managed bridge child exited."""
+        if self._disconnecting or not self._running:
+            return None
         if self._bridge_process is None:
             return None
 
@@ -655,6 +659,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
+        self._disconnecting = True
         if self._bridge_process:
             try:
                 try:
