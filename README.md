@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="#quick-start"><img src="https://img.shields.io/badge/Quickstart-5_minutes-blue?style=for-the-badge" alt="Quickstart"></a>
-  <a href="#social-qr-gateways"><img src="https://img.shields.io/badge/Social_QR-WeChat%20%7C%20WhatsApp%20%7C%20Telegram-0ea5e9?style=for-the-badge" alt="Social QR gateways"></a>
+  <a href="#gateway-concepts"><img src="https://img.shields.io/badge/Gateways-Personal%20%7C%20Shared-0ea5e9?style=for-the-badge" alt="Personal and Shared gateways"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT license"></a>
 </p>
 
@@ -43,7 +43,8 @@ access layer needed for business use.
 | Workspace agents | Create multiple business agents with role, task, tone, instructions, knowledge, skills, and users. |
 | Builder chat | Describe the agent you want, review a draft, then let the controlled builder tool create agents, skills, and invites. |
 | Remote portal | Run Teames on a server so users do not need to install a local agent before chatting. |
-| Social QR access | Invite users through WeChat, WhatsApp, Telegram, or generic bind links. |
+| Personal Gateway | Bind your own messaging accounts to your personal Teames agent, with optional routing to workspace agents. |
+| Shared Gateway | Invite users through workspace-owned WeChat, WhatsApp, Telegram, or generic bind links without requiring local installation. |
 | Social gateway routing | Messages from social platforms are mapped to tenant, user, and agent access context before the agent runs. |
 | Skills and tools | Reuses Hermes tools, toolsets, skills, cron, memory, session search, and gateway infrastructure. |
 
@@ -51,10 +52,12 @@ access layer needed for business use.
 
 ### 1. Remote portal: Weight Manager agent for social users
 
+Gateway type: **Shared Gateway**.
+
 A health coach, clinic, or wellness business can run Teames on a server and
 create a `weight_manager` agent that knows its coaching style, diet principles,
 check-in workflow, and reminder rules. The admin creates the agent in the
-workspace portal, connects a social gateway, and sends QR invites to users.
+workspace portal, connects a shared server bot, and sends QR invites to users.
 
 Users do not need to install anything. After scanning the invite, they can ask
 questions from WeChat, WhatsApp, Telegram, or another supported social channel.
@@ -65,6 +68,21 @@ social app.
 <p align="center">
   <img src="https://raw.githubusercontent.com/ouwei2013/teames/main/assets/readme/remote-portal-weight-manager.png" alt="Remote portal Weight Manager example" width="900">
 </p>
+
+### 2. Organization: Employees with personal agents and workspace oversight
+
+Gateway type: **Personal Gateway**.
+
+A company can let employees install Teames on their own machines and bind their
+own messaging accounts, such as WhatsApp, Telegram, WeChat, or Slack, to their
+personal Teames agent. Employees can chat with their personal agent from the
+apps they already use. When a question or task relates to a workspace business
+agent, the personal agent can route the request to that remote workspace agent.
+
+This keeps daily work convenient for employees while preserving organizational
+control. Admins can invite local devices into the workspace, approve which
+business agents they can access, and request reports about the employee's
+interactions with remote agents when the business workflow requires oversight.
 
 ## Architecture
 
@@ -167,7 +185,7 @@ http://<server-ip>:9119/enterprise
 If the portal is only bound to localhost on a remote machine, use your normal
 SSH port-forwarding setup and open the forwarded local URL in your browser.
 
-### 4. Start the remote social gateway
+### 4. Start the messaging gateway
 
 ```bash
 hermes gateway run --replace --accept-hooks -v
@@ -175,7 +193,9 @@ hermes gateway run --replace --accept-hooks -v
 
 The gateway can run multiple platforms at the same time. A single process can
 connect WeChat, WhatsApp, Telegram, and other enabled Hermes adapters, then route
-each inbound message through its platform-specific binding.
+each inbound message through its platform-specific binding. For Shared Gateway
+QR invites, keep this process running on the Teames server. For Personal Gateway,
+run it on the user's own installation after binding personal messaging accounts.
 
 ## Workspace Flow
 
@@ -200,9 +220,36 @@ present a draft first. Mutating actions such as `create_agent`, `update_agent`,
 `create_agent_skill`, and `create_invite` require explicit admin confirmation and
 `confirmed_by_admin=true`.
 
-## Social QR Gateways
+## Gateway Concepts
 
-Social QR is the remote portal onboarding path for businesses and organizations.
+Teames uses two gateway patterns. They both reuse Hermes' messaging gateway
+runtime, but they solve different onboarding problems.
+
+### Personal Gateway
+
+Personal Gateway is for a person who installed Teames and wants their own
+messaging accounts to reach their own Teames agent. The user binds platforms
+such as WhatsApp, Telegram, WeChat, Slack, or other Hermes-supported channels.
+Messages first go to the user's personal agent. If the user has joined a
+workspace and asks for something related to a remote business agent, the
+personal agent can route the request to that workspace agent.
+
+Use Personal Gateway when the user owns the agent installation and wants social
+apps as a personal control surface.
+
+### Shared Gateway
+
+Shared Gateway is for a workspace that wants other people to chat with business
+agents without installing Teames. An admin configures a server-side bot once,
+then creates QR invites. Invitees scan the QR code, bind their social account,
+and immediately chat with the assigned workspace agent through the shared bot.
+
+Use Shared Gateway when a business, team, or organization owns the server bot
+and wants customers, members, or employees to connect with minimal setup.
+
+## Shared Gateway QR Invites
+
+Social QR is the Shared Gateway onboarding path for businesses and organizations.
 The admin pairs or configures a server-side bot once, then creates QR invites in
 the workspace. An invited user scans the QR code, sends or confirms the bind
 message, and Teames maps that user's social account to the selected remote
