@@ -514,7 +514,10 @@ export default function EnterpriseAdminPage() {
   const isWhatsAppSocialPlatform = socialPlatform === "whatsapp";
   const whatsappGatewayPaired = whatsappPair?.status === "connected";
   const isTelegramSocialPlatform = socialPlatform === "telegram";
-  const telegramGatewayReady = telegramGateway?.status === "connected" && Boolean(telegramGateway.username);
+  const telegramInviteReady =
+    Boolean(telegramGateway?.username) &&
+    telegramGateway?.token_present !== false &&
+    !["invalid", "unreachable", "not_configured", "needs_token"].includes(telegramGateway?.status || "");
   const visibleSocialInvite =
     latestSocialInvite && latestSocialInvite.link.platform === socialPlatform
       ? latestSocialInvite
@@ -1016,7 +1019,7 @@ export default function EnterpriseAdminPage() {
       showToast("Pair the server WhatsApp bot first", "error");
       return;
     }
-    if (socialPlatform === "telegram" && !telegramGatewayReady) {
+    if (socialPlatform === "telegram" && !telegramInviteReady) {
       showToast("Configure the server Telegram bot first", "error");
       return;
     }
@@ -2960,7 +2963,7 @@ export default function EnterpriseAdminPage() {
                           {telegramGateway?.first_name && <div>Name: {telegramGateway.first_name}</div>}
                           {telegramGateway?.message && <div>{telegramGateway.message}</div>}
                         </div>
-                        {!telegramGatewayReady && (
+                        {!telegramInviteReady && (
                           <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
                             <Input
                               value={telegramBotToken}
@@ -2981,7 +2984,7 @@ export default function EnterpriseAdminPage() {
                           </div>
                         )}
                         <div className="space-y-4 pt-2">
-                          {telegramGatewayReady && (
+                          {telegramInviteReady && (
                             <Button
                               type="button"
                               className="h-11 w-full"

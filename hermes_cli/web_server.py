@@ -2184,7 +2184,7 @@ def _social_gateway_link_payload(
         username = ""
         try:
             status = _telegram_gateway_status(refresh=False)
-            if status.get("status") == "connected":
+            if status.get("token_present") is not False:
                 username = str(status.get("username") or "").strip().lstrip("@")
         except Exception:
             _log.debug("Could not resolve Telegram bot username", exc_info=True)
@@ -2281,7 +2281,8 @@ async def enterprise_create_social_invite(request: Request, body: EnterpriseSoci
         try:
             if platform_key in {"telegram", "tg"}:
                 status = _telegram_gateway_status(refresh=False)
-                if status.get("status") != "connected":
+                username = str(status.get("username") or "").strip().lstrip("@")
+                if not username or status.get("token_present") is False:
                     raise ValueError(status.get("message") or "Configure the server Telegram bot before creating Telegram invites")
             invite = store.create_social_gateway_invite(
                 agent_id=body.agent_id,
