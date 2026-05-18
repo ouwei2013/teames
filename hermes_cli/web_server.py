@@ -1996,13 +1996,38 @@ def _ensure_whatsapp_bridge_dependencies() -> None:
     bridge_dir = _whatsapp_bridge_dir()
     if not (bridge_dir / "bridge.js").exists():
         raise RuntimeError(f"WhatsApp bridge not found: {bridge_dir / 'bridge.js'}")
-    if (bridge_dir / "node_modules").exists():
+
+    def _bridge_import_error() -> str:
+        if not (bridge_dir / "node_modules" / "@whiskeysockets" / "baileys" / "package.json").exists():
+            return "missing @whiskeysockets/baileys package"
+        node = shutil.which("node") or "node"
+        result = subprocess.run(
+            [node, "--input-type=module", "-e", "await import('@whiskeysockets/baileys')"],
+            cwd=str(bridge_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            return ""
+        return (result.stderr or result.stdout or "").strip()[-1000:] or f"node import failed with code {result.returncode}"
+
+    import_error = _bridge_import_error()
+    if not import_error:
         return
     npm = shutil.which("npm")
     if not npm:
         raise RuntimeError("npm is required to install the WhatsApp bridge")
     result = subprocess.run(
-        [npm, "install", "--no-fund", "--no-audit", "--progress=false"],
+        [
+            npm,
+            "install",
+            "--no-fund",
+            "--no-audit",
+            "--progress=false",
+            "--cache",
+            str(bridge_dir / ".npm-cache"),
+        ],
         cwd=str(bridge_dir),
         capture_output=True,
         text=True,
@@ -2011,6 +2036,9 @@ def _ensure_whatsapp_bridge_dependencies() -> None:
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"npm install failed: {detail[-1000:]}")
+    import_error = _bridge_import_error()
+    if import_error:
+        raise RuntimeError(f"WhatsApp bridge dependencies are incomplete after npm install: {import_error}")
 
 
 def _detect_local_proxy_url() -> str:
