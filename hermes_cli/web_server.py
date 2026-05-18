@@ -2065,7 +2065,11 @@ def _finalize_whatsapp_pair_state(state: Dict[str, Any]) -> Dict[str, Any]:
                 _log.debug("Could not persist WhatsApp gateway env flags", exc_info=True)
         elif proc.returncode not in (0, None):
             state["status"] = "failed"
-            state["message"] = state.get("message") or f"WhatsApp pairing exited with code {proc.returncode}"
+            output_tail = "\n".join(state.get("output_tail") or [])[-1200:].strip()
+            if output_tail:
+                state["message"] = f"WhatsApp pairing exited with code {proc.returncode}: {output_tail}"
+            else:
+                state["message"] = f"WhatsApp pairing exited with code {proc.returncode}"
     return state
 
 
@@ -2079,6 +2083,10 @@ def _read_whatsapp_pair_output(pair_id: str, proc: subprocess.Popen) -> None:
             text = line.strip()
             if not text:
                 continue
+            output_tail = state.setdefault("output_tail", [])
+            if isinstance(output_tail, list):
+                output_tail.append(text)
+                del output_tail[:-20]
             if not text.startswith("{"):
                 if "Connection closed" in text or "WhatsApp pairing mode" in text or "Session:" in text:
                     state["message"] = text
@@ -2095,7 +2103,15 @@ def _read_whatsapp_pair_output(pair_id: str, proc: subprocess.Popen) -> None:
                 qr_value = str(event["qr"])
                 state["status"] = "waiting"
                 state["qr_data"] = qr_value
-                state["qr_image"] = _qr_png_data_url(qr_value)
+                qr_image = _qr_png_data_url(qr_value)
+                if not qr_image:
+                    state["status"] = "failed"
+                    state["message"] = (
+                        'Could not render WhatsApp pairing QR. Install QR image dependencies with '
+                        'pip install "qrcode[pil]>=7,<8" or pip install -e ".[portal,dev]", then restart Teames.'
+                    )
+                    break
+                state["qr_image"] = qr_image
             elif event.get("event") == "connected":
                 phone = _normalize_whatsapp_phone(event.get("userId"))
                 state["status"] = "connected"
@@ -2480,7 +2496,7 @@ async def enterprise_whatsapp_native_pair():
         return {
             key: value
             for key, value in state.items()
-            if key not in {"process"}
+            if key not in {"process", "output_tail"}
         }
     except Exception as exc:
         _log.exception("POST /api/enterprise/social-gateways/whatsapp/pair failed")
@@ -2517,7 +2533,7 @@ async def enterprise_whatsapp_native_pair_status(pair_id: str):
     return {
         key: value
         for key, value in state.items()
-        if key not in {"process"}
+        if key not in {"process", "output_tail"}
     }
 
 
