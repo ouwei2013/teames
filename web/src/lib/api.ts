@@ -652,9 +652,17 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  disconnectEnterpriseTelegramGateway: () =>
+    fetchJSON<EnterpriseTelegramGatewayStatus>("/api/enterprise/social-gateways/telegram/configure", {
+      method: "DELETE",
+    }),
   createEnterpriseWhatsAppPair: () =>
     fetchJSON<EnterpriseWhatsAppPairStatus>("/api/enterprise/social-gateways/whatsapp/pair", {
       method: "POST",
+    }),
+  disconnectEnterpriseWhatsAppPair: () =>
+    fetchJSON<EnterpriseWhatsAppPairStatus>("/api/enterprise/social-gateways/whatsapp/pair", {
+      method: "DELETE",
     }),
   getEnterpriseWhatsAppPairCurrentStatus: () =>
     fetchJSON<EnterpriseWhatsAppPairStatus>("/api/enterprise/social-gateways/whatsapp/pair/status"),

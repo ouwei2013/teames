@@ -2475,6 +2475,27 @@ async def enterprise_telegram_gateway_configure(body: EnterpriseTelegramBotConfi
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.delete("/api/enterprise/social-gateways/telegram/configure")
+async def enterprise_telegram_gateway_unconfigure():
+    try:
+        for key in (
+            "TELEGRAM_ENABLED",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_BOT_USERNAME",
+            "SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME",
+        ):
+            remove_env_value(key)
+        return {
+            "status": "not_configured",
+            "token_present": False,
+            "username": None,
+            "message": "Telegram bot disconnected. Paste a Telegram bot token to bind a new bot.",
+        }
+    except Exception as exc:
+        _log.exception("DELETE /api/enterprise/social-gateways/telegram/configure failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/api/enterprise/social-gateways/whatsapp/pair")
 async def enterprise_whatsapp_native_pair():
     _cleanup_whatsapp_pair_states()
@@ -2537,6 +2558,36 @@ async def enterprise_whatsapp_native_pair():
     except Exception as exc:
         _log.exception("POST /api/enterprise/social-gateways/whatsapp/pair failed")
         raise HTTPException(status_code=500, detail=f"WhatsApp pairing failed: {exc}")
+
+
+@app.delete("/api/enterprise/social-gateways/whatsapp/pair")
+async def enterprise_whatsapp_native_unpair():
+    try:
+        for key, state in list(_WHATSAPP_PAIR_STATES.items()):
+            proc = state.get("process")
+            try:
+                if proc and proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+            _WHATSAPP_PAIR_STATES.pop(key, None)
+        shutil.rmtree(_whatsapp_session_dir(), ignore_errors=True)
+        for key in (
+            "WHATSAPP_ENABLED",
+            "WHATSAPP_MODE",
+            "WHATSAPP_ALLOWED_USERS",
+            "SOCIAL_GATEWAY_WHATSAPP_NUMBER",
+        ):
+            remove_env_value(key)
+        return {
+            "id": "",
+            "status": "not_paired",
+            "phone_number": None,
+            "message": "WhatsApp bot disconnected. Pair a WhatsApp account to bind a new server bot.",
+        }
+    except Exception as exc:
+        _log.exception("DELETE /api/enterprise/social-gateways/whatsapp/pair failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/enterprise/social-gateways/whatsapp/pair/status")

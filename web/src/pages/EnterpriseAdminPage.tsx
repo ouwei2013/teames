@@ -448,10 +448,12 @@ export default function EnterpriseAdminPage() {
   const [weixinQrStatus, setWeixinQrStatus] = useState("");
   const [whatsappPair, setWhatsappPair] = useState<EnterpriseWhatsAppPairStatus | null>(null);
   const [pairingWhatsapp, setPairingWhatsapp] = useState(false);
+  const [disconnectingWhatsapp, setDisconnectingWhatsapp] = useState(false);
   const [telegramGateway, setTelegramGateway] = useState<EnterpriseTelegramGatewayStatus | null>(null);
   const [telegramBotToken, setTelegramBotToken] = useState("");
   const [savingTelegramBot, setSavingTelegramBot] = useState(false);
   const [refreshingTelegramBot, setRefreshingTelegramBot] = useState(false);
+  const [disconnectingTelegramBot, setDisconnectingTelegramBot] = useState(false);
   const knowledgeFileRef = useRef<HTMLInputElement | null>(null);
 
   const [tenantName, setTenantName] = useState("");
@@ -514,6 +516,8 @@ export default function EnterpriseAdminPage() {
   const isWhatsAppSocialPlatform = socialPlatform === "whatsapp";
   const whatsappGatewayPaired = whatsappPair?.status === "connected";
   const isTelegramSocialPlatform = socialPlatform === "telegram";
+  const telegramGatewayConfigured =
+    Boolean(telegramGateway?.username) || Boolean(telegramGateway?.token_present);
   const telegramInviteReady =
     Boolean(telegramGateway?.username) &&
     telegramGateway?.token_present !== false &&
@@ -1065,6 +1069,22 @@ export default function EnterpriseAdminPage() {
     }
   }
 
+  async function disconnectWhatsAppGateway() {
+    setDisconnectingWhatsapp(true);
+    setError(null);
+    try {
+      const result = await api.disconnectEnterpriseWhatsAppPair();
+      setWhatsappPair(result);
+      if (socialPlatform === "whatsapp") setLatestSocialInvite(null);
+      showToast("WhatsApp bot disconnected", "success");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("WhatsApp disconnect failed", "error");
+    } finally {
+      setDisconnectingWhatsapp(false);
+    }
+  }
+
   async function refreshTelegramGatewayStatus() {
     setRefreshingTelegramBot(true);
     setError(null);
@@ -1100,6 +1120,23 @@ export default function EnterpriseAdminPage() {
       showToast("Telegram bot configuration failed", "error");
     } finally {
       setSavingTelegramBot(false);
+    }
+  }
+
+  async function disconnectTelegramGateway() {
+    setDisconnectingTelegramBot(true);
+    setError(null);
+    try {
+      const result = await api.disconnectEnterpriseTelegramGateway();
+      setTelegramGateway(result);
+      setTelegramBotToken("");
+      if (socialPlatform === "telegram") setLatestSocialInvite(null);
+      showToast("Telegram bot disconnected", "success");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      showToast("Telegram disconnect failed", "error");
+    } finally {
+      setDisconnectingTelegramBot(false);
     }
   }
 
@@ -2904,10 +2941,30 @@ export default function EnterpriseAdminPage() {
                           <div className="font-courier text-sm normal-case text-midground">
                             Server WhatsApp Bot
                           </div>
-                          <Button type="button" variant="outline" size="sm" onClick={pairWhatsAppGateway} disabled={pairingWhatsapp}>
-                            {pairingWhatsapp && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                            {whatsappGatewayPaired ? "Refresh WhatsApp Status" : "Pair WhatsApp Bot"}
-                          </Button>
+                          <div className="flex flex-wrap gap-2 sm:justify-end">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={pairWhatsAppGateway}
+                              disabled={pairingWhatsapp || disconnectingWhatsapp}
+                            >
+                              {pairingWhatsapp && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                              {whatsappGatewayPaired ? "Refresh WhatsApp Status" : "Pair WhatsApp Bot"}
+                            </Button>
+                            {whatsappGatewayPaired && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={disconnectWhatsAppGateway}
+                                disabled={disconnectingWhatsapp || pairingWhatsapp}
+                              >
+                                {disconnectingWhatsapp && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                                Disconnect Bot
+                              </Button>
+                            )}
+                          </div>
                         </div>
                         <div className="text-xs normal-case text-muted-foreground">
                           Pair the server-side bot once with WhatsApp Linked Devices, then create user invite QR codes.
@@ -2946,16 +3003,30 @@ export default function EnterpriseAdminPage() {
                           <div className="font-courier text-sm normal-case text-midground">
                             Server Telegram Bot
                           </div>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            onClick={refreshTelegramGatewayStatus}
-                            disabled={refreshingTelegramBot}
-                          >
-                            {refreshingTelegramBot && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                            Refresh Telegram Status
-                          </Button>
+                          <div className="flex flex-wrap gap-2 sm:justify-end">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={refreshTelegramGatewayStatus}
+                              disabled={refreshingTelegramBot || disconnectingTelegramBot}
+                            >
+                              {refreshingTelegramBot && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                              Refresh Telegram Status
+                            </Button>
+                            {telegramGatewayConfigured && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={disconnectTelegramGateway}
+                                disabled={disconnectingTelegramBot || refreshingTelegramBot || savingTelegramBot}
+                              >
+                                {disconnectingTelegramBot && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                                Disconnect Bot
+                              </Button>
+                            )}
+                          </div>
                         </div>
                         <div className="space-y-2 text-xs normal-case text-muted-foreground">
                           <div>Status: {telegramGateway?.status || "checking"}</div>

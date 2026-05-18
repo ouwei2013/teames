@@ -98,6 +98,38 @@ from dotenv import load_dotenv  # backward-compat for tests that monkeypatch thi
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+_GATEWAY_HOT_RELOAD_ENV_KEYS = {
+    "TELEGRAM_ENABLED",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_USERNAME",
+    "SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME",
+    "WHATSAPP_ENABLED",
+    "WHATSAPP_MODE",
+    "WHATSAPP_ALLOWED_USERS",
+    "SOCIAL_GATEWAY_WHATSAPP_NUMBER",
+}
+
+
+def _read_env_key_names(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    keys: set[str] = set()
+    try:
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, sep, _ = line.partition("=")
+            if sep:
+                keys.add(key.strip())
+    except OSError:
+        return set()
+    return keys
+
+
+_config_reload_env_keys = _read_env_key_names(_env_path)
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -2538,7 +2570,8 @@ class GatewayRunner:
             return False
 
     async def _platform_config_reload_watcher(self) -> None:
-        """Hot-load newly configured gateway platforms from ~/.hermes/.env."""
+        """Hot-load and unload gateway platforms when ~/.hermes/.env changes."""
+        global _config_reload_env_keys
         while self._running and not self._shutdown_event.is_set():
             try:
                 await asyncio.sleep(5)
@@ -2550,12 +2583,35 @@ class GatewayRunner:
                     continue
                 self._config_reload_mtime = mtime
 
+                current_env_keys = _read_env_key_names(_env_path)
+                for key in (_config_reload_env_keys - current_env_keys) & _GATEWAY_HOT_RELOAD_ENV_KEYS:
+                    os.environ.pop(key, None)
+                _config_reload_env_keys = current_env_keys
                 load_hermes_dotenv(
                     hermes_home=_hermes_home,
                     project_env=Path(__file__).resolve().parents[1] / ".env",
                 )
                 refreshed = load_gateway_config()
                 connected: list[str] = []
+                disconnected: list[str] = []
+                for platform in list(self.adapters.keys()):
+                    platform_config = refreshed.platforms.get(platform)
+                    if platform_config and platform_config.enabled:
+                        continue
+                    adapter = self.adapters.pop(platform)
+                    await self._safe_adapter_disconnect(adapter, platform)
+                    self.config.platforms.pop(platform, None)
+                    self._failed_platforms.pop(platform, None)
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="disconnected",
+                        error_code=None,
+                        error_message=None,
+                    )
+                    disconnected.append(platform.value)
+                if disconnected:
+                    self.delivery_router.adapters = self.adapters
+                    logger.info("Gateway hot-unloaded platform(s): %s", ", ".join(disconnected))
                 for platform, platform_config in refreshed.platforms.items():
                     self.config.platforms[platform] = platform_config
                     if not platform_config.enabled or platform in self.adapters:
