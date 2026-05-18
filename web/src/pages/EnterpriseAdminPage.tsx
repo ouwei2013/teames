@@ -3025,7 +3025,9 @@ export default function EnterpriseAdminPage() {
                             />
                           ) : (
                             <div className="text-center font-courier text-xs normal-case text-muted-foreground">
-                              No QR image for this invite.
+                              {visibleSocialInvite.link.platform === "weixin"
+                                ? "No WeChat QR image for this invite. WeChat QR invites are temporary; create a fresh WeChat QR invite. If this was just created, reinstall portal dependencies and restart Teames."
+                                : "No QR image for this invite."}
                             </div>
                           )}
                         </div>

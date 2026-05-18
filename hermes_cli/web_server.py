@@ -1784,10 +1784,15 @@ async def _fetch_weixin_social_qr() -> Dict[str, str]:
     if not qrcode:
         raise RuntimeError("iLink QR response missing qrcode")
     qr_data = qrcode_url or qrcode
+    qr_image = _qr_png_data_url(qr_data)
+    if not qr_image:
+        raise RuntimeError(
+            'Could not generate WeChat QR image. Install portal dependencies with pip install -e ".[portal,dev]" and restart Teames.'
+        )
     return {
         "qrcode": qrcode,
         "qr_data": qr_data,
-        "qr_image": _qr_png_data_url(qr_data) or "",
+        "qr_image": qr_image,
     }
 
 
