@@ -860,6 +860,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].enabled = True
         config.platforms[Platform.TELEGRAM].token = telegram_token
+    telegram_enabled = os.getenv("TELEGRAM_ENABLED", "").strip().lower()
+    if telegram_enabled in {"1", "true", "yes", "on"}:
+        if Platform.TELEGRAM not in config.platforms:
+            config.platforms[Platform.TELEGRAM] = PlatformConfig()
+        config.platforms[Platform.TELEGRAM].enabled = True
     
     # Reply threading mode for Telegram (off/first/all)
     telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()

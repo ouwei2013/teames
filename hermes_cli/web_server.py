@@ -2454,6 +2454,7 @@ async def enterprise_telegram_gateway_configure(body: EnterpriseTelegramBotConfi
         if not token:
             raise HTTPException(status_code=400, detail="Telegram bot token is required")
         status = _telegram_gateway_status(refresh=True, token_override=token, persist=True)
+        save_env_value("TELEGRAM_ENABLED", "true")
         status["restart_required"] = True
         status["message"] = (
             "Telegram bot configured. Restart Hermes gateway if it is already running, then create invite QR codes."
