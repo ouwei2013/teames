@@ -2151,6 +2151,10 @@ def _read_whatsapp_pair_output(pair_id: str, proc: subprocess.Popen) -> None:
                 state["status"] = "connected"
                 if phone:
                     state["phone_number"] = phone
+                    try:
+                        _persist_whatsapp_native_gateway_env(phone, str(state.get("proxy_url") or "").strip())
+                    except Exception:
+                        _log.debug("Could not persist WhatsApp gateway env flags", exc_info=True)
                 state["message"] = "WhatsApp paired successfully."
         _finalize_whatsapp_pair_state(state)
     except Exception as exc:
@@ -2501,6 +2505,10 @@ async def enterprise_whatsapp_native_pair():
     _cleanup_whatsapp_pair_states()
     existing_phone = _whatsapp_native_paired_number()
     if existing_phone:
+        try:
+            _persist_whatsapp_native_gateway_env(existing_phone)
+        except Exception:
+            _log.debug("Could not persist WhatsApp gateway env flags", exc_info=True)
         return {
             "id": "",
             "status": "connected",

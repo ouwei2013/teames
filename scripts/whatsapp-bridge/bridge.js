@@ -79,18 +79,9 @@ function stripJidDevice(value) {
 
 async function resolveSendChatId(chatId) {
   if (!chatId) return chatId;
-  if (!String(chatId).endsWith('@lid')) return stripJidDevice(chatId);
-  try {
-    const mapped = await sock?.signalRepository?.lidMapping?.getPNForLID(chatId);
-    if (mapped) {
-      if (WHATSAPP_DEBUG) {
-        console.log(JSON.stringify({ event: 'resolved_lid_for_send', lid: chatId, pn: mapped }));
-      }
-      return stripJidDevice(mapped);
-    }
-  } catch (err) {
-    console.log(`[bridge] Could not resolve LID ${chatId} for send: ${err?.message || err}`);
-  }
+  // Modern WhatsApp 1:1 conversations commonly arrive as @lid.  Keep that
+  // address for replies so Baileys can attach the matching trusted-contact
+  // token and identity/session material.
   return stripJidDevice(chatId);
 }
 
