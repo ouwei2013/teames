@@ -1787,7 +1787,7 @@ async def _fetch_weixin_social_qr() -> Dict[str, str]:
     qr_image = _qr_png_data_url(qr_data)
     if not qr_image:
         raise RuntimeError(
-            'Could not generate WeChat QR image. Install portal dependencies with pip install -e ".[portal,dev]" and restart Teames.'
+            'Could not generate WeChat QR image. Install QR image dependencies with pip install "qrcode[pil]>=7,<8" or pip install -e ".[portal,dev]", then restart Teames.'
         )
     return {
         "qrcode": qrcode,
