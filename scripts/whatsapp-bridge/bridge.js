@@ -171,10 +171,73 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+let authState = null;
+
+function findBinaryChildren(node, tag) {
+  const out = [];
+  const visit = (item) => {
+    if (!item) return;
+    if (Array.isArray(item)) {
+      for (const child of item) visit(child);
+      return;
+    }
+    if (typeof item !== 'object') return;
+    if (item.tag === tag) out.push(item);
+    if (Array.isArray(item.content)) visit(item.content);
+  };
+  visit(node);
+  return out;
+}
+
+async function storeTrustedContactTokens(node) {
+  if (!authState?.keys || !node) return 0;
+  let stored = 0;
+  for (const tokenNode of findBinaryChildren(node, 'token')) {
+    const attrs = tokenNode.attrs || {};
+    if (attrs.type !== 'trusted_contact' || !attrs.jid || !(tokenNode.content instanceof Uint8Array)) continue;
+    await authState.keys.set({
+      tctoken: {
+        [stripJidDevice(attrs.jid)]: {
+          token: Buffer.from(tokenNode.content),
+          timestamp: attrs.t,
+        },
+      },
+    });
+    stored += 1;
+  }
+  return stored;
+}
+
+async function hasTrustedContactToken(jid) {
+  if (!authState?.keys || !jid) return false;
+  const key = stripJidDevice(jid);
+  try {
+    const data = await authState.keys.get('tctoken', [key]);
+    return Boolean(data?.[key]?.token);
+  } catch {
+    return false;
+  }
+}
+
+async function ensureTrustedContactToken(jid) {
+  if (!sock?.getPrivacyTokens || !authState?.keys || !jid) return;
+  const key = stripJidDevice(jid);
+  if (await hasTrustedContactToken(key)) return;
+  try {
+    const result = await sock.getPrivacyTokens([key]);
+    const stored = await storeTrustedContactTokens(result);
+    if (WHATSAPP_DEBUG) {
+      console.log(JSON.stringify({ event: 'privacy_token_requested', jid: key, stored }));
+    }
+  } catch (err) {
+    console.log(`[bridge] Could not fetch trusted-contact token for ${key}: ${err?.message || err}`);
+  }
+}
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
+  authState = state;
 
   sock = makeWASocket({
     version,
@@ -488,6 +551,7 @@ app.post('/send', async (req, res) => {
 
   try {
     const sendChatId = await resolveSendChatId(chatId);
+    await ensureTrustedContactToken(sendChatId);
     const sent = await sock.sendMessage(sendChatId, { text: formatOutgoingMessage(message) });
 
     // Track sent message ID to prevent echo-back loops
@@ -518,6 +582,7 @@ app.post('/edit', async (req, res) => {
   try {
     const key = { id: messageId, fromMe: true, remoteJid: chatId };
     const sendChatId = await resolveSendChatId(chatId);
+    await ensureTrustedContactToken(sendChatId);
     await sock.sendMessage(sendChatId, { text: formatOutgoingMessage(message), edit: { ...key, remoteJid: sendChatId } });
     res.json({ success: true, chatId: sendChatId });
   } catch (err) {
@@ -589,6 +654,7 @@ app.post('/send-media', async (req, res) => {
     }
 
     const sendChatId = await resolveSendChatId(chatId);
+    await ensureTrustedContactToken(sendChatId);
     const sent = await sock.sendMessage(sendChatId, msgPayload);
 
     // Track sent message ID to prevent echo-back loops
