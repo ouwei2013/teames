@@ -52,8 +52,6 @@ access layer needed for business use.
 
 ### 1. Remote portal: Weight Manager agent for social users
 
-Gateway type: **Shared Gateway**.
-
 A health coach, clinic, or wellness business can run Teames on a server and
 create a `weight_manager` agent that knows its coaching style, diet principles,
 check-in workflow, and reminder rules. The admin creates the agent in the
@@ -70,8 +68,6 @@ social app.
 </p>
 
 ### 2. Organization: Employees with personal agents and workspace oversight
-
-Gateway type: **Personal Gateway**.
 
 A company can let employees install Teames on their own machines and bind their
 own messaging accounts, such as WhatsApp, Telegram, WeChat, or Slack, to their
@@ -222,8 +218,15 @@ present a draft first. Mutating actions such as `create_agent`, `update_agent`,
 
 ## Gateway Concepts
 
+A gateway connects messaging apps to Teames agents. It lets people talk to an
+agent from apps they already use, such as WhatsApp, Telegram, WeChat, Slack, or
+other Hermes-supported channels, instead of opening the Teames web app every
+time. The gateway receives a message, identifies who sent it, checks which agent
+that person should reach, runs the agent, and sends the reply back to the same
+messaging app.
+
 Teames uses two gateway patterns. They both reuse Hermes' messaging gateway
-runtime, but they solve different onboarding problems.
+runtime, but they serve different ownership and onboarding models.
 
 ### Personal Gateway
 
@@ -235,7 +238,9 @@ workspace and asks for something related to a remote business agent, the
 personal agent can route the request to that workspace agent.
 
 Use Personal Gateway when the user owns the agent installation and wants social
-apps as a personal control surface.
+apps as a personal control surface. For the upstream Hermes setup flow and
+platform-specific configuration, see the
+[Hermes Messaging Gateway documentation](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
 
 ### Shared Gateway
 
@@ -326,17 +331,6 @@ Typical flow:
 Useful environment variables depend on your iLink / ClawBot deployment, but the
 gateway expects saved account credentials under the Hermes home directory and
 loads all available Weixin accounts at startup.
-
-### Generic Bind Links
-
-For platforms without a native QR flow, Teames can generate a generic bind code
-or link. The gateway extracts bind codes from messages like:
-
-```text
-/bind hms_xxx
-/start hms_xxx
-hms_xxx
-```
 
 ## Development
 
