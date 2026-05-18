@@ -1872,6 +1872,18 @@ def _whatsapp_native_paired_number() -> str:
     return _find_whatsapp_phone_in_json(parsed)
 
 
+def _persist_whatsapp_native_gateway_env(phone: str, proxy_url: str = "") -> None:
+    phone = _normalize_whatsapp_phone(phone)
+    if not phone:
+        return
+    save_env_value("WHATSAPP_ENABLED", "true")
+    save_env_value("WHATSAPP_MODE", "bot")
+    save_env_value("WHATSAPP_ALLOWED_USERS", "*")
+    save_env_value("SOCIAL_GATEWAY_WHATSAPP_NUMBER", phone)
+    if proxy_url:
+        save_env_value("WHATSAPP_PROXY_URL", proxy_url)
+
+
 def _telegram_configured_username() -> str:
     return (
         os.getenv("SOCIAL_GATEWAY_TELEGRAM_BOT_USERNAME")
@@ -2082,13 +2094,7 @@ def _finalize_whatsapp_pair_state(state: Dict[str, Any]) -> Dict[str, Any]:
             state["status"] = "connected"
             state["phone_number"] = phone
             try:
-                save_env_value("WHATSAPP_ENABLED", "true")
-                save_env_value("WHATSAPP_MODE", "bot")
-                save_env_value("WHATSAPP_ALLOWED_USERS", "*")
-                save_env_value("SOCIAL_GATEWAY_WHATSAPP_NUMBER", phone)
-                proxy_url = str(state.get("proxy_url") or "").strip()
-                if proxy_url:
-                    save_env_value("WHATSAPP_PROXY_URL", proxy_url)
+                _persist_whatsapp_native_gateway_env(phone, str(state.get("proxy_url") or "").strip())
             except Exception:
                 _log.debug("Could not persist WhatsApp gateway env flags", exc_info=True)
         elif proc.returncode not in (0, None):
@@ -2537,6 +2543,10 @@ async def enterprise_whatsapp_native_pair():
 async def enterprise_whatsapp_native_pair_current_status():
     phone = _whatsapp_native_paired_number()
     if phone:
+        try:
+            _persist_whatsapp_native_gateway_env(phone)
+        except Exception:
+            _log.debug("Could not persist WhatsApp gateway env flags", exc_info=True)
         return {
             "id": "",
             "status": "connected",
