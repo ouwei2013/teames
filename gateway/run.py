@@ -862,6 +862,7 @@ class GatewayRunner:
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
+        self._config_reload_mtime: float = 0.0
 
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
@@ -2454,10 +2455,119 @@ class GatewayRunner:
                 ", ".join(p.value for p in self._failed_platforms),
             )
         asyncio.create_task(self._platform_reconnect_watcher())
+        asyncio.create_task(self._platform_config_reload_watcher())
 
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    async def _connect_enabled_platform(self, platform: Platform, platform_config: Any, *, source: str) -> bool:
+        """Create and connect one enabled platform adapter."""
+        if not platform_config.enabled:
+            return False
+        if platform in self.adapters:
+            return True
+
+        adapter = self._create_adapter(platform, platform_config)
+        if not adapter:
+            logger.warning("No adapter available for %s", platform.value)
+            return False
+
+        adapter.set_message_handler(self._handle_message)
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+        adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+
+        logger.info("Connecting to %s (%s)...", platform.value, source)
+        self._update_platform_runtime_status(
+            platform.value,
+            platform_state="connecting",
+            error_code=None,
+            error_message=None,
+        )
+        try:
+            success = await adapter.connect()
+            if success:
+                self.adapters[platform] = adapter
+                self._sync_voice_mode_state_to_adapter(adapter)
+                self.delivery_router.adapters = self.adapters
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="connected",
+                    error_code=None,
+                    error_message=None,
+                )
+                logger.info("✓ %s connected", platform.value)
+                try:
+                    from gateway.channel_directory import build_channel_directory
+                    directory = build_channel_directory(self.adapters)
+                    ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
+                    logger.info("Channel directory refreshed: %d target(s)", ch_count)
+                except Exception as e:
+                    logger.debug("Channel directory refresh error: %s", e)
+                return True
+
+            logger.warning("✗ %s failed to connect", platform.value)
+            await self._safe_adapter_disconnect(adapter, platform)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="retrying",
+                error_code=getattr(adapter, "fatal_error_code", None),
+                error_message=getattr(adapter, "fatal_error_message", None) or "failed to connect",
+            )
+            self._failed_platforms[platform] = {
+                "config": platform_config,
+                "attempts": 1,
+                "next_retry": time.monotonic() + 30,
+            }
+            return False
+        except Exception as e:
+            logger.error("✗ %s error: %s", platform.value, e)
+            await self._safe_adapter_disconnect(adapter, platform)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="retrying",
+                error_code=None,
+                error_message=str(e),
+            )
+            self._failed_platforms[platform] = {
+                "config": platform_config,
+                "attempts": 1,
+                "next_retry": time.monotonic() + 30,
+            }
+            return False
+
+    async def _platform_config_reload_watcher(self) -> None:
+        """Hot-load newly configured gateway platforms from ~/.hermes/.env."""
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(5)
+                try:
+                    mtime = _env_path.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime <= self._config_reload_mtime:
+                    continue
+                self._config_reload_mtime = mtime
+
+                load_hermes_dotenv(
+                    hermes_home=_hermes_home,
+                    project_env=Path(__file__).resolve().parents[1] / ".env",
+                )
+                refreshed = load_gateway_config()
+                connected: list[str] = []
+                for platform, platform_config in refreshed.platforms.items():
+                    self.config.platforms[platform] = platform_config
+                    if not platform_config.enabled or platform in self.adapters:
+                        continue
+                    if await self._connect_enabled_platform(platform, platform_config, source="config reload"):
+                        connected.append(platform.value)
+                if connected:
+                    logger.info("Gateway hot-loaded platform(s): %s", ", ".join(connected))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("Gateway config reload watcher error: %s", e)
     
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
