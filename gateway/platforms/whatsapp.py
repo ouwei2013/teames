@@ -162,6 +162,47 @@ def check_whatsapp_requirements() -> bool:
         return False
 
 
+def _whatsapp_bridge_import_error(bridge_dir: Path) -> str:
+    if not (bridge_dir / "node_modules" / "@whiskeysockets" / "baileys" / "package.json").exists():
+        return "missing @whiskeysockets/baileys package"
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", "await import('@whiskeysockets/baileys')"],
+        cwd=str(bridge_dir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode == 0:
+        return ""
+    return (result.stderr or result.stdout or "").strip()[-1000:] or f"node import failed with code {result.returncode}"
+
+
+def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> str:
+    import_error = _whatsapp_bridge_import_error(bridge_dir)
+    if not import_error:
+        return ""
+
+    result = subprocess.run(
+        [
+            "npm",
+            "install",
+            "--no-fund",
+            "--no-audit",
+            "--progress=false",
+            "--cache",
+            str(bridge_dir / ".npm-cache"),
+        ],
+        cwd=str(bridge_dir),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return f"npm install failed: {detail[-1000:]}"
+    return _whatsapp_bridge_import_error(bridge_dir)
+
+
 class WhatsAppAdapter(BasePlatformAdapter):
     """
     WhatsApp adapter.
@@ -405,25 +446,16 @@ class WhatsAppAdapter(BasePlatformAdapter):
             logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
 
         try:
-            # Auto-install npm dependencies if node_modules doesn't exist
+            # Auto-install npm dependencies if they are missing or incomplete.
             bridge_dir = bridge_path.parent
-            if not (bridge_dir / "node_modules").exists():
+            import_error = _whatsapp_bridge_import_error(bridge_dir)
+            if import_error:
                 print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
-                try:
-                    install_result = subprocess.run(
-                        ["npm", "install", "--silent"],
-                        cwd=str(bridge_dir),
-                        capture_output=True,
-                        text=True,
-                        timeout=60,
-                    )
-                    if install_result.returncode != 0:
-                        print(f"[{self.name}] npm install failed: {install_result.stderr}")
-                        return False
-                    print(f"[{self.name}] Dependencies installed")
-                except Exception as e:
-                    print(f"[{self.name}] Failed to install dependencies: {e}")
+                install_error = _ensure_whatsapp_bridge_dependencies(bridge_dir)
+                if install_error:
+                    print(f"[{self.name}] WhatsApp bridge dependencies incomplete: {install_error}")
                     return False
+                print(f"[{self.name}] Dependencies installed")
 
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
