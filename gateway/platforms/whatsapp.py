@@ -68,6 +68,26 @@ def _kill_port_process(port: int) -> None:
         pass
 
 
+def _port_available(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", port))
+            return True
+    except OSError:
+        return False
+
+
+def _find_available_port(preferred: int) -> int:
+    if _port_available(preferred):
+        return preferred
+    for port in range(max(1024, preferred + 1), min(65535, preferred + 100)):
+        if _port_available(port):
+            return port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _terminate_bridge_process(proc, *, force: bool = False) -> None:
     """Terminate the bridge process using process-tree semantics where possible."""
     if _IS_WINDOWS:
@@ -483,9 +503,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
             except Exception:
                 pass  # Bridge not running, start a new one
             
-            # Kill any orphaned bridge from a previous gateway run
-            _kill_port_process(self._bridge_port)
-            await asyncio.sleep(1)
+            available_port = _find_available_port(self._bridge_port)
+            if available_port != self._bridge_port:
+                logger.warning(
+                    "[%s] WhatsApp bridge port %s is busy; using %s",
+                    self.name,
+                    self._bridge_port,
+                    available_port,
+                )
+                self._bridge_port = available_port
             
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
