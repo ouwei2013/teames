@@ -797,6 +797,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     if resp.status == 200:
                         data = await resp.json()
                         last_message_id = data.get("messageId")
+                        sent_chat_id = data.get("chatId")
+                        if sent_chat_id and sent_chat_id != chat_id:
+                            logger.info("[%s] WhatsApp send target resolved: %s -> %s", self.name, chat_id, sent_chat_id)
                     else:
                         error = await resp.text()
                         return SendResult(success=False, error=error)

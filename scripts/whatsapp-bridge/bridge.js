@@ -72,6 +72,22 @@ function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+async function resolveSendChatId(chatId) {
+  if (!chatId || !String(chatId).endsWith('@lid')) return chatId;
+  try {
+    const mapped = await sock?.signalRepository?.lidMapping?.getPNForLID(chatId);
+    if (mapped) {
+      if (WHATSAPP_DEBUG) {
+        console.log(JSON.stringify({ event: 'resolved_lid_for_send', lid: chatId, pn: mapped }));
+      }
+      return mapped;
+    }
+  } catch (err) {
+    console.log(`[bridge] Could not resolve LID ${chatId} for send: ${err?.message || err}`);
+  }
+  return chatId;
+}
+
 function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;
@@ -465,7 +481,8 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const sent = await sock.sendMessage(chatId, { text: formatOutgoingMessage(message) });
+    const sendChatId = await resolveSendChatId(chatId);
+    const sent = await sock.sendMessage(sendChatId, { text: formatOutgoingMessage(message) });
 
     // Track sent message ID to prevent echo-back loops
     if (sent?.key?.id) {
@@ -475,7 +492,7 @@ app.post('/send', async (req, res) => {
       }
     }
 
-    res.json({ success: true, messageId: sent?.key?.id });
+    res.json({ success: true, messageId: sent?.key?.id, chatId: sendChatId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -494,8 +511,9 @@ app.post('/edit', async (req, res) => {
 
   try {
     const key = { id: messageId, fromMe: true, remoteJid: chatId };
-    await sock.sendMessage(chatId, { text: formatOutgoingMessage(message), edit: key });
-    res.json({ success: true });
+    const sendChatId = await resolveSendChatId(chatId);
+    await sock.sendMessage(sendChatId, { text: formatOutgoingMessage(message), edit: { ...key, remoteJid: sendChatId } });
+    res.json({ success: true, chatId: sendChatId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -564,7 +582,8 @@ app.post('/send-media', async (req, res) => {
         break;
     }
 
-    const sent = await sock.sendMessage(chatId, msgPayload);
+    const sendChatId = await resolveSendChatId(chatId);
+    const sent = await sock.sendMessage(sendChatId, msgPayload);
 
     // Track sent message ID to prevent echo-back loops
     if (sent?.key?.id) {
@@ -574,7 +593,7 @@ app.post('/send-media', async (req, res) => {
       }
     }
 
-    res.json({ success: true, messageId: sent?.key?.id });
+    res.json({ success: true, messageId: sent?.key?.id, chatId: sendChatId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -590,8 +609,9 @@ app.post('/typing', async (req, res) => {
   if (!chatId) return res.status(400).json({ error: 'chatId required' });
 
   try {
-    await sock.sendPresenceUpdate('composing', chatId);
-    res.json({ success: true });
+    const sendChatId = await resolveSendChatId(chatId);
+    await sock.sendPresenceUpdate('composing', sendChatId);
+    res.json({ success: true, chatId: sendChatId });
   } catch (err) {
     res.json({ success: false });
   }
