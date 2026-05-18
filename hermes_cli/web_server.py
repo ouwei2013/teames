@@ -2281,6 +2281,9 @@ async def enterprise_create_social_invite(request: Request, body: EnterpriseSoci
             store.close()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        _log.warning("POST /api/enterprise/social-invites failed: %s", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
     except Exception:
         _log.exception("POST /api/enterprise/social-invites failed")
         raise HTTPException(status_code=500, detail="Enterprise social invite creation failed")

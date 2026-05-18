@@ -63,6 +63,18 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
   }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
+    let detail = "";
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown };
+      if (parsed.detail) {
+        detail = String(parsed.detail);
+      }
+    } catch {
+      // Fall through to the raw response text below when the body is not JSON.
+    }
+    if (detail) {
+      throw new Error(`${res.status}: ${detail}`);
+    }
     throw new Error(`${res.status}: ${text}`);
   }
   return res.json();

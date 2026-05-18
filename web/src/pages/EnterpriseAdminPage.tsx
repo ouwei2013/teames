@@ -1035,8 +1035,9 @@ export default function EnterpriseAdminPage() {
       showToast("Social QR invite created", "success");
       await loadEnterprise();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      showToast("Social QR invite failed", "error");
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      showToast(`Social QR invite failed: ${message}`, "error");
     } finally {
       setCreatingSocialInvite(false);
     }
