@@ -5,6 +5,7 @@ root.
 
 ## Contents
 
+- [`github-workflow.md`](github-workflow.md) — Fork、分支、Commit、Push、PR 与同步上游（中文，适合新贡献者）。
 - `releases/` — archived release notes inherited from the Hermes Agent fork.
 - `plans/` — implementation plans and design sketches.
 - `notes/` — longer product or project notes.
