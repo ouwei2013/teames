@@ -47,7 +47,6 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
-from firecrawl import Firecrawl
 from agent.auxiliary_client import (
     async_call_llm,
     extract_content_or_reasoning,
@@ -64,6 +63,31 @@ from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
+
+Firecrawl = None
+
+
+def _load_firecrawl_client_class():
+    """Load the Firecrawl SDK only when the Firecrawl backend is used."""
+    global Firecrawl
+    if Firecrawl is not None:
+        return Firecrawl
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("search.firecrawl", prompt=False)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    try:
+        from firecrawl import Firecrawl as loaded_firecrawl
+    except ImportError as exc:
+        raise RuntimeError(
+            "Firecrawl web tools require the optional firecrawl-py package. "
+            "Install it with `pip install -e '.[firecrawl]'` or `uv pip install firecrawl-py==4.17.0`."
+        ) from exc
+    Firecrawl = loaded_firecrawl
+    return Firecrawl
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -236,7 +260,7 @@ def _get_firecrawl_client():
     if _firecrawl_client is not None and _firecrawl_client_config == client_config:
         return _firecrawl_client
 
-    _firecrawl_client = Firecrawl(**kwargs)
+    _firecrawl_client = _load_firecrawl_client_class()(**kwargs)
     _firecrawl_client_config = client_config
     return _firecrawl_client
 
@@ -250,9 +274,16 @@ def _get_parallel_client():
 
     Requires PARALLEL_API_KEY environment variable.
     """
-    from parallel import Parallel
     global _parallel_client
     if _parallel_client is None:
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("search.parallel", prompt=False)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        from parallel import Parallel
         api_key = os.getenv("PARALLEL_API_KEY")
         if not api_key:
             raise ValueError(
@@ -268,9 +299,16 @@ def _get_async_parallel_client():
 
     Requires PARALLEL_API_KEY environment variable.
     """
-    from parallel import AsyncParallel
     global _async_parallel_client
     if _async_parallel_client is None:
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("search.parallel", prompt=False)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        from parallel import AsyncParallel
         api_key = os.getenv("PARALLEL_API_KEY")
         if not api_key:
             raise ValueError(
@@ -880,9 +918,16 @@ def _get_exa_client():
 
     Requires EXA_API_KEY environment variable.
     """
-    from exa_py import Exa
     global _exa_client
     if _exa_client is None:
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("search.exa", prompt=False)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        from exa_py import Exa
         api_key = os.getenv("EXA_API_KEY")
         if not api_key:
             raise ValueError(

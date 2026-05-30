@@ -58,6 +58,14 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
+def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
+    """Atomically move *tmp_path* onto *target*, preserving symlink targets."""
+    target_str = str(target)
+    real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
+    os.replace(str(tmp_path), real_path)
+    return real_path
+
+
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,

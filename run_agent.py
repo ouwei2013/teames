@@ -11335,8 +11335,11 @@ class AIAgent:
                     if is_client_error:
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
-                        self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                        if self._try_activate_fallback():
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            self._emit_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                        else:
+                            self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                        if self._try_activate_fallback(reason=classified.reason):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -11345,10 +11348,16 @@ class AIAgent:
                             self._dump_api_request_debug(
                                 api_kwargs, reason="non_retryable_client_error", error=api_error,
                             )
-                        self._emit_status(
-                            f"❌ Non-retryable error (HTTP {status_code}): "
-                            f"{self._summarize_api_error(api_error)}"
-                        )
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            self._emit_status(
+                                f"❌ Provider safety filter blocked this request: "
+                                f"{self._summarize_api_error(api_error)}"
+                            )
+                        else:
+                            self._emit_status(
+                                f"❌ Non-retryable error (HTTP {status_code}): "
+                                f"{self._summarize_api_error(api_error)}"
+                            )
                         self._vprint(f"{self.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                         self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
@@ -11367,6 +11376,19 @@ class AIAgent:
                                     self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            self._vprint(
+                                f"{self.log_prefix}   💡 The provider's safety filter rejected this specific prompt.",
+                                force=True,
+                            )
+                            self._vprint(
+                                f"{self.log_prefix}      • Try rephrasing the request, narrowing the context, or splitting it into smaller steps.",
+                                force=True,
+                            )
+                            self._vprint(
+                                f"{self.log_prefix}      • Configure a fallback provider so future blocks can route automatically: hermes fallback add",
+                                force=True,
+                            )
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
                         # Skip session persistence when the error is likely
                         # context-overflow related (status 400 + large session).
@@ -11381,6 +11403,23 @@ class AIAgent:
                             )
                         else:
                             self._persist_session(messages, conversation_history)
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            _summary = self._summarize_api_error(api_error)
+                            _policy_response = (
+                                "⚠️ The model provider's safety filter blocked this request "
+                                "(not a Hermes/gateway failure).\n\n"
+                                f"Provider message: {_summary}\n\n"
+                                "Try rephrasing the request, narrowing the context, or adding "
+                                "a fallback provider with `hermes fallback add`."
+                            )
+                            return {
+                                "final_response": _policy_response,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "failed": True,
+                                "error": f"content_policy_blocked: {_summary}",
+                            }
                         return {
                             "final_response": None,
                             "messages": messages,

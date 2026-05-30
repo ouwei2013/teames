@@ -27,6 +27,8 @@ import sys
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Optional
 
+from hermes_cli.fallback_config import get_fallback_chain
+
 
 def run_oneshot(
     prompt: str,
@@ -154,6 +156,7 @@ def _run_agent(
     # Pull in whatever toolsets the user has enabled for "cli".
     # sorted() gives stable ordering; set→list for AIAgent's signature.
     toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+    fallback_chain = get_fallback_chain(cfg)
 
     agent = AIAgent(
         api_key=runtime.get("api_key"),
@@ -162,6 +165,7 @@ def _run_agent(
         api_mode=runtime.get("api_mode"),
         model=effective_model,
         enabled_toolsets=toolsets_list,
+        fallback_model=fallback_chain,
         quiet_mode=True,
         platform="cli",
         credential_pool=runtime.get("credential_pool"),

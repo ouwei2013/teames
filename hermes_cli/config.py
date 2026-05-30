@@ -924,6 +924,10 @@ DEFAULT_CONFIG = {
             "domains": [],
             "shared_files": [],
         },
+        # Allow Teames/Hermes to lazy-install opt-in backend packages from PyPI
+        # the first time a user enables a backend that needs them. Set false
+        # for audited, restricted-network, or air-gapped deployments.
+        "allow_lazy_installs": True,
     },
 
     "cron": {
@@ -1816,8 +1820,8 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "API_SERVER_KEY": {
-        "description": "Bearer token for API server authentication. Required for non-loopback binding; server refuses to start without it. On loopback (127.0.0.1), all requests are allowed if empty.",
-        "prompt": "API server auth key (required for network access)",
+        "description": "Bearer token for API server authentication. Required whenever the API server is enabled; server refuses to start without it.",
+        "prompt": "API server auth key",
         "url": None,
         "password": True,
         "category": "messaging",
@@ -1832,7 +1836,7 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "API_SERVER_HOST": {
-        "description": "Host/bind address for the API server (default: 127.0.0.1). Use 0.0.0.0 for network access — server refuses to start without API_SERVER_KEY.",
+        "description": "Host/bind address for the API server (default: 127.0.0.1). API_SERVER_KEY is still required even on loopback binds.",
         "prompt": "API server host",
         "url": None,
         "password": False,
