@@ -56,7 +56,7 @@ class TestFailoverReason:
             "overloaded", "server_error", "timeout",
             "context_overflow", "payload_too_large",
             "model_not_found", "format_error",
-            "provider_policy_blocked",
+            "provider_policy_blocked", "content_policy_blocked",
             "thinking_signature", "long_context_tier", "unknown",
         }
         actual = {r.value for r in FailoverReason}
@@ -350,6 +350,61 @@ class TestClassifyApiError:
         )
         result = classify_api_error(e)
         assert result.reason == FailoverReason.provider_policy_blocked
+
+    # ── Provider content-policy block (per-prompt safety filter) ──
+
+    def test_message_only_cyber_content_policy_blocked(self):
+        e = Exception(
+            "This content was flagged for possible cybersecurity risk. If this "
+            "seems wrong, try rephrasing your request. To get authorized for "
+            "security work, join the Trusted Access for Cyber program."
+        )
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_compress is False
+
+    def test_400_cyber_content_policy_blocked(self):
+        e = MockAPIError(
+            "This content was flagged for possible cybersecurity risk",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.5")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_openai_usage_policy_violation_content_policy_blocked(self):
+        e = MockAPIError(
+            "Your request was flagged by the moderation system as potentially "
+            "violating OpenAI's usage policies.",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="openai", model="gpt-4o")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_anthropic_safety_system_content_policy_blocked(self):
+        e = Exception(
+            "Your prompt was flagged by our safety system. Please rephrase "
+            "and try again."
+        )
+        result = classify_api_error(e, provider="anthropic", model="claude-3-5-sonnet")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_azure_content_filter_content_policy_blocked(self):
+        e = MockAPIError(
+            "The response was filtered: ResponsibleAIPolicyViolation "
+            "(finish_reason=content_filter).",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="azure", model="gpt-4o")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
 
     def test_404_model_not_found_still_works(self):
         # Regression guard: the new policy-block check must not swallow

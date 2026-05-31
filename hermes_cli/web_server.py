@@ -58,6 +58,7 @@ from hermes_cli.config import (
 from agent.access_context import AccessContext
 from gateway.status import get_running_pid, read_runtime_status
 from hermes_constants import get_default_hermes_root
+from utils import env_var_enabled
 
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -1827,6 +1828,14 @@ def _whatsapp_session_dir() -> Path:
     return Path(get_hermes_home()) / "whatsapp" / "session"
 
 
+def _whatsapp_logout_marker_path() -> Path:
+    return _whatsapp_session_dir() / "logged-out.json"
+
+
+def _whatsapp_session_logged_out() -> bool:
+    return _whatsapp_logout_marker_path().exists()
+
+
 def _whatsapp_bridge_dir() -> Path:
     return PROJECT_ROOT / "scripts" / "whatsapp-bridge"
 
@@ -1854,6 +1863,8 @@ def _find_whatsapp_phone_in_json(value: Any) -> str:
 
 
 def _whatsapp_native_paired_number() -> str:
+    if _whatsapp_session_logged_out():
+        return ""
     configured = (
         os.getenv("SOCIAL_GATEWAY_WHATSAPP_NUMBER")
         or os.getenv("WHATSAPP_BUSINESS_NUMBER")
@@ -2600,6 +2611,13 @@ async def enterprise_whatsapp_native_unpair():
 
 @app.get("/api/enterprise/social-gateways/whatsapp/pair/status")
 async def enterprise_whatsapp_native_pair_current_status():
+    if _whatsapp_session_logged_out():
+        return {
+            "id": "",
+            "status": "not_paired",
+            "phone_number": None,
+            "message": "WhatsApp session expired. Pair the server-side WhatsApp bot again.",
+        }
     phone = _whatsapp_native_paired_number()
     if phone:
         try:
@@ -9154,6 +9172,25 @@ async def set_dashboard_theme(body: ThemeSetBody):
 # Dashboard plugin system
 # ---------------------------------------------------------------------------
 
+def _safe_plugin_api_relpath(api_field: Any, *, dashboard_dir: Path) -> Optional[str]:
+    """Validate the manifest's backend ``api`` path before importing it."""
+    if not isinstance(api_field, str) or not api_field.strip():
+        return None
+    candidate = Path(api_field)
+    if candidate.is_absolute():
+        return None
+    try:
+        resolved = (dashboard_dir / candidate).resolve()
+        base = dashboard_dir.resolve()
+    except (OSError, RuntimeError):
+        return None
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        return None
+    return api_field
+
+
 def _discover_dashboard_plugins() -> list:
     """Scan plugins/*/dashboard/manifest.json for dashboard extensions.
 
@@ -9170,7 +9207,16 @@ def _discover_dashboard_plugins() -> list:
         (PROJECT_ROOT / "plugins" / "memory", "bundled"),
         (PROJECT_ROOT / "plugins", "bundled"),
     ]
-    if os.environ.get("HERMES_ENABLE_PROJECT_PLUGINS"):
+    # GHSA-5qr3-c538-wm9j (#29156): the previous ``os.environ.get(...)``
+    # check treated *any* non-empty string as truthy, so ``=0``, ``=false``,
+    # and ``=no`` — all of which the agent loader and operators correctly
+    # read as "disabled" — silently *enabled* the untrusted project source
+    # in the web server.  Combined with the absolute-path RCE primitive on
+    # the manifest's ``api`` field (now patched below), this turned the
+    # opt-in into a sticky always-on switch.  Use the shared truthy
+    # semantics (``1`` / ``true`` / ``yes`` / ``on``) so the gate matches
+    # ``hermes_cli/plugins.py`` and the documented user contract.
+    if env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
         search_dirs.append((Path.cwd() / ".hermes" / "plugins", "project"))
 
     for plugins_root, source in search_dirs:
@@ -9209,6 +9255,15 @@ def _discover_dashboard_plugins() -> list:
                 slots: List[str] = []
                 if isinstance(slots_src, list):
                     slots = [s for s in slots_src if isinstance(s, str) and s]
+                raw_api = data.get("api")
+                dashboard_dir = child / "dashboard"
+                safe_api = _safe_plugin_api_relpath(raw_api, dashboard_dir=dashboard_dir)
+                if raw_api and safe_api is None:
+                    _log.warning(
+                        "Plugin %s: refusing unsafe api path %r; backend routes "
+                        "from this plugin will not be mounted",
+                        name, raw_api,
+                    )
                 plugins.append({
                     "name": name,
                     "label": data.get("label", name),
@@ -9219,10 +9274,10 @@ def _discover_dashboard_plugins() -> list:
                     "slots": slots,
                     "entry": data.get("entry", "dist/index.js"),
                     "css": data.get("css"),
-                    "has_api": bool(data.get("api")),
+                    "has_api": bool(safe_api),
                     "source": source,
-                    "_dir": str(child / "dashboard"),
-                    "_api_file": data.get("api"),
+                    "_dir": str(dashboard_dir),
+                    "_api_file": safe_api,
                 })
             except Exception as exc:
                 _log.warning("Bad dashboard plugin manifest %s: %s", manifest_file, exc)
@@ -9308,7 +9363,26 @@ def _mount_plugin_api_routes():
         api_file_name = plugin.get("_api_file")
         if not api_file_name:
             continue
-        api_path = Path(plugin["_dir"]) / api_file_name
+        if plugin.get("source") == "project":
+            _log.warning(
+                "Plugin %s: ignoring backend api=%s from project plugin source; "
+                "move the plugin to ~/.hermes/plugins/ if you trust it",
+                plugin["name"], api_file_name,
+            )
+            continue
+        dashboard_dir = Path(plugin["_dir"])
+        api_path = dashboard_dir / api_file_name
+        try:
+            resolved_api = api_path.resolve()
+            resolved_base = dashboard_dir.resolve()
+            resolved_api.relative_to(resolved_base)
+        except (OSError, RuntimeError, ValueError):
+            _log.warning(
+                "Plugin %s: refusing to import api file outside its dashboard "
+                "directory (%s)",
+                plugin["name"], api_path,
+            )
+            continue
         if not api_path.exists():
             _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
             continue

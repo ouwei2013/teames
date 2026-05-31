@@ -193,6 +193,25 @@ class TestWebServerEndpoints:
         assert resp.json()["gateway_state"] == "startup_failed"
         assert resp.json()["gateway_platforms"] == {}
 
+    def test_whatsapp_pair_status_treats_logged_out_session_as_not_paired(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+
+        monkeypatch.setenv("SOCIAL_GATEWAY_WHATSAPP_NUMBER", "8619958274056")
+        session_dir = get_hermes_home() / "whatsapp" / "session"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "logged-out.json").write_text(
+            json.dumps({"status": "logged_out", "reason": "logged_out"}),
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/enterprise/social-gateways/whatsapp/pair/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "not_paired"
+        assert data["phone_number"] is None
+        assert "expired" in data["message"].lower()
+
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")
         assert resp.status_code == 200

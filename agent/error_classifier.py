@@ -43,9 +43,10 @@ class FailoverReason(enum.Enum):
     context_overflow = "context_overflow"  # Context too large — compress, not failover
     payload_too_large = "payload_too_large"  # 413 — compress payload
 
-    # Model
+    # Model / provider policy
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator (e.g. OpenRouter) blocked the only endpoint due to account data/privacy policy
+    content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — do not retry unchanged
 
     # Request format
     format_error = "format_error"        # 400 bad request — abort or strip + retry
@@ -216,6 +217,26 @@ _PROVIDER_POLICY_BLOCKED_PATTERNS = [
     "no endpoints available matching your guardrail",
     "no endpoints available matching your data policy",
     "no endpoints found matching your data policy",
+]
+
+# Provider content-policy / safety-filter blocks. Distinct from
+# ``provider_policy_blocked`` above, which is an OpenRouter account-level
+# data/privacy guardrail. These are per-prompt safety decisions by the model
+# provider, so retrying the same request just repeats the refusal.
+_CONTENT_POLICY_BLOCKED_PATTERNS = [
+    # OpenAI Codex / cyber safety refusal.
+    "flagged for possible cybersecurity risk",
+    "trusted access for cyber",
+    # OpenAI moderation / Responses.
+    "violates our usage policies",
+    "violates openai's usage policies",
+    "your request was flagged by",
+    # Anthropic safety system.
+    "prompt was flagged by our safety",
+    "responses cannot be generated due to safety",
+    # Azure / OpenAI structured content-filter tokens.
+    "content_filter",
+    "responsibleaipolicyviolation",
 ]
 
 # Auth patterns (non-status-code signals)
@@ -406,6 +427,16 @@ def classify_api_error(
         return ClassifiedError(**defaults)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
+
+    # Provider content-policy / safety-filter block. Must run before status
+    # classification so a 400 safety block is not downgraded to format_error,
+    # and status-less provider refusals do not fall into retryable unknown.
+    if any(p in error_msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
+        return _result(
+            FailoverReason.content_policy_blocked,
+            retryable=False,
+            should_fallback=True,
+        )
 
     # Anthropic thinking block signature invalid (400).
     # Don't gate on provider — OpenRouter proxies Anthropic errors, so the

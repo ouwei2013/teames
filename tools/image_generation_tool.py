@@ -29,7 +29,30 @@ import uuid
 from typing import Any, Dict, Optional, Union
 from urllib.parse import urlencode
 
-import fal_client
+fal_client: Any = None
+
+
+def _load_fal_client() -> Any:
+    """Load fal_client only when image generation is actually used."""
+    global fal_client
+    if fal_client is not None:
+        return fal_client
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("image.fal", prompt=False)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    try:
+        import fal_client as loaded_fal_client
+    except ImportError as exc:
+        raise RuntimeError(
+            "FAL image generation requires the optional fal-client package. "
+            "Install it with `pip install -e '.[fal]'` or `uv pip install fal-client==0.13.1`."
+        ) from exc
+    fal_client = loaded_fal_client
+    return fal_client
 
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
@@ -338,11 +361,12 @@ class _ManagedFalSyncClient:
     """Small per-instance wrapper around fal_client.SyncClient for managed queue hosts."""
 
     def __init__(self, *, key: str, queue_run_origin: str):
-        sync_client_class = getattr(fal_client, "SyncClient", None)
+        fal = _load_fal_client()
+        sync_client_class = getattr(fal, "SyncClient", None)
         if sync_client_class is None:
             raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
 
-        client_module = getattr(fal_client, "client", None)
+        client_module = getattr(fal, "client", None)
         if client_module is None:
             raise RuntimeError("fal_client.client is required for managed FAL gateway mode")
 
@@ -438,7 +462,7 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_gateway()
     if managed_gateway is None:
-        return fal_client.submit(model, arguments=arguments, headers=request_headers)
+        return _load_fal_client().submit(model, arguments=arguments, headers=request_headers)
 
     managed_client = _get_managed_fal_client(managed_gateway)
     try:
@@ -788,9 +812,9 @@ def check_image_generation_requirements() -> bool:
     """
     try:
         if check_fal_api_key():
-            fal_client  # noqa: F401 — SDK presence check
+            _load_fal_client()
             return True
-    except ImportError:
+    except (ImportError, RuntimeError):
         pass
 
     # Probe plugin providers. Discovery is idempotent and cheap.
@@ -826,9 +850,9 @@ if __name__ == "__main__":
     print("✅ FAL.ai API key found")
 
     try:
-        import fal_client  # noqa: F401
+        _load_fal_client()
         print("✅ fal_client library available")
-    except ImportError:
+    except RuntimeError:
         print("❌ fal_client library not found — pip install fal-client")
         raise SystemExit(1)
 

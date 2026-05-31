@@ -1972,10 +1972,50 @@ class EnterpriseStore:
 
     def list_users(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
-            """SELECT id, tenant_id, email, name, role, created_at, disabled_at
-               FROM users ORDER BY created_at DESC"""
+            """SELECT u.id, u.tenant_id, u.email, u.name, u.role,
+                      u.created_at, u.disabled_at,
+                      (
+                        SELECT COUNT(*)
+                        FROM social_gateway_bindings b
+                        WHERE b.tenant_id = u.tenant_id
+                          AND b.user_id = u.id
+                          AND b.revoked_at IS NULL
+                          AND b.status = 'active'
+                      ) AS social_binding_count,
+                      (
+                        SELECT COUNT(*)
+                        FROM local_devices d
+                        WHERE d.tenant_id = u.tenant_id
+                          AND d.user_id = u.id
+                          AND d.revoked_at IS NULL
+                      ) AS local_device_count,
+                      (
+                        SELECT MAX(b.last_seen_at)
+                        FROM social_gateway_bindings b
+                        WHERE b.tenant_id = u.tenant_id
+                          AND b.user_id = u.id
+                      ) AS social_last_seen_at,
+                      (
+                        SELECT MAX(d.last_seen_at)
+                        FROM local_devices d
+                        WHERE d.tenant_id = u.tenant_id
+                          AND d.user_id = u.id
+                      ) AS device_last_seen_at
+               FROM users u
+               ORDER BY COALESCE(social_last_seen_at, device_last_seen_at, u.created_at) DESC,
+                        u.created_at DESC"""
         ).fetchall()
-        return [dict(r) for r in rows]
+        users: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            last_seen_values = [
+                value
+                for value in (item.get("social_last_seen_at"), item.get("device_last_seen_at"))
+                if value is not None
+            ]
+            item["last_seen_at"] = max(last_seen_values) if last_seen_values else None
+            users.append(item)
+        return users
 
     def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(

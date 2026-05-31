@@ -153,6 +153,11 @@ def test_social_gateway_invite_binds_external_user_to_agent(tmp_path):
         assert invites[0]["uses"] == 1
         bindings = store.list_social_gateway_bindings()
         assert bindings[0]["external_user_id"] == "wx_user_1"
+        users = store.list_users()
+        assert users[0]["id"] == bound["user"]["id"]
+        assert users[0]["social_binding_count"] == 1
+        assert users[0]["local_device_count"] == 0
+        assert users[0]["last_seen_at"] == users[0]["social_last_seen_at"]
     finally:
         store.close()
 

@@ -22,10 +22,27 @@ from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import normalize_proxy_env_vars
 
-try:
-    import anthropic as _anthropic_sdk
-except ImportError:
-    _anthropic_sdk = None  # type: ignore[assignment]
+_anthropic_sdk: Any = ...  # sentinel; None means "tried and missing"
+
+
+def _get_anthropic_sdk():
+    """Return the Anthropic SDK, installing the optional extra on demand."""
+    global _anthropic_sdk
+    if _anthropic_sdk is ...:
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("provider.anthropic", prompt=False)
+        except ImportError:
+            pass
+        except Exception:
+            # FeatureUnavailable already carries the actionable install hint.
+            pass
+        try:
+            import anthropic as _sdk
+            _anthropic_sdk = _sdk
+        except ImportError:
+            _anthropic_sdk = None
+    return _anthropic_sdk
 
 logger = logging.getLogger(__name__)
 
@@ -374,10 +391,11 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
 
     Returns an anthropic.Anthropic instance.
     """
-    if _anthropic_sdk is None:
+    anthropic_sdk = _get_anthropic_sdk()
+    if anthropic_sdk is None:
         raise ImportError(
             "The 'anthropic' package is required for the Anthropic provider. "
-            "Install it with: pip install 'anthropic>=0.39.0'"
+            "Install it with: pip install 'anthropic==0.87.0'"
         )
 
     normalize_proxy_env_vars()
@@ -446,7 +464,7 @@ def build_anthropic_client(api_key: str, base_url: str = None, timeout: float = 
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
-    return _anthropic_sdk.Anthropic(**kwargs)
+    return anthropic_sdk.Anthropic(**kwargs)
 
 
 def build_anthropic_bedrock_client(region: str):
@@ -458,19 +476,20 @@ def build_anthropic_bedrock_client(region: str):
 
     Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
     """
-    if _anthropic_sdk is None:
+    anthropic_sdk = _get_anthropic_sdk()
+    if anthropic_sdk is None:
         raise ImportError(
             "The 'anthropic' package is required for the Bedrock provider. "
-            "Install it with: pip install 'anthropic>=0.39.0'"
+            "Install it with: pip install 'anthropic==0.87.0'"
         )
-    if not hasattr(_anthropic_sdk, "AnthropicBedrock"):
+    if not hasattr(anthropic_sdk, "AnthropicBedrock"):
         raise ImportError(
             "anthropic.AnthropicBedrock not available. "
-            "Upgrade with: pip install 'anthropic>=0.39.0'"
+            "Upgrade with: pip install 'anthropic==0.87.0'"
         )
     from httpx import Timeout
 
-    return _anthropic_sdk.AnthropicBedrock(
+    return anthropic_sdk.AnthropicBedrock(
         aws_region=region,
         timeout=Timeout(timeout=900.0, connect=10.0),
     )
@@ -1711,5 +1730,4 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
 

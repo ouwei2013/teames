@@ -5227,6 +5227,54 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    @staticmethod
+    def _is_codex_none_output_parse_error(exc: Exception) -> bool:
+        return isinstance(exc, TypeError) and "'NoneType' object is not iterable" in str(exc)
+
+    def _synthesize_codex_stream_response(
+        self,
+        *,
+        output_items: list,
+        text_parts: list,
+        has_tool_calls: bool = False,
+        source: str = "stream",
+    ):
+        """Recover when the Codex SDK parser crashes after usable deltas."""
+        if output_items:
+            logger.warning(
+                "Codex %s parser failed on final response; using %d collected output items. %s",
+                source, len(output_items), self._client_log_context(),
+            )
+            return SimpleNamespace(
+                output=list(output_items),
+                usage=None,
+                status="completed",
+                model=self.model,
+            )
+        if text_parts and not has_tool_calls:
+            assembled = "".join(text_parts)
+            logger.warning(
+                "Codex %s parser failed on final response; synthesized output from "
+                "%d text deltas (%d chars). %s",
+                source, len(text_parts), len(assembled), self._client_log_context(),
+            )
+            return SimpleNamespace(
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[
+                            SimpleNamespace(type="output_text", text=assembled)
+                        ],
+                    )
+                ],
+                usage=None,
+                status="completed",
+                model=self.model,
+            )
+        return None
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -5317,6 +5365,23 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except TypeError as exc:
+                if self._is_codex_none_output_parse_error(exc):
+                    synthesized = self._synthesize_codex_stream_response(
+                        output_items=collected_output_items,
+                        text_parts=self._codex_streamed_text_parts,
+                        has_tool_calls=has_tool_calls,
+                        source="responses.stream",
+                    )
+                    if synthesized is not None:
+                        return synthesized
+                    logger.debug(
+                        "Codex Responses stream parser hit empty final output but no "
+                        "usable deltas/items were collected; falling back to create(stream=True). %s",
+                        self._client_log_context(),
+                    )
+                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                raise
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -5418,6 +5483,16 @@ class AIAgent:
                                 len(collected_text_deltas), len(assembled),
                             )
                     return terminal_response
+        except TypeError as exc:
+            if self._is_codex_none_output_parse_error(exc):
+                synthesized = self._synthesize_codex_stream_response(
+                    output_items=collected_output_items,
+                    text_parts=collected_text_deltas,
+                    source="create(stream=True)",
+                )
+                if synthesized is not None:
+                    return synthesized
+            raise
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
@@ -11335,8 +11410,11 @@ class AIAgent:
                     if is_client_error:
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
-                        self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                        if self._try_activate_fallback():
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            self._emit_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                        else:
+                            self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                        if self._try_activate_fallback(reason=classified.reason):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -11345,10 +11423,16 @@ class AIAgent:
                             self._dump_api_request_debug(
                                 api_kwargs, reason="non_retryable_client_error", error=api_error,
                             )
-                        self._emit_status(
-                            f"❌ Non-retryable error (HTTP {status_code}): "
-                            f"{self._summarize_api_error(api_error)}"
-                        )
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            self._emit_status(
+                                f"❌ Provider safety filter blocked this request: "
+                                f"{self._summarize_api_error(api_error)}"
+                            )
+                        else:
+                            self._emit_status(
+                                f"❌ Non-retryable error (HTTP {status_code}): "
+                                f"{self._summarize_api_error(api_error)}"
+                            )
                         self._vprint(f"{self.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                         self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
@@ -11367,6 +11451,19 @@ class AIAgent:
                                     self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            self._vprint(
+                                f"{self.log_prefix}   💡 The provider's safety filter rejected this specific prompt.",
+                                force=True,
+                            )
+                            self._vprint(
+                                f"{self.log_prefix}      • Try rephrasing the request, narrowing the context, or splitting it into smaller steps.",
+                                force=True,
+                            )
+                            self._vprint(
+                                f"{self.log_prefix}      • Configure a fallback provider so future blocks can route automatically: hermes fallback add",
+                                force=True,
+                            )
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
                         # Skip session persistence when the error is likely
                         # context-overflow related (status 400 + large session).
@@ -11381,6 +11478,23 @@ class AIAgent:
                             )
                         else:
                             self._persist_session(messages, conversation_history)
+                        if classified.reason == FailoverReason.content_policy_blocked:
+                            _summary = self._summarize_api_error(api_error)
+                            _policy_response = (
+                                "⚠️ The model provider's safety filter blocked this request "
+                                "(not a Hermes/gateway failure).\n\n"
+                                f"Provider message: {_summary}\n\n"
+                                "Try rephrasing the request, narrowing the context, or adding "
+                                "a fallback provider with `hermes fallback add`."
+                            )
+                            return {
+                                "final_response": _policy_response,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "failed": True,
+                                "error": f"content_policy_blocked: {_summary}",
+                            }
                         return {
                             "final_response": None,
                             "messages": messages,

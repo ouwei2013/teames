@@ -640,7 +640,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def _check_managed_bridge_exit(self) -> Optional[str]:
         """Return a fatal error message if the managed bridge child exited."""
-        if self._disconnecting or not self._running:
+        if getattr(self, "_disconnecting", False) or not getattr(self, "_running", False):
             return None
         if self._bridge_process is None:
             return None
