@@ -920,6 +920,11 @@ export interface EnterpriseUser {
   role: string;
   created_at?: number;
   disabled_at?: number | null;
+  social_binding_count?: number;
+  local_device_count?: number;
+  social_last_seen_at?: number | null;
+  device_last_seen_at?: number | null;
+  last_seen_at?: number | null;
 }
 
 export interface EnterpriseAgentUser extends EnterpriseUser {

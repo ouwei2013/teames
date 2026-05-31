@@ -24,7 +24,7 @@ import { Boom } from '@hapi/boom';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'fs';
 import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
@@ -48,6 +48,7 @@ const QR_JSON =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const LOGOUT_MARKER = path.join(SESSION_DIR, 'logged-out.json');
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
@@ -108,6 +109,24 @@ function getContextInfo(messageContent) {
 }
 
 mkdirSync(SESSION_DIR, { recursive: true });
+
+function writeLogoutMarker(reason) {
+  try {
+    writeFileSync(LOGOUT_MARKER, JSON.stringify({
+      status: 'logged_out',
+      reason,
+      timestamp: new Date().toISOString(),
+    }, null, 2));
+  } catch {}
+}
+
+function clearLogoutMarker() {
+  try {
+    if (existsSync(LOGOUT_MARKER)) {
+      rmSync(LOGOUT_MARKER, { force: true });
+    }
+  } catch {}
+}
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
 function buildLidMap() {
@@ -268,6 +287,7 @@ async function startSocket() {
       connectionState = 'disconnected';
 
       if (reason === DisconnectReason.loggedOut) {
+        writeLogoutMarker('logged_out');
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
         process.exit(1);
       } else {
@@ -281,6 +301,7 @@ async function startSocket() {
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      clearLogoutMarker();
       if (QR_JSON) {
         try {
           console.log(JSON.stringify({

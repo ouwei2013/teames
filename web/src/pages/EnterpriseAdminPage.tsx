@@ -935,6 +935,54 @@ export default function EnterpriseAdminPage() {
   }, [latestSocialInvite?.link?.platform, latestSocialInvite?.link?.qr_id]);
 
   useEffect(() => {
+    const invite = latestSocialInvite;
+    const platform = invite?.link?.platform;
+    if (!invite || platform === "weixin" || !platform || invite.uses >= invite.max_uses) return;
+
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      Promise.all([api.getEnterpriseSocialInvites(), api.getEnterpriseUsers()])
+        .then(([inviteResult, userResult]) => {
+          if (cancelled) return;
+          const nextInvites = inviteResult.invites || [];
+          setSocialInvites(nextInvites);
+          setUsers(userResult.users || []);
+          const matched = nextInvites.find(
+            (item) =>
+              item.created_at === invite.created_at &&
+              item.agent_id === invite.agent_id &&
+              (item.platform || "") === (invite.platform || ""),
+          );
+          if (matched && matched.uses > invite.uses) {
+            setLatestSocialInvite((current) =>
+              current && current.created_at === invite.created_at
+                ? { ...current, uses: matched.uses }
+                : current,
+            );
+            window.clearInterval(timer);
+            showToast(`${invite.link.platform_label} user connected`, "success");
+            void loadEnterprise();
+          }
+        })
+        .catch(() => {
+          // Keep the QR usable even if one poll fails.
+        });
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    latestSocialInvite?.agent_id,
+    latestSocialInvite?.created_at,
+    latestSocialInvite?.link?.platform,
+    latestSocialInvite?.max_uses,
+    latestSocialInvite?.platform,
+    latestSocialInvite?.uses,
+  ]);
+
+  useEffect(() => {
     if (!whatsappPair?.id || ["connected", "failed"].includes(whatsappPair.status)) return;
     let cancelled = false;
     const timer = window.setInterval(() => {
@@ -3154,7 +3202,8 @@ export default function EnterpriseAdminPage() {
                       <tr>
                         <th className="px-4 py-2 font-normal">User</th>
                         <th className="px-4 py-2 font-normal">Role</th>
-                        <th className="px-4 py-2 font-normal">Created</th>
+                        <th className="px-4 py-2 font-normal">Connections</th>
+                        <th className="px-4 py-2 font-normal">Last seen</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -3174,13 +3223,22 @@ export default function EnterpriseAdminPage() {
                             </Badge>
                           </td>
                           <td className="px-4 py-3 text-muted-foreground">
-                            {formatDate(user.created_at)}
+                            <div className="flex flex-wrap gap-1">
+                              <Badge variant="outline">{user.social_binding_count || 0} gateway</Badge>
+                              <Badge variant="outline">{user.local_device_count || 0} local</Badge>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 text-muted-foreground">
+                            <div>{formatDate(user.last_seen_at)}</div>
+                            <div className="mt-1 text-[0.68rem] text-muted-foreground">
+                              Joined {formatDate(user.created_at)}
+                            </div>
                           </td>
                         </tr>
                       ))}
                       {users.length === 0 && (
                         <tr>
-                          <td className="px-4 py-6 text-muted-foreground" colSpan={3}>
+                          <td className="px-4 py-6 text-muted-foreground" colSpan={4}>
                             No users yet.
                           </td>
                         </tr>

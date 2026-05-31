@@ -188,6 +188,22 @@ class _FakeCreateStream:
         self.closed = True
 
 
+class _FakeCrashingResponsesStream:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.output_text.delta", delta="Recovered")
+        yield SimpleNamespace(type="response.output_text.delta", delta=" text")
+        raise TypeError("'NoneType' object is not iterable")
+
+    def get_final_response(self):
+        raise AssertionError("parser crash should recover before final response lookup")
+
+
 def _codex_request_kwargs():
     return {
         "model": "gpt-5-codex",
@@ -420,6 +436,21 @@ def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     response = agent._run_codex_stream(_codex_request_kwargs())
     assert calls["stream"] == 2
     assert response.output[0].content[0].text == "stream ok"
+
+
+def test_run_codex_stream_recovers_from_sdk_none_output_parse_error(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _FakeCrashingResponsesStream(),
+            create=lambda **kwargs: _codex_message_response("fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "Recovered text"
 
 
 def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(monkeypatch):

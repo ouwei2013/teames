@@ -1828,6 +1828,14 @@ def _whatsapp_session_dir() -> Path:
     return Path(get_hermes_home()) / "whatsapp" / "session"
 
 
+def _whatsapp_logout_marker_path() -> Path:
+    return _whatsapp_session_dir() / "logged-out.json"
+
+
+def _whatsapp_session_logged_out() -> bool:
+    return _whatsapp_logout_marker_path().exists()
+
+
 def _whatsapp_bridge_dir() -> Path:
     return PROJECT_ROOT / "scripts" / "whatsapp-bridge"
 
@@ -1855,6 +1863,8 @@ def _find_whatsapp_phone_in_json(value: Any) -> str:
 
 
 def _whatsapp_native_paired_number() -> str:
+    if _whatsapp_session_logged_out():
+        return ""
     configured = (
         os.getenv("SOCIAL_GATEWAY_WHATSAPP_NUMBER")
         or os.getenv("WHATSAPP_BUSINESS_NUMBER")
@@ -2601,6 +2611,13 @@ async def enterprise_whatsapp_native_unpair():
 
 @app.get("/api/enterprise/social-gateways/whatsapp/pair/status")
 async def enterprise_whatsapp_native_pair_current_status():
+    if _whatsapp_session_logged_out():
+        return {
+            "id": "",
+            "status": "not_paired",
+            "phone_number": None,
+            "message": "WhatsApp session expired. Pair the server-side WhatsApp bot again.",
+        }
     phone = _whatsapp_native_paired_number()
     if phone:
         try:

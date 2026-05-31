@@ -5227,6 +5227,54 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    @staticmethod
+    def _is_codex_none_output_parse_error(exc: Exception) -> bool:
+        return isinstance(exc, TypeError) and "'NoneType' object is not iterable" in str(exc)
+
+    def _synthesize_codex_stream_response(
+        self,
+        *,
+        output_items: list,
+        text_parts: list,
+        has_tool_calls: bool = False,
+        source: str = "stream",
+    ):
+        """Recover when the Codex SDK parser crashes after usable deltas."""
+        if output_items:
+            logger.warning(
+                "Codex %s parser failed on final response; using %d collected output items. %s",
+                source, len(output_items), self._client_log_context(),
+            )
+            return SimpleNamespace(
+                output=list(output_items),
+                usage=None,
+                status="completed",
+                model=self.model,
+            )
+        if text_parts and not has_tool_calls:
+            assembled = "".join(text_parts)
+            logger.warning(
+                "Codex %s parser failed on final response; synthesized output from "
+                "%d text deltas (%d chars). %s",
+                source, len(text_parts), len(assembled), self._client_log_context(),
+            )
+            return SimpleNamespace(
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[
+                            SimpleNamespace(type="output_text", text=assembled)
+                        ],
+                    )
+                ],
+                usage=None,
+                status="completed",
+                model=self.model,
+            )
+        return None
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
@@ -5317,6 +5365,23 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except TypeError as exc:
+                if self._is_codex_none_output_parse_error(exc):
+                    synthesized = self._synthesize_codex_stream_response(
+                        output_items=collected_output_items,
+                        text_parts=self._codex_streamed_text_parts,
+                        has_tool_calls=has_tool_calls,
+                        source="responses.stream",
+                    )
+                    if synthesized is not None:
+                        return synthesized
+                    logger.debug(
+                        "Codex Responses stream parser hit empty final output but no "
+                        "usable deltas/items were collected; falling back to create(stream=True). %s",
+                        self._client_log_context(),
+                    )
+                    return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                raise
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -5418,6 +5483,16 @@ class AIAgent:
                                 len(collected_text_deltas), len(assembled),
                             )
                     return terminal_response
+        except TypeError as exc:
+            if self._is_codex_none_output_parse_error(exc):
+                synthesized = self._synthesize_codex_stream_response(
+                    output_items=collected_output_items,
+                    text_parts=collected_text_deltas,
+                    source="create(stream=True)",
+                )
+                if synthesized is not None:
+                    return synthesized
+            raise
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
