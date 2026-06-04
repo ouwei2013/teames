@@ -1335,7 +1335,6 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
     model, requested_provider = _resolve_startup_runtime()
     runtime = resolve_runtime_provider(
         requested=requested_provider,
-        target_model=model or None,
     )
     return AIAgent(
         model=model,

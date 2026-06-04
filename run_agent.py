@@ -4299,11 +4299,9 @@ class AIAgent:
             self._memory_manager.sync_all(
                 original_user_message,
                 final_response,
-                session_id=self.session_id,
             )
             self._memory_manager.queue_prefetch_all(
                 original_user_message,
-                session_id=self.session_id,
             )
         except Exception:
             pass
@@ -7953,7 +7951,14 @@ class AIAgent:
             api_msg["reasoning_content"] = existing
             return
 
-        # 2. DeepSeek / Kimi thinking mode: tool-call turns that lack
+        # 2. Healthy session: promote 'reasoning' field to 'reasoning_content'
+        # for providers that use the internal 'reasoning' key.
+        normalized_reasoning = source_msg.get("reasoning")
+        if isinstance(normalized_reasoning, str) and normalized_reasoning:
+            api_msg["reasoning_content"] = normalized_reasoning
+            return
+
+        # 3. DeepSeek / Kimi thinking mode: tool-call turns that lack
         # reasoning_content are "poisoned history" — a prior provider (MiniMax,
         # etc.) left them empty. DeepSeek returns HTTP 400 if reasoning_content
         # is absent on replay; inject "" to satisfy the provider's requirement
@@ -7967,13 +7972,6 @@ class AIAgent:
         )
         if needs_empty_reasoning:
             api_msg["reasoning_content"] = ""
-            return
-
-        # 3. Healthy session: promote 'reasoning' field to 'reasoning_content'
-        # for providers that use the internal 'reasoning' key.
-        normalized_reasoning = source_msg.get("reasoning")
-        if isinstance(normalized_reasoning, str) and normalized_reasoning:
-            api_msg["reasoning_content"] = normalized_reasoning
             return
 
         # 4. DeepSeek / Kimi thinking mode: all assistant messages need
@@ -9615,8 +9613,7 @@ class AIAgent:
         if self._memory_manager:
             try:
                 _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-                self._memory_manager.on_turn_start(
-                    self._user_turn_count,
+                self._memory_manager.on_turn_start(self._user_turn_count,
                     _turn_msg,
                     access_context=self.access_context,
                     session_id=self.session_id,

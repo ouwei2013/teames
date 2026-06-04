@@ -469,9 +469,14 @@ def _coerce_number(value: str, integer_only: bool = False):
         f = float(value)
     except (ValueError, OverflowError):
         return value
-    # Guard against inf/nan — not JSON-serializable, keep original string
-    if f != f or f == float("inf") or f == float("-inf"):
+    # Guard against nan — not a valid number
+    if f != f:
         return value
+    # Guard against inf — cannot be converted to an integer
+    if f == float("inf") or f == float("-inf"):
+        if integer_only:
+            return value  # keep as string; can't represent as int
+        return f
     # If it looks like an integer (no fractional part), return int
     if f == int(f):
         return int(f)
