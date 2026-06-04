@@ -86,7 +86,7 @@ class TestNormalizeCustomProviderEntry:
             "unknownField": "value",
             "anotherBad": 42,
         }
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
             result = _normalize_custom_provider_entry(entry, provider_key="test")
         assert result is not None
         assert any("unknown config keys" in r.message.lower() for r in caplog.records)
@@ -97,7 +97,7 @@ class TestNormalizeCustomProviderEntry:
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-test-key",
         }
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
             result = _normalize_custom_provider_entry(entry, provider_key="test")
         assert result is not None
         camel_warnings = [r for r in caplog.records if "camelcase" in r.message.lower() or "auto-mapped" in r.message.lower()]
