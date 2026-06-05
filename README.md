@@ -5,7 +5,7 @@
 <h1 align="center">Teames</h1>
 
 <p align="center">
-  <strong>Team + Hermes: a business agent workspace with social QR access.</strong>
+  <strong>Team + Hermes: Build a business AI agent and deploy it to WeChat, WhatsApp, Telegram, or the Web in minutes.</strong>
 </p>
 
 <p align="center">
