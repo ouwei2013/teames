@@ -196,7 +196,7 @@ class TestKindField:
         )
         _enable(hermes_home, "p1")
 
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("WARNING", logger="hermes_cli.plugins"):
             mgr = PluginManager()
             mgr.discover_and_load()
 

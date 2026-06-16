@@ -111,6 +111,21 @@ class PtyBridge:
         # Let caller-supplied env fully override inheritance; if they pass
         # None we inherit the server's env (same semantics as subprocess).
         spawn_env = os.environ.copy() if env is None else env
+        # PTY sessions are always terminal-capable.  Ensure TERM is set to
+        # a sane default so terminal programs (tput, ncurses, etc.) work
+        # even when the parent process was launched without one or with a
+        # placeholder value like "unknown" (common in CI/container envs).
+        _term = spawn_env.get("TERM", "")
+        if not _term or _term == "unknown":
+            spawn_env = {**spawn_env, "TERM": "xterm-256color"}
+        # Remove inherited COLUMNS/LINES so that terminal programs (tput,
+        # ncurses, readline) read the window size from the PTY via TIOCGWINSZ
+        # rather than from stale env-var overrides.  The caller controls the
+        # actual dimensions through the ``cols``/``rows`` parameters and any
+        # subsequent :meth:`resize` calls.
+        if "COLUMNS" in spawn_env or "LINES" in spawn_env:
+            spawn_env = {k: v for k, v in spawn_env.items()
+                         if k not in ("COLUMNS", "LINES")}
         proc = ptyprocess.PtyProcess.spawn(  # type: ignore[union-attr]
             list(argv),
             cwd=cwd,

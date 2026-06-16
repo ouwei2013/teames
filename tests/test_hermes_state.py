@@ -1291,9 +1291,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 9
-
-    def test_title_column_exists(self, db):
+        assert version == 10
         """Verify the title column was created in the sessions table."""
         cursor = db._conn.execute("PRAGMA table_info(sessions)")
         columns = {row[1] for row in cursor.fetchall()}
@@ -1347,12 +1345,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v9
+        # Open with SessionDB — should migrate to v10
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 9
+        assert cursor.fetchone()[0] == 10
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
